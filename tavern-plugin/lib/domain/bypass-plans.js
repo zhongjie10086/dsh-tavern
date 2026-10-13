@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { regexFromString } from './tavern-regex-display.js'
 
 const BYPASS_PLAN_SCHEMA = 'dsh-tavern/bypass-plan'
 const BYPASS_PLAN_FILE_VERSION = 1
@@ -49,7 +50,7 @@ function normalizeEntry(value) {
 
 function normalizeRegex(value, index) {
   const script = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
-  return Object.assign({}, clone(script), {
+  return Object.assign({}, Object.fromEntries(['scriptName','trimStrings','placement','disabled','markdownOnly','promptOnly','runOnEdit','substituteRegex','minDepth','maxDepth'].filter(key=>Object.hasOwn(script,key)).map(key=>[key,clone(script[key])])), {
     regexKey: str(script.regexKey || script.id || 'regex-' + (index + 1)),
     id: str(script.id || script.regexKey || 'regex-' + (index + 1)),
     name: str(script.name || script.id || script.regexKey || '正则 ' + (index + 1)),
@@ -73,12 +74,19 @@ function normalizePlan(value) {
     entries: (Array.isArray(plan.entries) ? plan.entries : []).map(normalizeEntry).filter(function (entry) { return entry.entryKey !== '' }),
     regexScripts: (Array.isArray(plan.regexScripts) ? plan.regexScripts : []).map(normalizeRegex).filter(function (script) { return script.regexKey !== '' }),
     compatibleModels: normalizeCompatibleModels(plan.compatibleModels),
-    compatibilitySettings: plan.compatibilitySettings && typeof plan.compatibilitySettings === 'object' && !Array.isArray(plan.compatibilitySettings) ? clone(plan.compatibilitySettings) : {},
+    compatibilitySettings: compatibilitySettings(plan.compatibilitySettings),
     createdAt: Number(plan.createdAt) || 0,
     updatedAt: Number(plan.updatedAt) || 0
   }
 }
 
+function validatePlan(plan) {
+  if(plan.name.length>256||plan.entries.length>1000||plan.regexScripts.length>256)throw new Error('预设条目配置超限：名称 256 字符、1000 条提示词、256 条正则')
+  if(Buffer.byteLength(JSON.stringify(plan))>4*1024*1024)throw new Error('单份预设条目配置超过 4 MiB')
+  for(const entry of plan.entries)if(Buffer.byteLength(entry.content)>256*1024)throw new Error('单条预设提示词超过 256 KiB')
+  for(const script of plan.regexScripts){if(script.findRegex.length>32768||Buffer.byteLength(script.replaceString)>256*1024)throw new Error('正则模式或替换内容超过限制');if(script.findRegex)regexFromString(script.findRegex)}
+  for(const value of Object.values(plan.compatibilitySettings))if(typeof value!=='string'||value.length>100000)throw new Error('兼容设置必须为最多 100000 字符的文本')
+}
 function normalizeState(value) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
   const plans = (Array.isArray(source.plans) ? source.plans : []).map(normalizePlan).filter(function (plan) {
@@ -150,14 +158,18 @@ export function createBypassPlanModule(options = {}) {
     throw new TypeError('预设条目配置模块缺少存储适配器')
   }
 
-  async function mutate(updater) {
-    return updateState(async function (value) {
+  let mutationTail = Promise.resolve()
+  function mutate(updater) {
+    const result = mutationTail.catch(()=>{}).then(()=>updateState(async function (value) {
       const current = normalizeState(value)
       const next = await updater(current)
       if (next === undefined) return undefined
+      if(next.plans.length>1024||Buffer.byteLength(JSON.stringify(next))>64*1024*1024)throw new Error('预设条目配置总额超过限制')
       next.updatedAt = now()
       return next
-    })
+    }))
+    mutationTail=result
+    return result
   }
 
   async function state() {
@@ -228,7 +240,10 @@ export function createBypassPlanModule(options = {}) {
       createdAt: existing ? existing.createdAt : stamp,
       updatedAt: stamp
     })
+    validatePlan(plan)
     await mutate(function (latest) {
+      if(latest.plans.some(item=>item.name===name&&(!existing||item.id!==id)))throw new Error('预设条目配置名称已存在：'+name)
+      if(existing&&!latest.plans.some(item=>item.id===id))throw new Error('预设条目配置已删除')
       const index = latest.plans.findIndex(function (item) { return item.id === id })
       if (index === -1) latest.plans.push(plan)
       else latest.plans[index] = plan
@@ -260,7 +275,10 @@ export function createBypassPlanModule(options = {}) {
       updatedAt: stamp
     })
     if (plan.entries.length === 0 && plan.regexScripts.length === 0) throw new Error('预设条目配置没有可保存的提示词或正则')
+    validatePlan(plan)
     await mutate(function (latest) {
+      if(latest.plans.some(item=>item.name===name&&(!existing||item.id!==id)))throw new Error('预设条目配置名称已存在：'+name)
+      if(existing&&!latest.plans.some(item=>item.id===id))throw new Error('预设条目配置已删除')
       const index = latest.plans.findIndex(function (item) { return item.id === id })
       if (index === -1) latest.plans.push(plan)
       else latest.plans[index] = plan
@@ -375,7 +393,10 @@ export function createBypassPlanModule(options = {}) {
       createdAt: stamp,
       updatedAt: stamp
     }))
+    validatePlan(next)
     await mutate(function (latest) {
+      if(latest.plans.some(item=>item.name===nextName))throw new Error('预设条目配置名称已存在：'+nextName)
+      if(!latest.plans.some(item=>item.id===id))throw new Error('来源预设条目配置已删除')
       latest.plans.push(next)
       return latest
     })

@@ -1,7 +1,8 @@
+import { appendAssistantEvent, pendingAssistantEdit, recoverAssistantEdits, syncAuthoredAgentPhase } from './session-surface-edit.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { editableReplyParts } from './reply-presentation.js'
 import { locateRegenerationSurface } from './rollback-surface.js'
-import { sessionEvents } from './session-events.js'
+import { sessionEvents, appendSessionEvent } from './session-events.js'
 
 function latest(chat) {
   const message = chat.messages?.at(-1)
@@ -10,28 +11,29 @@ function latest(chat) {
 }
 function source(message) { return message.projectionText ?? message.sourceText ?? message.text ?? '' }
 function token(chat, message) {
-  const { displayRuntime: _capture, ...body } = message
+  const { displayRuntime: _capture, tavernHistoryKey: _historyKey, tavernNativeMessageId: _nativeId, ...body } = message
   return createHash('sha256').update(JSON.stringify([chat.id, chat.timeline?.branchId, chat.timeline?.revision, chat.messages.length, body])).digest('hex')
 }
 
 /** Reconcile a durable Chat edit to native Surface; retries never duplicate history. */
 export async function synchronizeBodyEdits(session, chat, flush) {
+  recoverAssistantEdits(session)
   const recorded = new Set(sessionEvents(session).filter(event => event.type === 'assistant/message').map(event => event.data?.message?.id))
   for (const message of chat.messages || []) {
     if (!message.bodyEdit) continue
     const { id, seq, turn } = message.bodyEdit
     if (recorded.has(id)) continue
-    if (!session.surface?.nodes.includes(seq)) throw new Error('编辑正文尚未同步，原消息已不在上下文中')
-    session.append('assistant/message', {
+    if (!session.surface?.nodes.includes(seq) && !pendingAssistantEdit(session, id)) throw new Error('编辑正文尚未同步，原消息已不在上下文中')
+    appendAssistantEvent(session, {
       turn, step: 1,
       message: { id, role: 'assistant', content: [{ type: 'text', text: message.text }], source: { kind: 'model', provider: 'dsh-tavern', model: 'body-edit' } }
-    }, { surfaceOp: { op: 'replace', start: seq, end: seq }, sourceEventSeqs: [seq] })
+    }, { surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq }, sourceEventSeqs: [seq] })
   }
   if ((chat.messages || []).some(message => message.bodyEdit)) await flush(session)
 }
 
 /** Edit prose only; do not replay macros, scripts or settlement. */
-export function createBodyEditor({ chats, sessions, timeline, activity, project, present }) {
+export function createBodyEditor({ chats, sessions, timeline, activity, project, present, history }) {
   const pending = new Set()
   function idle(chat, agent) {
     if (agent?.phase?.kind === 'running' || chat.regenInProgress || ['pending', 'running'].includes(chat.settleStatus) || activity(chat)?.busy) throw new Error('请等待当前生成或后台处理完成后再编辑')
@@ -43,6 +45,7 @@ export function createBodyEditor({ chats, sessions, timeline, activity, project,
     if (!agent?.session) throw new Error('无法访问原生会话')
     idle(chat, agent)
     await synchronizeBodyEdits(agent.session, chat, sessions.flush)
+    syncAuthoredAgentPhase(agent)
     const message = latest(chat)
     const target = locateRegenerationSurface({ events: sessionEvents(agent.session), nodes: agent.session.surface?.nodes, turn: message.turn })
     if (!target) throw new Error('最后一轮正文已不在当前上下文中，无法编辑')
@@ -65,7 +68,10 @@ export function createBodyEditor({ chats, sessions, timeline, activity, project,
       if (!texts.some(text => text.trim())) throw new Error('正文不能为空')
       if (texts.some(text => editableReplyParts(text).some(part => part.kind !== 'text'))) throw new Error('这里只能编辑文本，不能新增 HTML')
       let index = 0
-      const text = parts.map(part => part.kind === 'text' ? texts[index++] : part.text).join('')
+      // Cards' status blocks must start on their own line. An edit box hides the blank lines
+      // around a text part, so keep the original edges when the edited text has none. (upstream f2f4d206)
+      const keepEdges = (original, edited) => (/^\s/.test(edited) ? '' : original.match(/^\s*/)[0]) + edited + (/\s$/.test(edited) ? '' : original.match(/\s*$/)[0])
+      const text = parts.map(part => part.kind === 'text' ? keepEdges(part.text, texts[index++]) : part.text).join('')
       if (text === source(message)) return present(chat)
       const reply = await project(text, chat)
       const patch = {
@@ -78,6 +84,29 @@ export function createBodyEditor({ chats, sessions, timeline, activity, project,
         const swipe = Number(message.swipeId) || 0
         if (typeof patch.swipes[swipe] === 'string') patch.swipes[swipe] = text
       }
+      if(history) {
+        const {bodyEdit:_legacy,...authored}=patch
+        const saved=await history.mutate(chat,current=>{
+          if(token(current,latest(current))!==input.token)throw new Error('正文或会话已变化，请重新打开编辑')
+          Object.assign(current.messages.at(-1),authored,{sessionText:authored.text})
+          // Decision 1A applies to the production history path too. The old
+          // result belongs to the old prose; keep variables and script state,
+          // but do not let this edit itself schedule new settlement or models.
+          current.posture = ''
+          current.lastSettle = null
+          current.settleStatus = 'idle'
+          current.settleError = null
+          current.candidateAgent = null
+          return [{messageId:current.messages.length-1}]
+        })
+        return present(saved.chat)
+      }
+      // Validate on an isolated native Session before the durable Chat intent.
+      // A rejected host event must never publish an edit that future requests
+      // will keep trying (and failing) to synchronize. Accepted writes retain
+      // the existing journal-first recovery path for disk/flush failures.
+      const preview = agent.session.constructor.fromRestore(agent.session.id, structuredClone(agent.session.snapshotEvents ? agent.session.snapshotEvents() : sessionEvents(agent.session)), structuredClone(agent.session.header), agent.session.inheritedEventCount, 'detached')
+      await synchronizeBodyEdits(preview, { messages: [{ ...message, ...patch }] }, async () => {})
       const saved = await chats.update(chat.id, current => {
         idle(current, agent)
         if (token(current, latest(current)) !== input.token) throw new Error('正文或会话已变化，请重新打开编辑')
@@ -85,6 +114,7 @@ export function createBodyEditor({ chats, sessions, timeline, activity, project,
         return timeline.apply({ chat: current, intent: { kind: 'body.edit', turn: message.turn, patch } }).chat
       }, { source: 'foreground.body-edit' })
       await synchronizeBodyEdits(agent.session, saved, sessions.flush)
+      syncAuthoredAgentPhase(agent)
       return present(saved)
     } finally { pending.delete(sessionId) }
   }

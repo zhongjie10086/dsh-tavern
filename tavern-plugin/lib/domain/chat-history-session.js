@@ -1,7 +1,9 @@
+import { appendTavernEvent, decodeTavernEvent } from './session-message-source.js'
 import { sessionEvents } from './session-events.js'
 import { createForegroundFrameBuilder } from './agent-input-frame.js'
 import { createForegroundFrameSessionAdapter } from './foreground-frame-session-adapter.js'
 import { foregroundFrameInputs } from './turn-orchestration.js'
+import { chatImportTimestamp } from './chat-history-import.js'
 
 const clone = value => structuredClone(value)
 
@@ -38,15 +40,15 @@ export async function buildImportedConversation(chat, parsed, { operationId, fil
     const messageId = `tavern-import:${operationId}:${row.sourceLine}`
     const variables = textOnly ? initialVariables : row.variables || initialVariables
     const message = { role: row.role, text: row.text, sourceText: row.text, projectionText: row.text,
-      sessionText: row.text, displayText: row.text, displayMode: 'markdown', ts: Date.parse(row.timestamp) || now,
+      sessionText: row.text, displayText: row.text, displayMode: 'markdown', ts: chatImportTimestamp(row.timestamp) ?? now,
       native: true, name: row.name, swipeId: 0, swipes: [row.text],
       ...(variables === undefined ? {} : { variables: [clone(variables)] }),
-      importSource: { operationId, line: row.sourceLine, lines: row.sourceLines, swipe: row.sourceSwipe, stateSourceLine: textOnly ? null : row.stateSourceLine, stateInherited: textOnly || row.stateInherited } }
+      importSource: { operationId, line: row.sourceLine, lines: row.sourceLines, swipe: row.sourceSwipe, sendDate:row.timestamp, stateSourceLine: textOnly ? null : row.stateSourceLine, stateInherited: textOnly || row.stateInherited } }
     if (row.role === 'user') {
       if (!pendingUsers.length) roundStart = chat.messages.length
       pendingUsers.push(row.text)
       events.push({ type: 'user/message', data: { id: messageId, role: 'user', content: [{ type: 'text', text: row.text }],
-        source: { kind: 'user', importSource: message.importSource } }, intent: { surfaceOp: 'append' } })
+        source: { kind: 'user' } }, intent: { surfaceOp: 'append' } })
     } else {
       turn++
       message.turn = turn
@@ -73,8 +75,8 @@ export async function buildImportedConversation(chat, parsed, { operationId, fil
       }
       if (!pendingUsers.length) events.push({ type: 'turn/start', data: { turn } }, { type: 'step/start', data: { turn, step: 1 } })
       events.push(
-        { type: 'assistant/message', data: { turn, step: 1, message: { id: messageId, role: 'assistant', content: [{ type: 'text', text: row.text }],
-          source: { kind: 'model', provider: 'dsh-tavern', model: 'chat-import', importSource: message.importSource } } }, intent: { surfaceOp: 'append', sourceEventSeqs: [] } },
+        { type: 'assistant/message', data: { stream: [], turn, step: 1, message: { id: messageId, role: 'assistant', content: [{ type: 'text', text: row.text }],
+          source: { kind: 'model', provider: 'dsh-tavern', model: 'chat-import' } } }, intent: { surfaceOp: 'append' } },
         { type: 'step/end', data: { turn, step: 1 } }, { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
       pendingUsers = []
     }
@@ -94,8 +96,8 @@ export async function appendImportedEvents(session, plan, flush) {
   for (let index = 0; index < plan.events.length; index++) {
     const expected = plan.events[index], existing = events[start + index]
     if (existing) {
-      if (existing.type !== expected.type || JSON.stringify(existing.data) !== JSON.stringify(expected.data)) throw new Error('导入事件与当前 Session 不一致，拒绝重复追加')
-    } else session.append(expected.type, expected.data, expected.intent)
+      if (existing.type !== expected.type || JSON.stringify(existing.data) !== JSON.stringify(decodeTavernEvent(expected).data)) throw new Error('导入事件与当前 Session 不一致，拒绝重复追加')
+    } else appendTavernEvent(session, expected.type, expected.data, expected.intent)
   }
   await flush(session)
 }

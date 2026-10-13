@@ -1,8 +1,16 @@
+import {BoundedRegExp} from './bounded-regex.js'
 import { projectAgentContent } from './runtime-content-projection.js'
 import { lastTavernHelperVariables } from './tavern-helper-context.js'
 
 const DYNAMIC_ENTRY_LIMIT = 3
 const READ_COOLDOWN_TURNS = 10
+
+// Play mode only: a global setting of 1-10 entries per turn (default 3). Compatibility
+// mode keeps SillyTavern's own world-info budget.
+export function worldBookRecallLimit(value) {
+  const limit = Number(value)
+  return Number.isInteger(limit) && limit >= 1 && limit <= 10 ? limit : DYNAMIC_ENTRY_LIMIT
+}
 
 function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
@@ -103,7 +111,7 @@ function regexKey(value) {
   const match = /^\/(.*)\/([dgimsuvy]*)$/.exec(str(value))
   if (!match) return null
   try {
-    return new RegExp(match[1], match[2].replaceAll('g', '').replaceAll('y', ''))
+    return new BoundedRegExp(match[1], match[2].replaceAll('g', '').replaceAll('y', ''))
   } catch (_error) {
     return null
   }
@@ -127,7 +135,7 @@ function keyMatch(text, value, entry) {
   const key = str(value).trim()
   if (key === '') return false
   const regex = regexKey(key)
-  if (regex !== null) return regex.test(text)
+  if (regex !== null) {try{return regex.test(text)}catch{return false}}
   return literalMatch(text, key, entry)
 }
 
@@ -175,7 +183,7 @@ function readRecorder(entries, turn) {
 /** Constant Tavern entries are part of the stable play prefix and never enter cooldown. */
 export function constantWorldBookContext(input = {}) {
   const entries = tavernOrder(enabledEntries(input.worldBook).filter(function (entry) {
-    return entry.constant === true && !isMvuUpdateEntry(entry) && !isWorldBookTemplateEntry(entry)
+    return entry.constant === true && !isMvuUpdateEntry(entry) && (input.includeTemplates===true || !isWorldBookTemplateEntry(entry))
   }))
   return {
     context: entries.map(function (entry) { return str(entry.content).trim() }).filter(Boolean).join('\n\n'),
@@ -258,7 +266,7 @@ export function prepareWorldBookRecall(input = {}) {
   const body = str(input.latestBody) || latestBody(input.chat)
   const selected = tavernOrder(all.filter(function (entry) {
     return entry.constant !== true && !isCoolingDown(input.chat, entry, input.turn) && keywordMatch(entry, body)
-  })).slice(0, DYNAMIC_ENTRY_LIMIT)
+  })).slice(0, worldBookRecallLimit(input.limit))
   return {
     kind: 'keywords',
     context: selected.map(function (entry) { return str(entry.content).trim() }).filter(Boolean).join('\n\n'),

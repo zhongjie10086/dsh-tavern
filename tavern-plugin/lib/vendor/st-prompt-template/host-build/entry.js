@@ -1,5 +1,6 @@
+export { createTemplateBrowserServices } from '../../../domain/full-prompt-template-browser-services.js'
 import { createNativeTemplateConnection } from './native-connection.js'
-import { configureTemplateHost, disposeTemplateHost, eventSource, runTemplateCommand, templateCommandNames } from './host.js'
+import { configureTemplateHost, refreshTemplateSnapshot, disposeTemplateHost, eventSource, runTemplateCommand, templateCommandNames } from './host.js'
 
 /** This must be loaded in a dedicated disposable frame, once per session. */
 export async function initializeTemplatePlugin({ snapshot, callbacks, libraries }) {
@@ -23,8 +24,12 @@ export async function initializeTemplatePlugin({ snapshot, callbacks, libraries 
       version: '1.17.9',
       api: globalThis.EjsTemplate,
       commands: templateCommandNames(),
+      getEditors: () => initialized.find(module => module.getTemplateEditors)?.getTemplateEditors() || [],
+      openEditor: ref => run(() => initialized.find(module => module.openTemplateCodeEditor)?.openTemplateCodeEditor(ref)),
+      refresh: snapshot => run(async () => { refreshTemplateSnapshot(snapshot); const ui = initialized.find(module => typeof module.loadSettings === 'function'); ui?.loadSettings(false); }),
       emit: (...args) => run(() => eventSource.emit(...args)),
       command: (...args) => run(() => runTemplateCommand(...args)),
+      commandFromTemplate: (...args) => runTemplateCommand(...args),
       processChatCompletion: ({ messages, type = 'normal' }) => run(async () => {
         if (!Array.isArray(messages) || !messages.length) throw new TypeError('Template request requires messages')
         const request = { messages: structuredClone(messages), type }
@@ -50,5 +55,5 @@ export async function initializeTemplatePlugin({ snapshot, callbacks, libraries 
 export async function connectTemplateSession({ sessionId, rpc, services, settingsHtml, libraries }) {
   const connection = await createNativeTemplateConnection({ sessionId, rpc, services, settingsHtml })
   const plugin = await initializeTemplatePlugin({ ...connection, libraries })
-  try { await connection.flush(); return { ...plugin, context: connection.snapshot } } catch(error) { await plugin.dispose(); throw error }
+  try { await connection.flush(); return { ...plugin, context: connection.snapshot, flush: connection.flush, refresh: async () => { await plugin.refresh(await connection.refresh()); } } } catch(error) { await plugin.dispose(); throw error }
 }

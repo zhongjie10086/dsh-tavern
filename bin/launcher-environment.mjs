@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { resolveDshCliEntry, resolveNpmCliEntry } from './plugin-dependencies.mjs'
 
 // Shared installation paths and process invocation; no install/start/update effects on import.
@@ -24,16 +24,19 @@ export const DSH_ROOT = path.resolve(RUNTIME_HOST === 'cli'
 export const CLI_RUNTIME_ROOT = path.join(DSH_ROOT, 'runtime')
 export function runtimeEnvironment() {
   return { ...process.env, DSH_HOME: DSH_ROOT, DSH_TAVERN_RUNTIME_HOST: RUNTIME_HOST,
+    PLAYWRIGHT_BROWSERS_PATH:process.env.PLAYWRIGHT_BROWSERS_PATH||path.join(DSH_ROOT,'browser-runtime'),
+    ...(/^(?:1|true)$/i.test(process.env.DSH_TAVERN_OFFLINE || '') ? {DSH_TELEMETRY_DISABLED:'1',NODE_OPTIONS:((process.env.NODE_OPTIONS || '')+' --import='+JSON.stringify(pathToFileURL(path.join(SOURCE_ROOT,'bin/offline-network.mjs')).href)).trim()} : {}),
     ...(RUNTIME_HOST === 'cli' ? { DSH_TAVERN_CLI_HOME: DSH_ROOT, DSH_TAVERN_LEGACY_DSH_HOME: LEGACY_DSH_ROOT } : {}) }
 }
 export const PROFILE_DIR = path.join(DSH_ROOT, 'profiles', PROFILE)
 export const LOG_DIR = path.join(DSH_ROOT, 'logs')
 export const LOG_FILE = path.join(LOG_DIR, 'tavern.log')
 export const PID_FILE = path.join(LOG_DIR, 'tavern.pid.json')
+export const SERVICE_FILE = path.join(LOG_DIR, 'tavern-service.json')
 export const FRONTEND_BOOTSTRAP_FILE = path.join(LOG_DIR, 'tavern.frontend-bootstrap.json')
 export const FRONTEND_BOOTSTRAP_VERSION = 2
 export const RELEASE_FILE = '.dsh-tavern-release.json'
-export const DEFAULT_COMMIT_URL = 'https://api.github.com/repos/flizzywine/dsh-tavern/commits/main'
+export const DEFAULT_COMMIT_URL = 'https://api.github.com/repos/zhongjie10086/dsh-tavern/commits/release-r15-clean'
 export const SETTINGS_FILE = path.join(DSH_ROOT, 'settings.yaml')
 export const SIDEBAR_DEFAULTS_VERSION = 8
 export const TAVERN_SIDEBAR_DEFAULTS = {

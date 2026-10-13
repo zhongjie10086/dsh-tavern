@@ -15,6 +15,7 @@ function chatSummary(chat, preservedLastOpenedAt = 0) {
   return {
     id: str(chat && chat.id),
     cardPath: str(chat && chat.cardPath),
+    legacyChatFileName: str(chat && chat.legacyChatFileName),
     cardName: str(chat && chat.cardName) || '未命名角色',
     title: str(chat && chat.title),
     mode: str(chat && chat.mode) || 'story',
@@ -25,7 +26,7 @@ function chatSummary(chat, preservedLastOpenedAt = 0) {
 }
 
 function sameSummary(left, right) {
-  return left && right && ['id', 'cardPath', 'cardName', 'title', 'mode', 'requestMode', 'updatedAt', 'lastOpenedAt'].every(function (key) { return left[key] === right[key] })
+  return left && right && ['id', 'cardPath', 'legacyChatFileName', 'cardName', 'title', 'mode', 'requestMode', 'updatedAt', 'lastOpenedAt'].every(function (key) { return left[key] === right[key] })
 }
 
 /**
@@ -43,12 +44,12 @@ export function createTavernConversationRegistry(options = {}) {
     return normalizeLinks(await store.readLinks())
   }
 
-  async function resolve(sessionId) {
+  async function resolve(sessionId, {readonly=false}={}) {
     const id = str(sessionId)
     if (id === '') return undefined
     const links = normalizeLinks(await store.readLinks())
     if (typeof links[id] === 'string') {
-      const mapped = await store.readChat(links[id])
+      const mapped = await (readonly && store.readChatReadonly || store.readChat)(links[id])
       if (mapped !== undefined) return mapped
     }
     let found
@@ -178,5 +179,18 @@ export function createTavernConversationRegistry(options = {}) {
     return { deleted: true }
   }
 
-  return { links, resolve, publish, sync, list, touch, remove }
+  async function findByName(cardPath, name) {
+    if (!name || !cardPath) return undefined
+    const rows = chatRows(await store.readIndex()).filter(row => row.cardPath === cardPath)
+    const exact = rows.filter(row => row.id === name || row.legacyChatFileName === name)
+    const legacy = rows.filter(row => !Object.hasOwn(row, 'legacyChatFileName') && !exact.includes(row))
+    for (const row of exact.concat(legacy)) {
+      const chat = await store.readChat(row.id)
+      if (!chat) continue
+      if (!Object.hasOwn(row, 'legacyChatFileName')) await sync(chat)
+      if (chat.cardPath === cardPath && (chat.id === name || chat.legacyChatFileName === name)) return chat
+    }
+    return undefined
+  }
+  return { links, resolve, publish, sync, list, touch, remove, findByName }
 }

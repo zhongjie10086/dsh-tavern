@@ -25,7 +25,7 @@ export async function auditUpstream({ directory = root, lockFile = new URL('../u
     for (const node of ast.body) {
       if (node.type !== 'ImportDeclaration') continue
       const specifier = node.source.value
-      const target = relative(directory, resolve(dirname(resolve(directory, file)), specifier))
+      const target = relative(directory, resolve(dirname(resolve(directory, file)), specifier)).replaceAll('\\', '/')
       const kind = !specifier.startsWith('.') ? 'package' : target.startsWith('../') ? 'host' : 'upstream'
       imports.push({ file, specifier, kind, symbols: node.specifiers.map(s => s.type === 'ImportDefaultSpecifier' ? 'default' : s.type === 'ImportNamespaceSpecifier' ? '*' : s.imported.name).sort() })
     }

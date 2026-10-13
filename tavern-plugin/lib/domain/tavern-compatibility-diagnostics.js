@@ -1,12 +1,13 @@
+import {createRollingDiagnosticStorage} from './rolling-diagnostics.js'
 import { createHash } from 'node:crypto'
 import { redactDiagnostic } from './mvu-diagnostics.js'
 
 // Explicitly audited gaps only. Never claim every unknown property is a function.
 export const TAVERN_COMPATIBILITY_CAPABILITIES = Object.freeze([
   ...['scrollChatToBottom', 'showLoader', 'hideLoader', 'unregisterMacro'].map(name => ({ surface: 'SillyTavern', name, policy: 'noop' })),
-  ...['registerMacro', 'getRequestHeaders', 'getChatCompletionModel'].map(name => ({ surface: 'SillyTavern', name, policy: 'reject' })),
-  ...['generate', 'generateRaw', 'stopGeneration', 'deleteLastMessage', 'deleteMessage', 'clearChat', 'reloadCurrentChat', 'openCharacterChat', 'openGroupChat', 'executeSlashCommandsWithOptions'].map(name => ({ surface: 'SillyTavern', name, policy: 'missing' })),
-  ...['generate', 'triggerSlash'].map(name => ({ surface: 'TavernHelper', name, policy: 'missing' }))
+  ...['registerMacro', 'getChatCompletionModel'].map(name => ({ surface: 'SillyTavern', name, policy: 'reject' })),
+  ...['generate', 'stopGeneration', 'deleteLastMessage', 'deleteMessage', 'clearChat', 'openGroupChat'].map(name => ({ surface: 'SillyTavern', name, policy: 'missing' })),
+
 ].map(entry => Object.freeze({ ...entry, id: entry.surface + '.' + entry.name })))
 
 const catalog = new Map(TAVERN_COMPATIBILITY_CAPABILITIES.map(entry => [entry.id, entry]))
@@ -15,6 +16,7 @@ const hash = value => createHash('sha256').update(value).digest('hex')
 
 /** Aggregate runtime snapshots separately from Chat, Frames and model-visible state. */
 export function createTavernCompatibilityDiagnosticStore(storage, { maxRecords = 400 } = {}) {
+  storage = createRollingDiagnosticStorage(storage)
   maxRecords = Math.max(1, Math.min(400, Number(maxRecords) || 400))
   const path = id => 'diagnostics/compatibility-' + hash(String(id)) + '.json'
   return {

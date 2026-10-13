@@ -1,25 +1,26 @@
-import { sessionEvents } from './session-events.js'
+import { appendAssistantEvent, isTavernSurfaceMarker, surfaceRange } from './session-surface-edit.js'
+import { sessionEvents, surfaceReplacementRange } from './session-events.js'
 import { randomUUID } from 'node:crypto'
 
 export function rewindBackgroundSurface(session, boundary) {
   if (!Number.isSafeInteger(boundary)) return 0
   const events = sessionEvents(session)
   const nodes = session && session.surface && Array.isArray(session.surface.nodes) ? session.surface.nodes : []
-  if (boundary === -1) {
-    // Preserve the fixed system-context seed while discarding previous task work.
-    for (const seq of nodes) {
-      const event = events[seq]
-      const id = event?.data?.message?.id || event?.data?.id || ''
-      if (String(id).startsWith('tavern-session-prefix:')) boundary = Math.max(boundary, seq)
-    }
+  const bySeq=new Map(events.map((event,index)=>[Number.isSafeInteger(event.seq)?event.seq:index,event]))
+  const groups=[];let group=null
+  for(const seq of nodes){
+    const event=bySeq.get(seq),id=event?.data?.message?.id || event?.data?.id || ''
+    const fixed=event?.type==='system/message'||String(id).startsWith('tavern-session-prefix:')||isTavernSurfaceMarker(event)&&!event.data.source.replacement.message.content.length
+    if(fixed||!Number.isSafeInteger(seq)||seq<=boundary){group=null;continue}
+    if(group===null){group=[];groups.push(group)}
+    group.push(seq)
   }
-  const shadowed = nodes.filter(function (seq) { return Number.isSafeInteger(seq) && seq > boundary })
-  if (shadowed.length === 0) return 0
+  if(!groups.length)return 0
   let source = null
   let turn = 0
   let step = 1
   for (let index = nodes.length - 1; index >= 0; index--) {
-    const event = events[nodes[index]]
+    const event = bySeq.get(nodes[index])
     const candidate = event && event.data && event.data.message && event.data.message.source
     if (event && event.type === 'assistant/message' && candidate && candidate.kind === 'model') {
       source = candidate
@@ -28,16 +29,18 @@ export function rewindBackgroundSurface(session, boundary) {
       break
     }
   }
-  if (source === null) throw new Error('后台 Agent checkpoint 之后存在消息，但找不到可用的模型来源')
-  session.append('assistant/message', {
+  // A failed task may contain only a user message; this source labels the
+  // durable empty marker, not an invented model execution.
+  if (source === null) source = { kind: 'model', provider: 'dsh-tavern', model: 'background-rewind' }
+  for(const shadowed of groups) appendAssistantEvent(session, {
     turn,
     step,
     message: { id: randomUUID(), role: 'assistant', content: [], source }
   }, {
-    surfaceOp: { op: 'replace', start: shadowed[0], end: shadowed[shadowed.length - 1] },
+    surfaceOp: { op: 'replace', startSeq: shadowed[0], endSeq: shadowed[shadowed.length - 1] },
     sourceEventSeqs: shadowed
   })
-  return shadowed.length
+  return groups.reduce((count,group)=>count+group.length,0)
 }
 
 // Rebuild display suppression from durable empty surface replacements, including
@@ -45,10 +48,11 @@ export function rewindBackgroundSurface(session, boundary) {
 export function backgroundSuppressedTurns(events) {
   const turns = new Set()
   for (const event of events) {
-    const op = event.surfaceOp
-    if (event.type !== 'assistant/message' || op?.op !== 'replace' || event.data?.message?.content?.length !== 0) continue
+    const op = surfaceRange(event.surfaceOp)
+    const empty = isTavernSurfaceMarker(event) ? !event.data.source.replacement.message.content.length : event.type === 'assistant/message' && event.data?.message?.content?.length === 0
+    if (!op || !empty) continue
     for (const previous of events) {
-      if (!Number.isSafeInteger(previous.seq) || previous.seq < op.start || previous.seq > op.end) continue
+      if (!Number.isSafeInteger(previous.seq) || previous.seq < surfaceReplacementRange(op).start || previous.seq > surfaceReplacementRange(op).end) continue
       const turn = previous.data?.turn
       if (Number.isSafeInteger(turn) && turn > 0) turns.add(turn)
     }

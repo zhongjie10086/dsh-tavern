@@ -18,12 +18,13 @@ export { SCENE_PLAN_TOOL } from './scene-plan-draft.js'
 
 /** A per-game atomic document publishes character revisions, blocks and frames
  * together. Content-addressed revisions never overwrite another story position. */
-export function createScenePlans({ store }) {
+export function createScenePlans({ store, limits = { frames: 256, bytes: 8 * 1024 ** 2, reserveBytes: 512 * 1024 } }) {
   const pathFor = chatId => 'scene-images/' + createHash('sha256').update(String(chatId)).digest('hex') + '/plans.json'
   const empty = () => ({ version: 1, generation: 0, characters: {}, blocks: {}, frames: {} })
   async function prepare({ chatId, target, lineage, sources, profile, gapComplete = true }) {
     const data = await store.readJson(pathFor(chatId)) || empty()
     const saved = data.frames[target.key]?.[profile]
+    if (!saved && (Object.values(data.frames).reduce((n, frames) => n + Object.keys(frames).length, 0) >= limits.frames || Buffer.byteLength(JSON.stringify(data)) + limits.reserveBytes > limits.bytes)) throw new Error('本局生图方案已达容量上限，已有图片和方案已保留；本次尚未请求模型')
     const applicable = lineage.flatMap(item => Object.values(data.frames[item.key] || {}))
     const known = Object.create(null)
     for (const frame of applicable) for (const ref of frame.characterRefs) known[data.characters[ref].id] = data.characters[ref]
@@ -154,7 +155,9 @@ export function createScenePlans({ store }) {
       const existing = data.frames[prepared.target.key]?.[prepared.profile]
       if (existing) { assert(existing.id === frame.id, '当前正文方案已保存，旧任务不能覆盖；请重新读取'); return data }
       assert(data.generation === prepared.generation, '人物方案版本已变化，请重新读取后提交')
-      return { ...data, generation: data.generation + 1, characters: { ...data.characters, ...characterVersions }, blocks: { ...data.blocks, ...pendingBlocks }, frames: { ...data.frames, [prepared.target.key]: { ...data.frames[prepared.target.key], [prepared.profile]: frame } } }
+      const next = { ...data, generation: data.generation + 1, characters: { ...data.characters, ...characterVersions }, blocks: { ...data.blocks, ...pendingBlocks }, frames: { ...data.frames, [prepared.target.key]: { ...data.frames[prepared.target.key], [prepared.profile]: frame } } }
+      assert(Object.values(next.frames).reduce((n, frames) => n + Object.keys(frames).length, 0) <= limits.frames && Buffer.byteLength(JSON.stringify(next)) <= limits.bytes, '本局生图方案已达容量上限，已有方案已保留')
+      return next
     })
     return frame
   }

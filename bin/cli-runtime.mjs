@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, symlinkSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { adaptedDshVersion } from './dsh-compatibility.mjs'
@@ -21,7 +21,7 @@ export function healthyCliRuntime(root, platform = process.platform) {
   } catch { return false }
 }
 
-export function installCliRuntime({ root, run, platform = process.platform, force = process.env.DSH_TAVERN_REINSTALL_RUNTIME === '1' }) {
+export function installCliRuntime({ root, run, link = symlinkSync, platform = process.platform, force = process.env.DSH_TAVERN_REINSTALL_RUNTIME === '1' }) {
   if (!force && healthyCliRuntime(root, platform)) {
     return { command: cliRuntimeCommand(root, platform), reused: true, commit() {}, rollback() {} }
   }
@@ -32,11 +32,29 @@ export function installCliRuntime({ root, run, platform = process.platform, forc
   let backedUp = false
   let settled = false
   try {
-    run('npm', ['install', '--global', '--prefix', staging, '--registry', process.env.DSH_TAVERN_NPM_REGISTRY || 'https://registry.npmmirror.com', `@deepseek-ai/dsh@${adaptedDshVersion}`])
+    // npm's global install ignores a project's lock and resolves prerelease ranges
+    // again. Install the reviewed dependency graph locally inside the private root.
+    const installRoot = platform === 'win32' ? staging : path.join(staging, 'lib')
+    mkdirSync(installRoot, { recursive: true })
+    const manifest = JSON.parse(readFileSync(new URL('../config/cli-runtime/package.json', import.meta.url), 'utf8'))
+    if (manifest.dependencies['@deepseek-ai/dsh'] !== adaptedDshVersion) throw new Error('独立 DSH 依赖锁与适配版本不一致。')
+    for (const name of ['package.json', 'package-lock.json']) copyFileSync(new URL('../config/cli-runtime/' + name, import.meta.url), path.join(installRoot, name))
+    run('npm', ['ci', '--prefix', installRoot, '--no-audit', '--no-fund', '--registry', process.env.DSH_TAVERN_NPM_REGISTRY || 'https://registry.npmmirror.com'])
+    const installedPackage = path.join(installRoot, 'node_modules/@deepseek-ai/dsh/package.json')
+    const pkg = JSON.parse(readFileSync(installedPackage, 'utf8'))
+    const bin = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin?.dsh
+    if (!bin) throw new Error('下载的独立 DSH 缺少命令入口。')
+    const entry = path.resolve(path.dirname(installedPackage), bin)
+    const command = cliRuntimeCommand(staging, platform)
+    mkdirSync(path.dirname(command), { recursive: true })
+    if (platform === 'win32') {
+      const relative = path.relative(staging, entry).split(path.sep).join('\\')
+      writeFileSync(command, '@echo off\r\nnode "%~dp0' + relative + '" %*\r\n')
+    } else link(path.relative(path.dirname(command), entry), command)
     const packageFile = platform === 'win32'
       ? path.join(staging, 'node_modules/@deepseek-ai/dsh/package.json')
       : path.join(staging, 'lib/node_modules/@deepseek-ai/dsh/package.json')
-    if (JSON.parse(readFileSync(packageFile, 'utf8')).version !== adaptedDshVersion || !existsSync(cliRuntimeCommand(staging, platform))) {
+    if (JSON.parse(readFileSync(packageFile, 'utf8')).version !== adaptedDshVersion || !healthyCliRuntime(staging, platform)) {
       throw new Error('下载的独立 DSH 版本或入口不正确。')
     }
     if (existsSync(root)) { renameSync(root, backup); backedUp = true }
@@ -61,7 +79,7 @@ export function installCliRuntime({ root, run, platform = process.platform, forc
 
 // Copy only a previous CLI installation, never adopt Desktop/DSHA data.
 // Originals remain intact; a completed snapshot is never recopied on repair.
-export function migrateCliHome({ source, target }) {
+export function migrateCliHome({ source, target, sourceRoot }) {
   if (path.resolve(source) === path.resolve(target)) return false
   const marker = path.join(target, '.cli-home-migrated.json')
   if (existsSync(marker)) return false
@@ -69,13 +87,15 @@ export function migrateCliHome({ source, target }) {
   if (!existsSync(manifestFile)) return false
   const manifest = JSON.parse(readFileSync(manifestFile, 'utf8'))
   if (manifest.dshTavern?.host !== 'cli') return false
+  const canonical = value => {
+    const absolute = path.resolve(value)
+    return process.platform === 'win32' ? absolute.toLowerCase() : absolute
+  }
+  if (!sourceRoot || !manifest.dshTavern.source || canonical(manifest.dshTavern.source) !== canonical(sourceRoot)) {
+    throw new Error('旧 CLI 数据属于另一套或无法确认的源码安装，未停止服务或复制数据。请明确指定同一套酒馆的数据目录。')
+  }
   if (existsSync(path.join(source, 'logs/tavern.pid.json'))) {
-    const launcher = path.join(manifest.dshTavern.source || '', 'bin/dsh-tavern.mjs')
-    if (!existsSync(launcher)) throw new Error('请先停止旧 CLI 酒馆，再迁移数据；找不到旧启动器。')
-    const stopped = spawnSync(process.execPath, [launcher, 'stop'], {
-      stdio: 'inherit', env: { ...process.env, DSH_HOME: source, DSH_TAVERN_CLI_HOME: source, DSH_TAVERN_RUNTIME_HOST: 'cli' },
-    })
-    if (stopped.error || stopped.status !== 0) throw new Error('停止旧 CLI 失败，尚未复制数据。请先停止旧酒馆后重试。')
+    throw new Error('旧 CLI 酒馆仍有服务记录；请先用该安装的启动器停止服务，再迁移数据。尚未复制数据。')
   }
   mkdirSync(target, { recursive: true })
   const entries = ['profile-data/tavern', 'settings.yaml', '.credentials.yaml', '.openai-codex-auth.json', '.agent-presets', 'attachments']

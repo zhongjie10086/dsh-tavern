@@ -1,0 +1,35 @@
+{
+  "project": "SP database / AutoCardUpdater",
+  "version": "9.2.4",
+  "capturedAt": "2026-09-12T10:03:50.868Z",
+  "changes": [
+    "TypeScript type erasure",
+    "Explicit relative module suffix",
+    "Logger bound to console"
+  ],
+  "modules": [
+    {
+      "module": "stable-row-id-allocator",
+      "source": "src/shared/stable-row-id-allocator.ts",
+      "sha256": "8ed9ff3dbf6af2f56ea48a00bd4a1fb5b93368cb9b9c841f72b2eda7bf9e7af8"
+    },
+    {
+      "module": "canonical-row-normalizer",
+      "source": "src/shared/canonical-row-normalizer.ts",
+      "sha256": "e1be6c7878fc27c9071a3d59bf4fad8ef819046246d5949f15e824fcc7898b79"
+    },
+    {
+      "module": "ddl-utils",
+      "source": "src/shared/ddl-utils.ts",
+      "sha256": "f2a6ae268c094173aff5b5b8d782b119ea700b422801d2523d78e6825be80e76"
+    },
+    {
+      "module": "template-row-id-normalizer",
+      "source": "src/service/template/template-row-id-normalizer.ts",
+      "sha256": "fea3d85c4d71732cb7a4181cd332be99868ab9264f81d177bd6febd4e55b1ab6",
+      "changes": [
+        "Inline dependency-free display-name normalization"
+      ]
+    }
+  ]
+}

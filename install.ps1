@@ -1,13 +1,15 @@
 $ErrorActionPreference = 'Stop'
+if ($env:DSH_TAVERN_OFFLINE -match '^(?i:1|true)$') { throw '离线模式禁止下载安装或更新；请使用已有安装。' }
 
 $InstallHost = if ($env:DSH_TAVERN_HOST) { $env:DSH_TAVERN_HOST } else { 'cli' }
 if ($InstallHost -notin @('cli', 'desktop')) { throw "不支持的安装宿主：$InstallHost" }
 
-$Repository = if ($env:DSH_TAVERN_REPOSITORY) { $env:DSH_TAVERN_REPOSITORY } else { 'flizzywine/dsh-tavern' }
+$Repository = if ($env:DSH_TAVERN_REPOSITORY) { $env:DSH_TAVERN_REPOSITORY } else { 'zhongjie10086/dsh-tavern' }
+$ReleaseRef = 'release-r15-clean'
 $RepositoryUrl = if ($env:DSH_TAVERN_GIT_URL) { $env:DSH_TAVERN_GIT_URL } else { "https://github.com/$Repository.git" }
-$ArchiveUrl = if ($env:DSH_TAVERN_ARCHIVE_URL) { $env:DSH_TAVERN_ARCHIVE_URL } else { "https://codeload.github.com/$Repository/zip/refs/heads/main" }
-$CommitUrl = if ($env:DSH_TAVERN_COMMIT_URL) { $env:DSH_TAVERN_COMMIT_URL } else { "https://api.github.com/repos/$Repository/commits/main" }
-$CdnMetadataUrl = if ($env:DSH_TAVERN_CDN_METADATA_URL) { $env:DSH_TAVERN_CDN_METADATA_URL } else { "https://cdn.jsdelivr.net/gh/$Repository@main/dsh-tavern-runtime.json" }
+$ArchiveUrl = if ($env:DSH_TAVERN_ARCHIVE_URL) { $env:DSH_TAVERN_ARCHIVE_URL } else { "https://codeload.github.com/$Repository/zip/refs/heads/$ReleaseRef" }
+$CommitUrl = if ($env:DSH_TAVERN_COMMIT_URL) { $env:DSH_TAVERN_COMMIT_URL } else { "https://api.github.com/repos/$Repository/commits/$ReleaseRef" }
+$CdnMetadataUrl = if ($env:DSH_TAVERN_CDN_METADATA_URL) { $env:DSH_TAVERN_CDN_METADATA_URL } else { "https://cdn.jsdelivr.net/gh/$Repository@$ReleaseRef/dsh-tavern-runtime.json" }
 $CdnRootUrl = if ($env:DSH_TAVERN_CDN_ROOT_URL) { $env:DSH_TAVERN_CDN_ROOT_URL.TrimEnd('/') } else { "https://cdn.jsdelivr.net/gh/$Repository" }
 $DshRoot = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh' }
 $LegacyDshRoot = if ($env:DSH_TAVERN_LEGACY_DSH_HOME) { $env:DSH_TAVERN_LEGACY_DSH_HOME } else { $DshRoot }
@@ -56,8 +58,11 @@ $PnpmVersion = '11.25.0'
 $CommandBin = Join-Path $DshRoot 'bin'
 $SourceCache = Join-Path $DshRoot 'source-cache\dsh-tavern.git'
 $TempDir = Join-Path ([IO.Path]::GetTempPath()) ("dsh-tavern-install-" + [Guid]::NewGuid().ToString('N'))
-$TargetCommit = if ($env:DSH_TAVERN_TARGET_COMMIT) { $env:DSH_TAVERN_TARGET_COMMIT } else { '' }
+$RequestedCommit = if ($env:DSH_TAVERN_TARGET_COMMIT) { $env:DSH_TAVERN_TARGET_COMMIT } else { '' }
+$TargetCommit = $RequestedCommit
+$FetchRef = if ($RequestedCommit) { $RequestedCommit } else { $ReleaseRef }
 $RuntimePaths = @(
+  'dsh-tavern-runtime.json',
   'package.json',
   'pnpm-lock.yaml',
   'pnpm-workspace.yaml',
@@ -139,16 +144,16 @@ try {
       Write-Host '正在通过 Git 增量同步 DSH Tavern（不下载文档与图片）……'
       New-Item -ItemType Directory -Force -Path (Split-Path $SourceCache -Parent) | Out-Null
       if (-not (Test-Path (Join-Path $SourceCache 'HEAD'))) {
-        & $GitCommand clone --bare --filter=blob:none --depth 1 --single-branch --branch main $RepositoryUrl $SourceCache
+        & $GitCommand clone --bare --filter=blob:none --depth 1 --single-branch --branch $ReleaseRef $RepositoryUrl $SourceCache
         Assert-LastCommand 'DSH Tavern Git 缓存初始化失败。'
       }
       & $GitCommand --git-dir=$SourceCache remote set-url origin $RepositoryUrl
       Assert-LastCommand 'DSH Tavern Git 远程地址配置失败。'
-      & $GitCommand --git-dir=$SourceCache fetch --depth 1 origin main
+      & $GitCommand --git-dir=$SourceCache fetch --depth 1 origin $FetchRef
       Assert-LastCommand 'DSH Tavern 增量更新失败。'
       $TargetCommit = (& $GitCommand --git-dir=$SourceCache rev-parse FETCH_HEAD).Trim()
       Assert-LastCommand 'DSH Tavern 提交号读取失败。'
-      & $GitCommand --git-dir=$SourceCache archive --format=zip "--output=$ArchivePath" FETCH_HEAD -- @RuntimePaths
+      & $GitCommand -c core.autocrlf=false -c core.eol=lf --git-dir=$SourceCache archive --format=zip "--output=$ArchivePath" FETCH_HEAD -- @RuntimePaths
       Assert-LastCommand 'DSH Tavern 精简运行包生成失败。'
       $UsedGit = $true
     }
@@ -162,6 +167,7 @@ try {
       $CdnSource = Join-Path $TempDir 'cdn-source'
       New-Item -ItemType Directory -Force -Path $CdnSource | Out-Null
       $Metadata = Invoke-RestMethod -UseBasicParsing -Uri $CdnMetadataUrl -TimeoutSec 15
+      if ($RequestedCommit -and $Metadata.revision -ne $RequestedCommit) { throw '备用源尚未发布已确认提交，改用固定提交归档。' }
       if ([string]$Metadata.revision -notmatch '^[0-9a-fA-F]{40}$') { throw 'jsDelivr 运行清单缺少有效提交号。' }
       $RuntimePattern = '^(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|cordis\.patch\.yml|install\.ps1|install\.sh|bin/|config/|presets/|tavern-plugin/|patches/)'
       $Files = @($Metadata.files | Where-Object { $_.path -match $RuntimePattern -and $_.path -notmatch '(^|/)\.\.(/|$)' -and $_.sha256 -match '^[0-9a-fA-F]{64}$' })
@@ -187,10 +193,13 @@ try {
     $PreviousProgressPreference = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
     try {
+      $TargetCommit = $RequestedCommit
       if ($TargetCommit -eq '') {
         try { $TargetCommit = (Invoke-RestMethod -UseBasicParsing -Uri $CommitUrl -Headers @{ Accept = 'application/vnd.github+json' }).sha }
-        catch { Write-Warning '无法记录当前提交号，不影响本次安装。' }
+        catch { throw '无法确认下载提交号，尚未覆盖现有安装。' }
       }
+      if (-not $TargetCommit) { throw '无法确认下载提交号。' }
+      if (-not $env:DSH_TAVERN_ARCHIVE_URL) { $ArchiveUrl = "https://codeload.github.com/$Repository/zip/$TargetCommit" }
       for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
         try {
           Invoke-WebRequest -UseBasicParsing -Uri $ArchiveUrl -OutFile $ArchivePath
@@ -223,6 +232,73 @@ try {
     throw '下载内容不完整。'
   }
 
+  # BEGIN INSTALL SOURCE VERIFICATION
+  $ReleaseGuard = @'
+import { readFileSync, existsSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+
+const commitPattern = /^[0-9a-f]{40}$/i
+function json(file) { return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, '')) : null }
+function metadata(root) {
+  const value = json(path.join(root, 'dsh-tavern-runtime.json'))
+  if (!value || !commitPattern.test(value.revision) || !Number.isSafeInteger(value.releaseSequence) || !value.files?.length) return null
+  for (const file of value.files) {
+    const relative = path.relative(root, path.resolve(root, file.path))
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null
+    try { if (createHash('sha256').update(readFileSync(path.join(root, file.path))).digest('hex') !== file.sha256) return null }
+    catch { return null }
+  }
+  return value
+}
+function versionOrder(left, right) {
+  const parse = value => String(value).split('-')[0].split('.').map(Number)
+  const a = parse(left), b = parse(right)
+  if (a.length !== 3 || b.length !== 3 || [...a, ...b].some(n => !Number.isSafeInteger(n) || n < 0)) throw Error('无法验证安装版本号')
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return Math.sign(a[i] - b[i])
+  return 0
+}
+
+export function verifyInstallSource({ appDir, sourceDir, targetCommit, requestedCommit = '', sourceCache = '' }) {
+  if (!commitPattern.test(targetCommit)) throw Error('下载结果缺少可验证提交号，未覆盖现有安装')
+  if (requestedCommit && targetCommit.toLowerCase() !== requestedCommit.toLowerCase()) throw Error('备用下载源提交与已确认目标不同，拒绝安装缓存的旧版本')
+  const candidate = json(path.join(sourceDir, 'package.json'))
+  if (!candidate) throw Error('下载内容不完整')
+  const current = json(path.join(appDir, 'package.json'))
+  if (!current) return
+  const order = versionOrder(candidate.version, current.version)
+  if (order < 0) throw Error('下载版本低于当前安装，拒绝降级')
+  const oldMetadata = metadata(appDir), nextMetadata = metadata(sourceDir)
+  if (oldMetadata && nextMetadata) {
+    if (nextMetadata.releaseSequence < oldMetadata.releaseSequence || (nextMetadata.releaseSequence === oldMetadata.releaseSequence && nextMetadata.revision !== oldMetadata.revision)) throw Error('备用源发布序号较旧或冲突，拒绝覆盖')
+    return
+  }
+  const release = json(path.join(appDir, '.dsh-tavern-release.json'))
+  let currentCommit = oldMetadata?.revision || release?.commit || ''
+  const git = (...args) => execFileSync('git', args, { encoding: 'utf8', windowsHide: true, timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+  if (!currentCommit && existsSync(path.join(appDir, '.git'))) {
+    try { currentCommit = git('-C', appDir, 'rev-parse', 'HEAD') } catch {}
+  }
+  if (currentCommit === targetCommit) return
+  // A requested commit was checked before launching the updater. Every fallback must match it.
+  if (requestedCommit === targetCommit) return
+  if (order > 0) return
+  if (commitPattern.test(currentCommit)) {
+    for (const args of [['-C', appDir], ...(sourceCache ? [['--git-dir=' + sourceCache]] : [])]) {
+      try { git(...args, 'merge-base', '--is-ancestor', currentCommit, targetCommit); return } catch {}
+    }
+  }
+  throw Error('无法确认下载内容比当前构建更新；请先在酒馆检查更新后重试，现有安装未覆盖')
+}
+
+verifyInstallSource({appDir:process.argv[2],sourceDir:process.argv[3],targetCommit:process.argv[4],requestedCommit:process.argv[5] === '-' ? '' : process.argv[5],sourceCache:process.argv[6]})
+'@
+  $GuardRequestedCommit = if ($RequestedCommit) { $RequestedCommit } else { '-' }
+  $ReleaseGuard | & node --input-type=module - $AppDir $SourceDir.FullName $TargetCommit $GuardRequestedCommit $SourceCache
+  Assert-LastCommand '下载构建未通过防降级校验，现有安装未覆盖。'
+  # END INSTALL SOURCE VERIFICATION
+
   # Read compatibility from the downloaded release before installing missing tools.
   $CompatibilityScript = Join-Path $SourceDir.FullName 'bin\dsh-compatibility.mjs'
   $AdaptedDshVersion = (& node $CompatibilityScript --version)
@@ -254,9 +330,18 @@ try {
   $DshCommand = Resolve-Command 'dsh'
   if ($InstallHost -ne 'cli' -and $null -eq $DshCommand) { throw '未找到 DSH。Desktop 版请从 DSH Desktop 托盘打开 DSH Terminal 后运行本命令。' }
 
+  # Validate before replacing any installed application files.
+  if ($InstallHost -ne 'cli') {
+    $CurrentDshVersion = (& $DshCommand --version)
+    Assert-LastCommand '无法读取宿主 DSH 版本。'
+    & node $CompatibilityScript --check $InstallHost ($CurrentDshVersion -join "`n")
+    Assert-LastCommand '宿主 DSH 版本不兼容，尚未覆盖程序文件。'
+  }
+
   $OldLauncher = Join-Path $AppDir 'bin\dsh-tavern.mjs'
   if ($InstallHost -eq 'cli' -and (Test-Path $OldLauncher)) {
-    & node $OldLauncher stop *> $null
+    & node $OldLauncher stop
+    Assert-LastCommand '旧服务未能安全停止，尚未覆盖程序文件。'
   }
 
   New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
@@ -270,6 +355,15 @@ try {
     [IO.File]::WriteAllText((Join-Path $AppDir '.dsh-tavern-release.json'), $ReleaseJson, (New-Object Text.UTF8Encoding($false)))
   }
 
+  if ($InstallHost -eq 'desktop') {
+    Write-Host '正在准备 Windows Desktop 包管理环境……'
+    $PackageManagerBin = (& node (Join-Path $AppDir 'bin\desktop-package-manager.mjs'))
+    Assert-LastCommand '准备 Desktop 包管理环境失败。'
+    $PackageManagerBin = ($PackageManagerBin -join "`n").Trim()
+    if (-not (Test-Path -LiteralPath (Join-Path $PackageManagerBin 'pnpm.cmd'))) { throw 'Desktop 包管理入口未生成。' }
+    $env:Path = "$PackageManagerBin;$env:Path"
+    $PnpmCommand = Join-Path $PackageManagerBin 'pnpm.cmd'
+  }
   Write-Host '正在安装程序依赖……'
   & $PnpmCommand --dir $AppDir install --frozen-lockfile
   Assert-LastCommand '程序依赖安装失败。'

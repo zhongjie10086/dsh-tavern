@@ -269,6 +269,18 @@ function nextId(entries, field) {
   return entries.reduce(function (maximum, entry) { return Math.max(maximum, numberOr(entry && entry[field], -1)) }, -1) + 1
 }
 
+// Field vocabulary assignKnownPatch accepts; anything else would be dropped silently. (upstream 8384d622)
+export const WORLD_BOOK_PATCH_FIELDS = Object.freeze(['comment', 'content', 'enabled', 'primaryKeys', 'secondaryKeys', 'constant', 'selective', 'order', 'caseSensitive', 'displayIndex', 'selectiveLogic', 'vectorized', 'position', 'depth', 'role', 'probabilityEnabled', 'probability', 'scanDepth', 'matchWholeWords', 'excludeRecursion', 'preventRecursion', 'group', 'delayUntilRecursion', 'sticky', 'cooldown', 'delay', 'helperExtra'])
+
+/** Reject a misspelled entry field (e.g. keys) instead of silently dropping it. */
+export function assertWorldBookPatchFields(operations) {
+  for (const operation of Array.isArray(operations) ? operations : []) {
+    const fields = Object.keys(object(operation?.entry) || {}).concat(Object.keys(object(operation?.patch) || {}))
+    const unknown = fields.filter(field => !WORLD_BOOK_PATCH_FIELDS.includes(field))
+    if (unknown.length) throw new Error('世界书条目不支持字段 ' + unknown.join('、') + (unknown.some(field => /^(keys?|secondary_keys|keysecondary)$/.test(field)) ? '；关键词请用 primaryKeys / secondaryKeys' : '') + '。可用字段：' + WORLD_BOOK_PATCH_FIELDS.join('、'))
+  }
+}
+
 function assignKnownPatch(entry, patch, format) {
   const embedded = format !== 'sillytavern-worldbook'
   const extensions = Object.assign({}, object(entry.extensions) || {})

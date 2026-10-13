@@ -1,6 +1,9 @@
 #!/bin/sh
 
 set -eu
+case "${DSH_TAVERN_OFFLINE:-}" in
+  1|true|TRUE) printf '%s\n' '离线模式禁止下载安装或更新；请使用已有安装。' >&2; exit 1 ;;
+esac
 
 # Inherit the registry throughout bootstrap, Profile and plugin installation.
 export npm_config_registry="${DSH_TAVERN_NPM_REGISTRY:-https://registry.npmmirror.com}"
@@ -13,11 +16,12 @@ case ${INSTALL_HOST} in
   *) echo "安装失败：不支持的安装宿主 ${INSTALL_HOST}" >&2; exit 1 ;;
 esac
 
-REPOSITORY=${DSH_TAVERN_REPOSITORY:-flizzywine/dsh-tavern}
+REPOSITORY=${DSH_TAVERN_REPOSITORY:-zhongjie10086/dsh-tavern}
+RELEASE_REF=release-r15-clean
 REPOSITORY_URL=${DSH_TAVERN_GIT_URL:-https://github.com/${REPOSITORY}.git}
-ARCHIVE_URL=${DSH_TAVERN_ARCHIVE_URL:-https://codeload.github.com/${REPOSITORY}/tar.gz/refs/heads/main}
-COMMIT_URL=${DSH_TAVERN_COMMIT_URL:-https://api.github.com/repos/${REPOSITORY}/commits/main}
-CDN_METADATA_URL=${DSH_TAVERN_CDN_METADATA_URL:-https://cdn.jsdelivr.net/gh/${REPOSITORY}@main/dsh-tavern-runtime.json}
+ARCHIVE_URL=${DSH_TAVERN_ARCHIVE_URL:-https://codeload.github.com/${REPOSITORY}/tar.gz/refs/heads/${RELEASE_REF}}
+COMMIT_URL=${DSH_TAVERN_COMMIT_URL:-https://api.github.com/repos/${REPOSITORY}/commits/${RELEASE_REF}}
+CDN_METADATA_URL=${DSH_TAVERN_CDN_METADATA_URL:-https://cdn.jsdelivr.net/gh/${REPOSITORY}@${RELEASE_REF}/dsh-tavern-runtime.json}
 CDN_ROOT_URL=${DSH_TAVERN_CDN_ROOT_URL:-https://cdn.jsdelivr.net/gh/${REPOSITORY}}
 LEGACY_DSH_ROOT=${DSH_TAVERN_LEGACY_DSH_HOME:-${DSH_HOME:-${HOME}/.dsh}}
 DSH_ROOT=${DSH_HOME:-${HOME}/.dsh}
@@ -73,11 +77,13 @@ RUNTIME_BIN=${RUNTIME_ROOT}/bin
 PNPM_VERSION=11.25.0
 COMMAND_BIN=${HOME}/.local/bin
 SOURCE_CACHE=${DSH_ROOT}/source-cache/dsh-tavern.git
-RUNTIME_PATHS='package.json pnpm-lock.yaml pnpm-workspace.yaml cordis.patch.yml install.ps1 install.sh bin config presets tavern-plugin patches'
+RUNTIME_PATHS='dsh-tavern-runtime.json package.json pnpm-lock.yaml pnpm-workspace.yaml cordis.patch.yml install.ps1 install.sh bin config presets tavern-plugin patches'
 TMP_BASE=${TMPDIR:-/tmp}
 TMP_BASE=${TMP_BASE%/}
 TEMP_DIR=$(mktemp -d "${TMP_BASE}/dsh-tavern-install.XXXXXX")
-TARGET_COMMIT=${DSH_TAVERN_TARGET_COMMIT:-}
+REQUESTED_COMMIT=${DSH_TAVERN_TARGET_COMMIT:-}
+TARGET_COMMIT=${REQUESTED_COMMIT}
+FETCH_REF=${REQUESTED_COMMIT:-${RELEASE_REF}}
 
 cleanup() {
   case "${TEMP_DIR}" in
@@ -125,11 +131,11 @@ USED_CDN=0
 if command -v git >/dev/null 2>&1; then
   echo "正在通过 Git 增量同步（不下载文档与图片）……"
   mkdir -p "$(dirname -- "${SOURCE_CACHE}")"
-  if { [ -f "${SOURCE_CACHE}/HEAD" ] || git clone --bare --filter=blob:none --depth 1 --single-branch --branch main "${REPOSITORY_URL}" "${SOURCE_CACHE}"; } \
+  if { [ -f "${SOURCE_CACHE}/HEAD" ] || git clone --bare --filter=blob:none --depth 1 --single-branch --branch "${RELEASE_REF}" "${REPOSITORY_URL}" "${SOURCE_CACHE}"; } \
     && git --git-dir="${SOURCE_CACHE}" remote set-url origin "${REPOSITORY_URL}" \
-    && git --git-dir="${SOURCE_CACHE}" fetch --depth 1 origin main \
+    && git --git-dir="${SOURCE_CACHE}" fetch --depth 1 origin "${FETCH_REF}" \
     && TARGET_COMMIT=$(git --git-dir="${SOURCE_CACHE}" rev-parse FETCH_HEAD) \
-    && git --git-dir="${SOURCE_CACHE}" archive --format=tar --output="${TEMP_DIR}/app.tar" FETCH_HEAD -- ${RUNTIME_PATHS}; then
+    && git -c core.autocrlf=false -c core.eol=lf --git-dir="${SOURCE_CACHE}" archive --format=tar --output="${TEMP_DIR}/app.tar" FETCH_HEAD -- ${RUNTIME_PATHS}; then
     USED_GIT=1
   else
     echo "Git 增量更新不可用，将回退到完整 ZIP。" >&2
@@ -139,7 +145,7 @@ fi
 if [ "${USED_GIT}" -eq 0 ]; then
   echo "GitHub 直连不可用，正在通过 jsDelivr 备用源下载运行代码……"
   mkdir -p "${TEMP_DIR}/cdn-source"
-  if CDN_METADATA_URL="${CDN_METADATA_URL}" CDN_ROOT_URL="${CDN_ROOT_URL}" CDN_SOURCE="${TEMP_DIR}/cdn-source" node <<'NODE'
+  if CDN_METADATA_URL="${CDN_METADATA_URL}" CDN_ROOT_URL="${CDN_ROOT_URL}" CDN_SOURCE="${TEMP_DIR}/cdn-source" REQUESTED_COMMIT="${REQUESTED_COMMIT}" node <<'NODE'
 const { createHash } = require('node:crypto')
 const { mkdir, writeFile } = require('node:fs/promises')
 const path = require('node:path')
@@ -151,6 +157,7 @@ async function get(url, timeout = 30000) {
 }
 ;(async () => {
   const metadata = await (await get(process.env.CDN_METADATA_URL, 15000)).json()
+  if (process.env.REQUESTED_COMMIT && metadata.revision !== process.env.REQUESTED_COMMIT) throw new Error('备用源尚未发布已确认提交，改用固定提交归档')
   if (!/^[0-9a-f]{40}$/i.test(String(metadata.revision || ''))) throw new Error('jsDelivr 运行清单缺少有效提交号')
   const files = (metadata.files || []).map((file) => ({ ...file, path: String(file.path || '').replace(/^\/+/, '') }))
     .filter((file) => allowed.test(file.path) && !file.path.split('/').includes('..') && /^[0-9a-f]{64}$/i.test(String(file.sha256 || '')))
@@ -179,9 +186,12 @@ fi
 if [ "${USED_GIT}" -eq 0 ] && [ "${USED_CDN}" -eq 0 ]; then
   command -v curl >/dev/null 2>&1 || fail "Git 不可用且未找到 curl，无法下载完整 ZIP。"
   echo "正在下载完整 ZIP……"
+  TARGET_COMMIT=${REQUESTED_COMMIT}
   if [ -z "${TARGET_COMMIT}" ]; then
     TARGET_COMMIT=$(curl -fsSL --connect-timeout 10 "${COMMIT_URL}" | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' | head -n 1 || true)
   fi
+  [ -n "${TARGET_COMMIT}" ] || fail "无法确认下载提交号，尚未覆盖现有安装。"
+  ARCHIVE_URL=${DSH_TAVERN_ARCHIVE_URL:-https://codeload.github.com/${REPOSITORY}/tar.gz/${TARGET_COMMIT}}
   curl -fL --retry 3 --connect-timeout 15 "${ARCHIVE_URL}" -o "${TEMP_DIR}/app.tar.gz"
 fi
 mkdir -p "${TEMP_DIR}/extract"
@@ -196,6 +206,70 @@ else
 fi
 [ -n "${SOURCE_DIR}" ] || fail "下载内容不完整。"
 [ -f "${SOURCE_DIR}/package.json" ] || fail "下载内容不完整。"
+
+# BEGIN INSTALL SOURCE VERIFICATION
+node --input-type=module - "${APP_DIR}" "${SOURCE_DIR}" "${TARGET_COMMIT}" "${REQUESTED_COMMIT}" "${SOURCE_CACHE}" <<'VERIFY_INSTALL_SOURCE'
+import { readFileSync, existsSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+
+const commitPattern = /^[0-9a-f]{40}$/i
+function json(file) { return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, '')) : null }
+function metadata(root) {
+  const value = json(path.join(root, 'dsh-tavern-runtime.json'))
+  if (!value || !commitPattern.test(value.revision) || !Number.isSafeInteger(value.releaseSequence) || !value.files?.length) return null
+  for (const file of value.files) {
+    const relative = path.relative(root, path.resolve(root, file.path))
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null
+    try { if (createHash('sha256').update(readFileSync(path.join(root, file.path))).digest('hex') !== file.sha256) return null }
+    catch { return null }
+  }
+  return value
+}
+function versionOrder(left, right) {
+  const parse = value => String(value).split('-')[0].split('.').map(Number)
+  const a = parse(left), b = parse(right)
+  if (a.length !== 3 || b.length !== 3 || [...a, ...b].some(n => !Number.isSafeInteger(n) || n < 0)) throw Error('无法验证安装版本号')
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return Math.sign(a[i] - b[i])
+  return 0
+}
+
+export function verifyInstallSource({ appDir, sourceDir, targetCommit, requestedCommit = '', sourceCache = '' }) {
+  if (!commitPattern.test(targetCommit)) throw Error('下载结果缺少可验证提交号，未覆盖现有安装')
+  if (requestedCommit && targetCommit.toLowerCase() !== requestedCommit.toLowerCase()) throw Error('备用下载源提交与已确认目标不同，拒绝安装缓存的旧版本')
+  const candidate = json(path.join(sourceDir, 'package.json'))
+  if (!candidate) throw Error('下载内容不完整')
+  const current = json(path.join(appDir, 'package.json'))
+  if (!current) return
+  const order = versionOrder(candidate.version, current.version)
+  if (order < 0) throw Error('下载版本低于当前安装，拒绝降级')
+  const oldMetadata = metadata(appDir), nextMetadata = metadata(sourceDir)
+  if (oldMetadata && nextMetadata) {
+    if (nextMetadata.releaseSequence < oldMetadata.releaseSequence || (nextMetadata.releaseSequence === oldMetadata.releaseSequence && nextMetadata.revision !== oldMetadata.revision)) throw Error('备用源发布序号较旧或冲突，拒绝覆盖')
+    return
+  }
+  const release = json(path.join(appDir, '.dsh-tavern-release.json'))
+  let currentCommit = oldMetadata?.revision || release?.commit || ''
+  const git = (...args) => execFileSync('git', args, { encoding: 'utf8', windowsHide: true, timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+  if (!currentCommit && existsSync(path.join(appDir, '.git'))) {
+    try { currentCommit = git('-C', appDir, 'rev-parse', 'HEAD') } catch {}
+  }
+  if (currentCommit === targetCommit) return
+  // A requested commit was checked before launching the updater. Every fallback must match it.
+  if (requestedCommit === targetCommit) return
+  if (order > 0) return
+  if (commitPattern.test(currentCommit)) {
+    for (const args of [['-C', appDir], ...(sourceCache ? [['--git-dir=' + sourceCache]] : [])]) {
+      try { git(...args, 'merge-base', '--is-ancestor', currentCommit, targetCommit); return } catch {}
+    }
+  }
+  throw Error('无法确认下载内容比当前构建更新；请先在酒馆检查更新后重试，现有安装未覆盖')
+}
+
+verifyInstallSource({appDir:process.argv[2],sourceDir:process.argv[3],targetCommit:process.argv[4],requestedCommit:process.argv[5] === '-' ? '' : process.argv[5],sourceCache:process.argv[6]})
+VERIFY_INSTALL_SOURCE
+# END INSTALL SOURCE VERIFICATION
 
 # Read the downloaded release's version, not the bootstrap script's or npm's latest.
 ADAPTED_DSH_VERSION=$(node "${SOURCE_DIR}/bin/dsh-compatibility.mjs" --version)
@@ -215,8 +289,14 @@ fi
 command -v pnpm >/dev/null 2>&1 || fail "未找到 pnpm。Desktop 版请从 DSH Desktop 托盘打开 DSH Terminal 后运行本命令。"
 [ "${INSTALL_HOST}" = "cli" ] || command -v dsh >/dev/null 2>&1 || fail "未找到 DSH。Desktop 版请从 DSH Desktop 托盘打开 DSH Terminal 后运行本命令。"
 
+# Validate the downloaded release against the host before replacing any app files.
+if [ "${INSTALL_HOST}" != "cli" ]; then
+  CURRENT_DSH_VERSION=$(dsh --version) || fail "无法读取宿主 DSH 版本。"
+  node "${SOURCE_DIR}/bin/dsh-compatibility.mjs" --check "${INSTALL_HOST}" "${CURRENT_DSH_VERSION}"
+fi
+
 if [ "${INSTALL_HOST}" = "cli" ] && [ -f "${APP_DIR}/bin/dsh-tavern.mjs" ]; then
-  DSH_HOME=${DSH_ROOT} node "${APP_DIR}/bin/dsh-tavern.mjs" stop >/dev/null 2>&1 || true
+  DSH_HOME=${DSH_ROOT} node "${APP_DIR}/bin/dsh-tavern.mjs" stop || fail "旧服务未能安全停止，尚未覆盖程序文件。"
 fi
 
 mkdir -p "${APP_DIR}"

@@ -1,3 +1,4 @@
+import { postureForContext } from './posture-context.js'
 import { randomUUID } from 'node:crypto'
 
 function str(value) {
@@ -124,6 +125,9 @@ export function createPhoneChat(options) {
   const id = typeof options.id === 'function' ? options.id : randomUUID
   const queues = new Map()
   const activeRequests = new Set()
+  function assertIdle(chat) {
+    if (options.isBusy?.(chat)) throw new Error('请等待当前生成或后台处理完成后再发送手机消息')
+  }
 
   function requestKey(chatId, contactIdValue, requestId) {
     return [str(chatId), str(contactIdValue), str(requestId)].join('\u0000')
@@ -143,6 +147,7 @@ export function createPhoneChat(options) {
 
   async function saveMessage(chatId, contact, requestId, text) {
     return await store.updateChat(chatId, function (chat) {
+      assertIdle(chat)
       const document = phoneDocument(chat)
       const thread = threadOf(document, contact.id)
       const duplicate = thread.messages.find(function (message) { return message.requestId === requestId && message.role === 'user' })
@@ -191,6 +196,7 @@ export function createPhoneChat(options) {
     if (sessionId === '' || requestId === '' || text === '') throw new Error('手机聊天缺少会话、请求或消息内容')
     let chat = await store.chatForSession(sessionId)
     if (chat === undefined) throw new Error('当前 Session 没有对应的 Tavern Chat')
+    assertIdle(chat)
     const card = await store.readCard(chat.cardPath)
     if (card === undefined) throw new Error('当前人物卡不存在')
     const contacts = contactsOf(card, chat)
@@ -203,7 +209,9 @@ export function createPhoneChat(options) {
     chat = await saveMessage(chat.id, contact, requestId, text)
     const document = phoneDocument(chat)
     const thread = threadOf(document, contact.id)
-    const selected = selection(chat)
+    let selected
+    try { selected = await selection(chat) }
+    catch (error) { await fail(chat.id, contact.id, requestId, error); throw error }
     if (selected === null || selected === undefined) {
       const error = new Error('当前没有可用的后台模型')
       await fail(chat.id, contact.id, requestId, error)
@@ -212,7 +220,7 @@ export function createPhoneChat(options) {
     const context = [
       '联系人：' + contact.name,
       contact.profile ? '人物设定：\n' + contact.profile : '',
-      chat.posture ? '当前场景状态：\n' + compact(chat.posture, 1200) : '',
+      postureForContext(chat) ? '当前场景状态：\n' + compact(postureForContext(chat), 1200) : '',
       recentStory(chat) ? '最近剧情：\n' + recentStory(chat) : ''
     ].filter(Boolean).join('\n\n')
     const activeKey = requestKey(chat.id, contact.id, requestId)

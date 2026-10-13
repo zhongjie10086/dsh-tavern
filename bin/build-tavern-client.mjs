@@ -1,5 +1,6 @@
 import { readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import vm from 'node:vm'
 import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
@@ -31,13 +32,19 @@ async function expand(source, seen) {
 
 export async function assembleTavernClient() {
   const template = normalized(await readFile(templatePath, 'utf8'))
-  return banner + normalized(await expand(template, new Set()))
+  // CSS is embedded as a JS string. Normalize before stringify too, otherwise
+  // a Windows checkout bakes literal \\r escapes into the committed bundle.
+  const css = (await readFile(path.join(root, 'tavern-plugin/lib/client-assets/tavern.css'), 'utf8')).replace(/\r\n?/g, '\n')
+  const expanded = await expand(template, new Set())
+  return banner + normalized(expanded.replace('__TAVERN_BUNDLED_CSS__', () => JSON.stringify(css)))
 }
 
 export async function buildTavernClient({ check = false } = {}) {
   const output = await assembleTavernClient()
+  // Validate the whole generated program before comparing or publishing it.
+  new vm.Script(output, { filename: outputPath })
   const current = await readFile(outputPath, 'utf8').catch(() => '')
-  if (current === output) return Object.freeze({ changed: false, path: outputPath })
+  if (current.replace(/\r\n?/g, '\n') === output) return Object.freeze({ changed: false, path: outputPath })
   if (check) throw new Error('tavern-plugin/lib/client.js 已过期，请运行 pnpm build:client')
   const temporary = outputPath + `.tmp-${process.pid}`
   try {

@@ -1,2 +1,3 @@
-# Audited runtime bytes must not be rewritten by Windows core.autocrlf.
-tavern-plugin/lib/vendor/magvarupdate/host-build/artifact/bundle.js -text
+# Preserve audited source and artifact bytes in clones on every platform.
+# Runtime and third-party manifests hash exact bytes, including line endings.
+* -text

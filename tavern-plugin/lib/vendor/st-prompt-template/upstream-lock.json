@@ -7,25 +7,20 @@
     "dist/"
   ],
   "files": {
-    ".github/workflows/auto-build.yml": "0631a6a9968acd8061bae04e256e85167281a522570bb05744f5911d043a8f6d",
     ".gitignore": "d373417ea2a8844e3b7a1515aab123e90fbeb4b7225144d55d243d9f6f04f73a",
-    "LICENSE": "8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef",
-    "README.md": "c59441a4f827d4b40bc3fa44e737fa96378520560ac04b72f77b3783290497ed",
-    "README_CN.md": "31b59a7dad77d0ba38999ec367bf8e96c6de04a7efa6f771361378238904ddcd",
     "babel.config.json": "677c1c7ac0229a8621f85829fb178466892e60444fb99f4b1b5bba5a4785e907",
-    "docs/features.md": "e4be97267abfafa3478e74acde950621abaf516c4b8bc3e2d9892a414fc2c74e",
-    "docs/features_cn.md": "600c7465e03e3b3f75361b95fbe7bbbeb4225fdf8055045711fd178f3044ed98",
-    "docs/reference.md": "91291f1169d6b96f131e7426727cf0c2e210dd4fbad8dd089defdfe42dfea7b1",
-    "docs/reference_cn.md": "aedb3310b107111372e8de7fed5eaac13df7f6f9a8bbc6291b567d4082b98e65",
-    "include/reference.js": "f669236a74734f34167815c1a8c3bb035d57957d11e36d5c00f9143680c9aa93",
     "include/reference_cn.js": "37707077bb6cd00273a59a4de9d61a87c47e7de5df1a48342e370aec458ccc57",
+    "include/reference.js": "f669236a74734f34167815c1a8c3bb035d57957d11e36d5c00f9143680c9aa93",
     "libs/buffer.mjs": "43d7ffab85c67adc0575a7d7c463e84a61ee8efc455d95665c8eb8d4a31e17cd",
     "libs/faker.mjs": "e89e9d69ec8e237f5527eb1a8e860894df1b5b217836c2c34fd48a5d7e145000",
+    "LICENSE": "8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef",
     "locales/zh-cn.json": "25ee75b85e9cd51df5ee5e0a0ec66de1d825bc09bb59b8c08511898024c64ab2",
     "locales/zh-tw.json": "fabfc5ca6f9324679c4653b5d67f5eaa0613aa110ea9485613c2705dbe4c6eca",
     "manifest.json": "6337ad56c4bc2f48e28f874533f690e48918900afe4bbb0d68e5125d7204e5fc",
     "package-lock.json": "cccea9100adf445e65f2a84f7124369076107e73d37038b85f520e3840a4d621",
     "package.json": "8c859650ab3d22a8e31af557c9a12c3196ab4413e6632c26133aa6548e0c3d00",
+    "README_CN.md": "31b59a7dad77d0ba38999ec367bf8e96c6de04a7efa6f771361378238904ddcd",
+    "README.md": "c59441a4f827d4b40bc3fa44e737fa96378520560ac04b72f77b3783290497ed",
     "settings.html": "d659bf1fd60c2a0a937f1438e9e898dd40c6a27ded074ae563e9e415ac8d8c36",
     "src/3rdparty/ejs.js": "66b3c84f33adbf154950e18cb55704062e3fa5e2f4e69001f6df296d11548d54",
     "src/3rdparty/vm-browserify.ts": "337ba335ec3f16368fc794b7dc7c33f1abf1537dee1c2d4af41bf83f55babdec",
@@ -55,8 +50,12 @@
     "src/utils/iframe.ts": "425b59b172b921fe7d1f3db93b05e91c5462df9d7630dfa4e5a7d9e5f0ef8796",
     "src/utils/prompts.ts": "a30fd85ddaed666b907a73814a43115718d8595a32e9a93f6408b8f259002720",
     "src/utils/zodutl.ts": "20bf4ef0320f81ca9cb9373d3b8d1369e6bdb089c8d8ee9b1fa1fb1aabaa6d6b",
-    "tests/Inject_test.json": "c72fa79a84e30e9f229d61b8146061b77f5d16c074d2d97ea0090e5d721d48d4",
     "tsconfig.json": "7c15e9f07f35e086d72aaa8317b5aee0458a96de1c16b696b5978fbc20c49baf",
     "webpack.config.js": "997f2bf24161733f989200b8a3d616bb1147021da359dd28857e81510ecbe3e0"
-  }
+  },
+  "releaseExcludedPaths": [
+    "docs/",
+    "tests/",
+    ".github/"
+  ]
 }

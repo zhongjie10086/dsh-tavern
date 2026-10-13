@@ -1,5 +1,6 @@
 import { IMAGE_ADVANCED_FIELDS, channelSettings, channelNeedsKey, channelReady, imageCredentialRef, SCENE_IMAGE_CHANNELS } from './tavern/scene-image-channels.js'
 import { createSceneImageConnection } from './tavern/scene-image-connection.js'
+import {safeOutboundFetch} from './tavern/outbound-network-policy.js'
 import { generateSceneImage } from './tavern/scene-image-provider.js'
 
 // Same fields and credentials as the original plugin UI. Remaining providers
@@ -29,7 +30,7 @@ function readChannel(value, id) {
 }
 
 /** A private in-process interface: secrets never cross the Studio HTTP route. */
-export function createImageConfiguration({ read, write, restore = /** @type {((value: any) => Promise<unknown>) | undefined} */ (undefined), credentials, attachments, fetchImpl = fetch, generateImpl = generateSceneImage, onDiagnostic = undefined }) {
+export function createImageConfiguration({ read, write, restore = /** @type {((value: any) => Promise<unknown>) | undefined} */ (undefined), credentials, attachments, fetchImpl = /** @type {any} */ (undefined), lookup = /** @type {any} */ (undefined), generateImpl = generateSceneImage, onDiagnostic = undefined }) {
   let pending = Promise.resolve()
   /** @template T @param {() => T | Promise<T>} fn @returns {Promise<T>} */
   function serial(fn) { const result = pending.then(fn); pending = result.catch(() => {}); return result }
@@ -82,7 +83,7 @@ export function createImageConfiguration({ read, write, restore = /** @type {((v
     // The original probe code addresses channel refs. Translate to plugin refs.
     const id = [...ids].find(id => imageCredentialRef(id) === oldRef)
     return credentials.resolve(id && mapped[id] ? mapped[id][3] : oldRef)
-  } }), fetchImpl, onDiagnostic })
+  } }), fetchImpl, lookup, onDiagnostic })
   return {
     serial,
     inspect: id => serial(() => inspect(id)),
@@ -102,7 +103,7 @@ export function createImageConfiguration({ read, write, restore = /** @type {((v
         return { ...input, ...structuredClone(channelSettings(input)) }
       })
       request.signal?.throwIfAborted()
-      const generated = await generateImpl(request, fetchImpl === globalThis.fetch ? {} : { fetch: fetchImpl })
+      const generated = await generateImpl(request, {fetch:(url,init)=>safeOutboundFetch(url,init,{purpose:'model',trustedResource:true,fetcher:fetchImpl,lookup})})
       if (!attachments) return generated
       // Always hand received bytes back to Tavern's durable save/recovery flow.
       // A local attachment failure must never turn into another paid generation.

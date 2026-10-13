@@ -1,5 +1,10 @@
+import {projectPrivateWorldbook,storePrivateWorldbook,storeMergedPrivateWorldbook,privateWorldbookState,worldbookSourceKey,mergePrivateWorldbooks,createPrivateWorldbook} from './private-worldbooks.js'
+import { filterSpWorldbookOwner,removeSpWorldbookMirror } from './sp-fill-worldbook.js'
 import { mergeWorldBooks } from './worldbook-merge.js'
 import { exportCharacterBook, exportSillyTavernWorldBook, inspectWorldBookDocument, prepareWorldBookImport, updateWorldBookDocument } from './worldbook-resource.js'
+import {createDependencyProjectionCache} from './dependency-projection-cache.js'
+import { createVersionedJsonCache } from './versioned-json-cache.js'
+import { finishJsonDraft, mutableJsonDraft } from './json-draft.js'
 
 function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
@@ -28,16 +33,28 @@ export function createWorldBookLibrary(options = {}) {
     throw new Error('World Book Library 缺少资源、人物卡或路径 adapter')
   }
 
-  function sourceOf(locator) {
+  async function sourceOf(locator) {
     const source = locator && typeof locator === 'object' ? locator : {}
     if (source.kind === 'card') {
-      return { kind: 'card', cardPath: normalizePath(source.cardPath, 'card') }
+      return { kind: 'card', cardPath: await normalizePath(source.cardPath, 'card') }
     }
-    return { kind: 'standalone', path: normalizePath(source.path, 'worldbook') }
+    return { kind: 'standalone', path: await normalizePath(source.path, 'worldbook') }
   }
 
+  const recordCache = createVersionedJsonCache()
+  const privateCache=createDependencyProjectionCache({maxEntries:32,maxBytes:64*1024*1024})
+  const mergeCache=createDependencyProjectionCache({maxEntries:8,maxBytes:64*1024*1024})
+  async function mergeForChat(records,chat){return mutableJsonDraft(await mergeCache.read(chat.id,{records:records.map(finishJsonDraft),id:chat.id,mergeUids:privateWorldbookState(chat).mergeUids},()=>mergePrivateWorldbooks(records,chat)))}
   async function readRecord(locator) {
-    const source = sourceOf(locator)
+    const source = await sourceOf(locator)
+    // Only resource content is cached. Identity, binding and per-chat overlays
+    // are resolved anew; adapters without reliable versions stay uncached.
+    if (typeof options.resourceVersion !== 'function') return loadRecord(source)
+    const key = source.cardPath || source.path
+    return mutableJsonDraft(await recordCache.read(key, () => options.resourceVersion(key), () => loadRecord(source)))
+  }
+
+  async function loadRecord(source) {
     if (source.kind === 'card') {
       const card = await cards.read(source.cardPath)
       if (card === undefined) throw new Error('人物卡不存在: ' + source.cardPath)
@@ -59,6 +76,63 @@ export function createWorldBookLibrary(options = {}) {
     }
   }
 
+
+  async function liveStamp(chat){
+    if(!chat)return ''
+    const local=chat.worldbookState?.bindings?.character,current=local?null:await binding(chat.cardPath),sources=local??(current.kind==='multiple'?current.books.map(row=>row.source):current.source?[current.source]:[])
+    const all=[...sources,...await (options.additionalSources?.(chat)||[])]
+    return JSON.stringify(await Promise.all(all.map(async source=>source.kind==='chat'?[source.id]:[source,await Promise.resolve(options.resourceVersion?.(source.cardPath||source.path)).catch(error=>{if(error?.code==='ENOENT')return 'missing';throw error})])))
+  }
+  async function privateSource(locator) {
+    if(locator?.kind==='chat')return clone(locator)
+    if(locator?.resourceId&&options.identities){const identity=await options.identities.resolve(locator.resourceId);if(!identity||identity.deleted)return {...locator,missing:true};return {...locator,...(locator.kind==='card'?{cardPath:identity.path}:{path:identity.path})}}
+    const source=await sourceOf(locator)
+    if(options.identities){const identity=await options.identities.claim(source.cardPath||source.path);source.resourceId=identity.id}
+    return source
+  }
+  async function getForChat(chat,locator) {
+    const source=await privateSource(locator);let live
+    if(source.kind!=='chat'&&!source.missing){try{live=await readRecord(source)}catch(error){if(!privateWorldbookState(chat).books[worldbookSourceKey(source)]?.base)throw error}}
+    // Resolve identity, actual bytes/errors/deletion and local changes first.
+    // Cache only the pure projection; mirrors remain a live downstream input.
+    const input={source,id:chat.id,local:finishJsonDraft(privateWorldbookState(chat).books[worldbookSourceKey(source)]),live:finishJsonDraft(live)}
+    const record=mutableJsonDraft(await privateCache.read(JSON.stringify([chat.id,worldbookSourceKey(source)]),input,()=>projectPrivateWorldbook(chat,source,input.live)))
+    return options.projectMirror?options.projectMirror(record,chat):record
+  }
+  function validateNative(document){
+    if(!document||typeof document!=='object'||Array.isArray(document)||!document.entries||typeof document.entries!=='object'||Array.isArray(document.entries))throw Error('原生世界书需要 entries 对象')
+    for(const [key,row]of Object.entries(document.entries))if(!row||typeof row!=='object'||Array.isArray(row)||!Number.isSafeInteger(row.uid)||row.uid<0||String(row.uid)!==key)throw Error('世界书条目编号无效或重复')
+  }
+  async function ensurePrivateBase(chat,source){const record=await getForChat(chat,source);if(record&&!privateWorldbookState(chat).books[worldbookSourceKey(record.source)])storePrivateWorldbook(chat,record,record.document);return record}
+  async function replaceForChat(chat,record,document){
+    validateNative(document);
+    if(chat.worldbookState?.spMirrors){document=removeSpWorldbookMirror(document,chat.id);record={...record,document:removeSpWorldbookMirror(record.document,chat.id),baseDocument:record.baseDocument?removeSpWorldbookMirror(record.baseDocument,chat.id):record.baseDocument,mergedRecords:record.mergedRecords?.map(row=>({...row,document:removeSpWorldbookMirror(row.document,chat.id),baseDocument:row.baseDocument?removeSpWorldbookMirror(row.baseDocument,chat.id):row.baseDocument}))}}
+    storeMergedPrivateWorldbook(chat,record,document)
+    const records=record.mergedRecords?await Promise.all(record.mergedRecords.map(row=>getForChat(chat,row.source))):[await getForChat(chat,record.source)]
+    return mergePrivateWorldbooks(records.filter(Boolean),chat)
+  }
+  async function migrateChat(chat){
+    if(chat.worldbookState?.version===1&&chat.openingWorldbookSnapshot?.version!==1)return false
+    const legacy=chat.openingWorldbookSnapshot,state=clone(privateWorldbookState(chat));chat.worldbookState=state
+    if(legacy?.version===1&&legacy.document){
+      const full=exportSillyTavernWorldBook(legacy.document),rows=legacy.mergedSources?.length?legacy.mergedSources:[{source:legacy.source,entries:Object.keys(full.entries).map(uid=>({uid:Number(uid),originalUid:Number(uid)}))}],sources=[],claimed=new Set(),mergeUids={}
+      for(const row of rows){if(!row.source)continue;const source=await privateSource(row.source);let record
+        try{record=await getForChat(chat,source)}catch{}
+        const fallback={...full,entries:{}};record ||= projectPrivateWorldbook(chat,source,{document:fallback})
+        const requested={...clone(record.document),entries:{}}
+        for(const {uid,originalUid}of row.entries||[]){const value=full.entries[uid];if(!value)continue;claimed.add(String(uid));requested.entries[originalUid]={...clone(value),uid:originalUid};mergeUids[worldbookSourceKey(source)+':'+originalUid]=uid}
+        // Unmapped old entries are private additions in the first source, never dropped.
+        if(sources.length===0){for(const [uid,value]of Object.entries(full.entries))if(!rows.some(other=>(other.entries||[]).some(e=>String(e.uid)===uid)))requested.entries[uid]=clone(value);Object.assign(requested,Object.fromEntries(Object.entries(full).filter(([key])=>key!=='entries')))}
+        storePrivateWorldbook(chat,record,requested);sources.push(source)
+      }
+      if(!sources.length){const source=createPrivateWorldbook(chat,full.name||'旧局世界书',full);sources.push(source)}
+      chat.worldbookState.bindings={...chat.worldbookState.bindings,character:sources};chat.worldbookState.mergeUids=mergeUids
+      chat.worldbookState.migration={version:1,policy:'preserve-legacy-differences'}
+    }else if(legacy?.version===1)chat.worldbookState.bindings={...chat.worldbookState.bindings,character:[]}
+    if(legacy?.version===1)chat.openingWorldbookSnapshot={version:2,source:legacy.source||null,libraryDigest:legacy.libraryDigest||null}
+    chat.cardContextSnapshotVersion=0
+    return true
+  }
   async function get(locator) {
     const record = await readRecord(locator)
     return { source: record.source, view: record.view }
@@ -67,11 +141,16 @@ export function createWorldBookLibrary(options = {}) {
   async function catalog() {
     const standaloneResults = await Promise.all((await resources.list('worldbook')).map(async function (path) {
       try {
-        const record = await readRecord({ kind: 'standalone', path })
+        const [record, metadata] = await Promise.all([
+          readRecord({ kind: 'standalone', path }),
+          typeof resources.metadata === 'function' ? resources.metadata(path) : null
+        ])
         return { row: {
           kind: 'standalone', path: record.source.path, name: record.view.displayName,
           entryCount: record.view.entryCount, enabledCount: record.view.enabledCount,
-          diagnostics: record.view.diagnostics.length
+          diagnostics: record.view.diagnostics.length,
+          importedAt: Math.max(0, Number(metadata && metadata.importedAt) || 0),
+          updatedAt: Math.max(0, Number(metadata && metadata.updatedAt) || 0)
         } }
       } catch (error) {
         return { diagnostic: { kind: 'standalone', path, message: str(error && error.message || error) } }
@@ -79,13 +158,18 @@ export function createWorldBookLibrary(options = {}) {
     }))
     const embeddedResults = await Promise.all((await cards.listPaths()).map(async function (cardPath) {
       try {
-        const card = await cards.read(cardPath)
+        const [card, metadata] = await Promise.all([
+          cards.read(cardPath),
+          typeof cards.metadata === 'function' ? cards.metadata(cardPath) : null
+        ])
         if (!card || !card.character_book || typeof card.character_book !== 'object') return {}
         const view = inspectWorldBookDocument(card.character_book, { filename: card.name })
         return { row: {
           kind: 'card', cardPath, cardName: card.name, name: view.displayName,
           entryCount: view.entryCount, enabledCount: view.enabledCount,
-          diagnostics: view.diagnostics.length
+          diagnostics: view.diagnostics.length,
+          importedAt: Math.max(0, Number(metadata && metadata.importedAt) || 0),
+          updatedAt: Math.max(0, Number(metadata && metadata.updatedAt) || 0)
         } }
       } catch (error) {
         return { diagnostic: { kind: 'card', path: cardPath, message: str(error && error.message || error) } }
@@ -98,13 +182,13 @@ export function createWorldBookLibrary(options = {}) {
   }
 
   async function binding(cardPath) {
-    const normalized = normalizePath(cardPath, 'card')
+    const normalized = await normalizePath(cardPath, 'card')
     const card = await cards.read(normalized)
     if (card === undefined) throw new Error('人物卡不存在: ' + normalized)
     const stored = await resources.bindingForCard(normalized)
     if (stored.kind === 'multiple') {
       const books = await Promise.all(stored.sources.map(async item => {
-        const source = sourceOf(item.kind === 'embedded' ? { kind: 'card', cardPath: item.cardPath } : item)
+        const source = await sourceOf(item.kind === 'embedded' ? { kind: 'card', cardPath: item.cardPath } : item)
         const kind = source.kind === 'card' ? 'embedded' : 'standalone'
         if (!item.available) return { kind, source, name: '', available: false }
         const record = await readRecord(source)
@@ -154,7 +238,7 @@ export function createWorldBookLibrary(options = {}) {
   }
 
   async function associations(locator) {
-    const source = sourceOf(locator)
+    const source = await sourceOf(locator)
     const cardPaths = await cards.listPaths()
     const cardRows = []
     for (const cardPath of cardPaths) {
@@ -174,33 +258,38 @@ export function createWorldBookLibrary(options = {}) {
     return { source, cards: cardRows, boundCards, conflict: false }
   }
 
-  async function bound(cardPath, card, chat) {
-    if (chat?.openingWorldbookSnapshot?.version === 1) {
-      const snapshot = chat.openingWorldbookSnapshot
-      if (snapshot.document === null) return null
-      return { source: clone(snapshot.source), document: clone(snapshot.document),
-        localChatId: chat.id, view: inspectWorldBookDocument(snapshot.document) }
-    }
-    const current = await binding(cardPath)
-    if (current.kind === 'none') return null
-    if (current.available !== true) throw new Error('绑定的世界书不存在，请重新绑定或解绑')
-    if (current.kind === 'multiple') {
-      const records = await Promise.all(current.books.map(book => readRecord(book.source)))
-      const merged = mergeWorldBooks(records)
-      return { source: current.source, document: merged.document, localChatId: chat?.id, mergedSources: merged.sources, view: inspectWorldBookDocument(merged.document) }
-    }
-    if (current.kind === 'embedded' && card && current.source.cardPath === normalizePath(cardPath, 'card')) {
-      const document = embeddedDocument(card)
-      return { source: current.source, view: inspectWorldBookDocument(document, { filename: card.name }) }
-    }
-    return await get(current.source)
+  async function boundCard(cardPath, card, chat) { return filterSpWorldbookOwner(await rawBoundCard(cardPath,card,chat),chat) }
+  async function rawBoundCard(cardPath, card, chat) {
+    if(chat?.openingWorldbookSnapshot?.version===1){chat=clone(chat);await migrateChat(chat)}
+    const localSources=chat?.worldbookState?.bindings?.character,current=localSources?null:await binding(cardPath)
+    if(current?.available===false)throw new Error('绑定的世界书不存在，请重新绑定或解绑')
+    const sources=localSources??(current.kind==='multiple'?current.books.map(row=>row.source):current.source?[current.source]:[])
+    const records=(await Promise.all(sources.map(source=>chat?getForChat(chat,source):readRecord(source)))).filter(Boolean)
+    if(!records.length)return null
+    if(chat)return mergeForChat(records,chat)
+    if(records.length===1)return records[0]
+    const merged=mergeWorldBooks(records);return {source:records[0].source,document:merged.document,mergedSources:merged.sources,view:inspectWorldBookDocument(merged.document)}
   }
 
+  async function bound(cardPath,card,chat) {
+    if(chat?.openingWorldbookSnapshot?.version===1){chat=clone(chat);await migrateChat(chat)}
+    const primary=await boundCard(cardPath,card,chat)
+    if(!options.additionalSources)return primary
+    const records=primary?.mergedRecords|| (primary?[primary]:[]),seen=new Set(records.map(row=>worldbookSourceKey(row.source)))
+    for(const locator of await options.additionalSources(chat)){
+      const record=chat?await getForChat(chat,locator):await readRecord(locator);if(!record)continue
+      const key=worldbookSourceKey(record.source);if(seen.has(key))continue;seen.add(key);records.push(filterSpWorldbookOwner(record,chat))
+    }
+    if(!records.length)return null
+    if(records.length===1)return records[0]
+    if(chat)return mergeForChat(records,chat)
+    const merged=mergeWorldBooks(records);return {source:records[0].source,document:merged.document,mergedSources:merged.sources,view:inspectWorldBookDocument(merged.document)}
+  }
   async function bind(cardPath, locator) {
-    const normalized = normalizePath(cardPath, 'card')
+    const normalized = await normalizePath(cardPath, 'card')
     const card = await cards.read(normalized)
     if (card === undefined) throw new Error('人物卡不存在: ' + normalized)
-    const source = sourceOf(locator)
+    const source = await sourceOf(locator)
     if (source.kind === 'card') {
       const owner = await cards.read(source.cardPath)
       if (owner === undefined) throw new Error('人物卡不存在: ' + source.cardPath)
@@ -213,9 +302,9 @@ export function createWorldBookLibrary(options = {}) {
   }
 
   async function setBindings(cardPath, locators) {
-    const normalized = normalizePath(cardPath, 'card')
+    const normalized = await normalizePath(cardPath, 'card')
     if (!Array.isArray(locators)) throw new Error('世界书绑定需要有序列表')
-    const sources = locators.map(sourceOf)
+    const sources = await Promise.all(locators.map(sourceOf))
     const identities = sources.map(source => JSON.stringify(source))
     if (new Set(identities).size !== identities.length) throw new Error('不能重复绑定同一本世界书')
     for (const source of sources) {
@@ -233,7 +322,7 @@ export function createWorldBookLibrary(options = {}) {
     if (!locator) { await resources.unbind(cardPath); return await binding(cardPath) }
     const current = await binding(cardPath)
     const books = current.kind === 'multiple' ? current.books : current.source ? [current] : []
-    const source = sourceOf(locator)
+    const source = await sourceOf(locator)
     return await setBindings(cardPath, books.filter(book => !bindingMatchesSource(book, source)).map(book => book.source))
   }
 
@@ -292,9 +381,15 @@ export function createWorldBookLibrary(options = {}) {
     return exportCharacterBook(record.document || record.view.raw)
   }
 
-  async function remove(path) {
-    return await removeStandalone(normalizePath(path, 'worldbook'))
+  async function remove(locator) {
+    const source = await sourceOf(typeof locator === 'string' ? { kind: 'standalone', path: locator } : locator)
+    if (source.kind === 'standalone') return await removeStandalone(source.path)
+    await readRecord(source)
+    const relations = await associations(source)
+    for (const card of relations.boundCards) await unbind(card.path, source)
+    await cards.update(source.cardPath, { character_book: null })
+    return { removed: source.cardPath, kind: 'embedded' }
   }
 
-  return Object.freeze({ catalog, get, binding, associations, bound, bind, setBindings, unbind, import: importBook, update, replaceNative, export: exportBook, characterBookForCard, remove })
+  return Object.freeze({ catalog, get, liveStamp, getForChat, ensurePrivateBase, migrateChat, replaceForChat, privateSource, binding, associations, bound, boundCard, bindingStamp: options.bindingStamp, bind, setBindings, unbind, import: importBook, update, replaceNative, export: exportBook, characterBookForCard, remove })
 }

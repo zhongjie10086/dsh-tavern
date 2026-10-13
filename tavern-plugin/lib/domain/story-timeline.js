@@ -1,5 +1,9 @@
+import {mutableJsonDraft,immutableJsonSnapshot} from './json-draft.js'
+import {captureOriginalSpPersistence,restoreOriginalSpPersistence} from './sp-authority.js'
+import {projectCharacterDesignRollback} from './character-design-rollback.js'
+
 function clone(value) {
-  return value === undefined ? undefined : JSON.parse(JSON.stringify(value))
+  return mutableJsonDraft(immutableJsonSnapshot(value))
 }
 
 function storageRevision(chat) {
@@ -19,7 +23,8 @@ function sameBasedOn(left, right) {
 }
 
 function participantRole(role) {
-  return role === 'candidate' || role === 'settlement' ? 'background' : role
+  // The 设计人物 task (87c4b25a) shares the game's background agent like candidates and settlement.
+  return role === 'candidate' || role === 'settlement' || role === 'character-design' ? 'background' : role
 }
 
 function participantLifetime(value) {
@@ -109,6 +114,8 @@ export function createStoryTimeline(options = {}) {
       macroState: chat.macroState === undefined ? null : chat.macroState,
       tavernScriptPrompts: chat.tavernScriptPrompts || [],
       runtimeInputs: chat.runtimeInputs === undefined ? null : chat.runtimeInputs,
+      ...Object.fromEntries(['worldbookState','openingWorldbookSnapshot','chatWorldbookBindings','characterDesignDocument','variables','tavernHelperScriptVariables','tavernPluginMetadata'].map(key => [key, chat[key] ?? null])),
+      spDatabase: chat.spDatabase || null,
       posture: str(chat.posture),
       ledger: chat.ledger || null,
       scriptState: chat.scriptState === undefined ? null : chat.scriptState,
@@ -123,14 +130,23 @@ export function createStoryTimeline(options = {}) {
     })
   }
 
-  function restore(chat, state) {
+  function restore(chat, state, { preserveSpDatabase = false, originalSpDeletion = null } = {}) {
     const source = object(state)
+    const originalSp = preserveSpDatabase || chat.spAuthority?.owner === 'original' ? captureOriginalSpPersistence(chat) : null
     chat.messages = clone(Array.isArray(source.messages) ? source.messages : [])
     chat.presentation = clone(source.presentation === undefined ? null : source.presentation)
     chat.presentationWarnings = clone(Array.isArray(source.presentationWarnings) ? source.presentationWarnings : [])
     if (Object.hasOwn(source, 'macroState')) chat.macroState = clone(source.macroState)
     if (Object.hasOwn(source, 'runtimeInputs')) chat.runtimeInputs = clone(source.runtimeInputs)
+    for (const key of ['worldbookState','openingWorldbookSnapshot','chatWorldbookBindings','characterDesignDocument','variables','tavernHelperScriptVariables','tavernPluginMetadata']) {
+      if (!Object.hasOwn(source, key)) continue // Older inline checkpoints never captured these fields.
+      if (source[key] === null) delete chat[key]
+      else chat[key] = clone(source[key])
+    }
+    if (Object.hasOwn(source, 'worldbookState')) { chat.cardContextSnapshotVersion = 0; delete chat.helperWorldbookBindingsStamp }
     chat.tavernScriptPrompts = clone(source.tavernScriptPrompts || [])
+    if(!preserveSpDatabase && chat.spAuthority?.owner!=='original')chat.spDatabase = clone(source.spDatabase || null)
+    chat.resolvedRuntimePreset = clone(source.resolvedRuntimePreset || null)
     chat.posture = str(source.posture)
     chat.ledger = clone(source.ledger || null)
     chat.scriptState = clone(source.scriptState === undefined ? null : source.scriptState)
@@ -141,11 +157,54 @@ export function createStoryTimeline(options = {}) {
     chat.preparedWorldBookContext = str(source.preparedWorldBookContext)
     chat.preparedWorldBook = clone(source.preparedWorldBook === undefined ? null : source.preparedWorldBook)
     chat.worldBookReads = clone(source.worldBookReads === undefined ? null : source.worldBookReads)
+    if(originalSp)restoreOriginalSpPersistence(chat,originalSp,{deletion:originalSpDeletion})
   }
 
-  function trimOperations(timeline) {
+  function trimOperations(chat, admitted) {
+    const timeline = chat.timeline
     const entries = Object.values(timeline.operations).sort(function (left, right) { return (Number(right.createdAt) || 0) - (Number(left.createdAt) || 0) })
-    for (const operation of entries.slice(80)) delete timeline.operations[operation.id]
+    // Keep admission even when timestamps tie. A settlement must not prune the
+    // body that complete() will validate before applying its prepared effect.
+    const retained = new Set([admitted.id])
+    const rounds = new Map()
+    function retainRound(round) {
+      if (!round || round.kind !== 'body' || round.status !== 'completed'
+        || str(round.committedBranchId) !== timeline.branchId
+        || Number(round.committedRevision) > timeline.revision) return
+      retained.add(round.id)
+      rounds.set(round.id, round)
+    }
+    const running = entries.find(operation => operation.kind === 'agent' && operation.role === 'settlement'
+      && operation.status === 'running' && sameBasedOn(operation.basedOn, basedOn(chat)))
+    if (running) {
+      retained.add(running.id)
+      retainRound(timeline.operations[running.roundOperationId])
+    }
+    // Preserve the existing scheduler/recovery targets between durable deferral
+    // and resumption, not every historical pending round on the branch.
+    retainRound(pendingSettlementBody(chat))
+    const background = backgroundBody(chat)
+    if (['pending', 'running', 'failed'].includes(background?.background?.phase)) retainRound(background)
+    const latestBody = entries.filter(operation => operation.kind === 'body' && operation.status === 'completed'
+      && str(operation.committedBranchId) === timeline.branchId)
+      .sort((left, right) => Number(right.committedRevision) - Number(left.committedRevision))[0]
+    if (['pending', 'running', 'failed'].includes(latestBody?.background?.phase)) retainRound(latestBody)
+    for (const round of rounds.values()) {
+      // Use the same ordering as recoverBackground, including existing ties.
+      const latest = entries.find(operation => operation.kind === 'agent' && operation.role === 'settlement'
+        && operation.roundOperationId === round.id && str(operation.basedOn?.branchId) === timeline.branchId
+        && Number(operation.basedOn?.revision) <= timeline.revision)
+      if (latest) retained.add(latest.id)
+    }
+    // The selected live set is bounded (admission, active settlement and at most
+    // four selected rounds/receipts). Remaining slots retain ordinary newest
+    // history; superseded, completed and old-branch entries age out as before.
+    let remaining = 80 - retained.size
+    for (const operation of entries) {
+      if (retained.has(operation.id)) continue
+      if (remaining > 0) remaining--
+      else delete timeline.operations[operation.id]
+    }
   }
 
   function operationValue(operation, participant) {
@@ -168,13 +227,13 @@ export function createStoryTimeline(options = {}) {
     })[0]
   }
 
-  function pendingSettlementBody(chat) {
+  function pendingSettlementBody(chat, turn) {
     const latest = Object.values(chat.timeline.operations).filter(function (operation) {
-      return operation.kind === 'body' && operation.status === 'completed' && str(operation.committedBranchId) === chat.timeline.branchId
+      return operation.kind === 'body' && operation.status === 'completed' && str(operation.committedBranchId) === chat.timeline.branchId && ['pending', 'running', 'failed'].includes(str(object(operation.background).phase)) && (turn === undefined || Number(operation.turn) === Number(turn))
     }).sort(function (left, right) {
-      return (Number(right.committedRevision) || 0) - (Number(left.committedRevision) || 0)
+      return (Number(left.committedRevision) || 0) - (Number(right.committedRevision) || 0)
     })[0]
-    return latest !== undefined && ['pending', 'running', 'failed'].includes(str(object(latest.background).phase)) ? latest : undefined
+    return latest
   }
 
   function commitBody(chat, operation) {
@@ -231,7 +290,7 @@ export function createStoryTimeline(options = {}) {
       basedOn: basedOn(chat), beforeRevision: storageRevision(chat), beforeParticipants: clone(chat.timeline.participants), createdAt: now()
     }
     chat.timeline.operations[operation.id] = operation
-    trimOperations(chat.timeline)
+    trimOperations(chat, operation)
     return operationValue(operation)
   }
 
@@ -245,7 +304,7 @@ export function createStoryTimeline(options = {}) {
     if (current.status === 'current' && current.branchId === chat.timeline.branchId && str(current.sessionId) !== '') {
       return { role: participantKey, sessionId: current.sessionId, rewindTo: null, lifetime: participantLifetime(current.lifetime), syncedRevision: current.syncedRevision }
     }
-    if (bound && ['running', 'interrupted', 'failed', 'deferred'].includes(bound.status)) return { role: participantKey, sessionId: bound.startedSessionId, rewindTo: null, lifetime: 'chat', syncedRevision: null }
+    if (current.status !== 'needs-rewind' && bound && ['running', 'interrupted', 'failed', 'deferred'].includes(bound.status)) return { role: participantKey, sessionId: bound.startedSessionId, rewindTo: null, lifetime: 'chat', syncedRevision: null }
     const rewindTo = Number.isSafeInteger(current.rewindTo) ? current.rewindTo : (Number.isSafeInteger(current.boundary) ? current.boundary : null)
     return {
       role: participantKey,
@@ -256,12 +315,17 @@ export function createStoryTimeline(options = {}) {
     }
   }
 
-  function commitParticipant(chat, operation, value) {
-    const participant = object(value)
+  function commitParticipant(chat, operation, value, preserveRewind = false) {
+    let participant = object(value)
+    // Binding is durable before execution; stale receipts cannot transplant a
+    // checkpoint from the old Session into its replacement.
+    if(operation.kind==='agent' && str(operation.startedSessionId) && operation.startedSessionId!==participant.sessionId)
+      participant={...participant,sessionId:operation.startedSessionId,lifetime:'chat',boundary:null}
     if (operation.kind !== 'agent' || str(participant.sessionId) === '') return
     const lifetime = participantLifetime(participant.lifetime)
     const participantKey = participantRole(operation.role)
     const previousParticipant = object(chat.timeline.participants[participantKey])
+    if(preserveRewind && previousParticipant.status==='needs-rewind' && previousParticipant.sessionId===participant.sessionId)return
     const nextParticipant = {
       role: participantKey,
       lifetime,
@@ -339,11 +403,11 @@ export function createStoryTimeline(options = {}) {
       id: makeId('operation'), kind: 'agent', role, status: 'running',
       requestId, basedOn: basedOn(chat), createdAt: now()
     }
-    const round = role === 'settlement' ? pendingSettlementBody(chat) : undefined
+    const round = role === 'settlement' ? pendingSettlementBody(chat, intent.roundTurn) : undefined
     if (round !== undefined) operation.roundOperationId = round.id
     chat.timeline.operations[operation.id] = operation
     if (role === 'settlement') updateSettlementBackground(chat, operation, 'running')
-    trimOperations(chat.timeline)
+    trimOperations(chat, operation)
     return Object.assign(operationValue(operation, participantRequest(chat, role)), { created: true })
   }
 
@@ -373,7 +437,41 @@ export function createStoryTimeline(options = {}) {
         changed = true
       }
     }
+    if (['pending', 'running'].includes(chat.settleStatus)) {
+      chat.settleStatus = 'failed'
+      chat.settleError = '上次结算已中断，请重试结算或继续游玩。'
+      changed = true
+    }
     return { status: changed ? 'recovered' : 'unchanged', role: interruptedRole }
+  }
+
+  function rollbackState(chat, intent) {
+    const checkpoint = chat.timeline.checkpoints.at(-1)
+    if (!checkpoint) {
+      if (intent.legacyBefore) return intent.legacyBefore
+      const error = new Error('没有可回退的剧情 checkpoint')
+      error.code = 'NOTHING_TO_ROLLBACK'
+      throw error
+    }
+    if (checkpoint.before !== undefined && (Object.hasOwn(checkpoint.before, 'characterDesignDocument') || !intent.beforeChat)) return checkpoint.before
+    if (intent.allowMissingHistory === true) return snapshot(object(intent.legacyBefore))
+    const beforeChat = object(intent.beforeChat)
+    const expectedRevision = Math.max(0, Number(checkpoint.beforeRevision) || 0)
+    if (str(beforeChat.id) !== str(chat.id) || storageRevision(beforeChat) !== expectedRevision) {
+      const error = new Error('剧情 checkpoint 需要 storage revision ' + expectedRevision + ' 的历史 Chat')
+      error.code = 'CHECKPOINT_HISTORY_REQUIRED'
+      error.beforeRevision = expectedRevision
+      throw error
+    }
+    const historical = snapshot(beforeChat)
+    // Some older inline checkpoints retained a reliable journal cursor but did
+    // not capture designs. Recover that missing field from the exact revision.
+    return checkpoint.before === undefined ? historical : { ...checkpoint.before, characterDesignDocument: historical.characterDesignDocument }
+  }
+
+  function rollbackPreview(input) {
+    const chat = ensure(input?.chat)
+    return projectCharacterDesignRollback(chat, rollbackState(chat, object(input?.intent)))
   }
 
   function rollback(chat, intent) {
@@ -396,25 +494,9 @@ export function createStoryTimeline(options = {}) {
       if (operation.status === 'running' || (operation.kind === 'body' && operation.status === 'foreground-completed')) operation.status = 'cancelled'
       if (['pending', 'running'].includes(operation.background?.phase)) operation.background = { ...operation.background, phase: 'cancelled' }
     }
-    let restoredState
-    if (checkpoint.before !== undefined) {
-      restoredState = checkpoint.before
-    } else {
-      const beforeChat = object(intent.beforeChat)
-      const expectedRevision = Math.max(0, Number(checkpoint.beforeRevision) || 0)
-      if (intent.allowMissingHistory === true) {
-        restoredState = snapshot(object(intent.legacyBefore))
-      } else {
-        if (str(beforeChat.id) !== str(chat.id) || storageRevision(beforeChat) !== expectedRevision) {
-          const error = new Error('剧情 checkpoint 需要 storage revision ' + expectedRevision + ' 的历史 Chat')
-          error.code = 'CHECKPOINT_HISTORY_REQUIRED'
-          error.beforeRevision = expectedRevision
-          throw error
-        }
-        restoredState = snapshot(beforeChat)
-      }
-    }
-    restore(chat, restoredState)
+    const restoredState = rollbackState(chat, intent)
+    projectCharacterDesignRollback(chat, restoredState)
+    restore(chat, restoredState, { preserveSpDatabase: intent.preserveSpDatabase === true, originalSpDeletion: intent.originalSpDeletion || null })
     const branchId = makeId('branch')
     const restoredParticipants = object(checkpoint.participants || restoredState && restoredState.participants)
     const nextParticipants = {}
@@ -476,6 +558,27 @@ export function createStoryTimeline(options = {}) {
       chat.timeline.revision++
       chat.timeline.updatedAt = now()
       chat.candidates = null
+      // Prose is authoritative. The previous settlement must not overrule the
+      // edited scene in foreground requests or in the resident background Agent.
+      chat.posture = ''
+      chat.lastSettle = null
+      chat.settleStatus = 'idle'
+      chat.settleError = null
+      const checkpoint = chat.timeline.checkpoints.at(-1)
+      for (const [role, participant] of Object.entries(chat.timeline.participants)) {
+        if (!persistentParticipant(participant.lifetime)) continue
+        const previous = object(checkpoint?.participants?.[role])
+        const source = participantCheckpointSource(previous)
+        const needsSession = participant.requiresNewSessionOnRewind === true || !str(participant.sessionId)
+        const boundary = source?.sessionId === participant.sessionId ? source.boundary : -1
+        chat.timeline.participants[role] = {
+          ...participant, status: needsSession ? 'needs-session' : 'needs-rewind',
+          sessionId: needsSession ? '' : participant.sessionId,
+          boundary: needsSession ? null : boundary, rewindTo: needsSession ? null : boundary,
+          syncedRevision: null, updatedAt: now()
+        }
+      }
+      chat.candidateAgent = null
       value = { status: 'edited', revision: chat.timeline.revision }
     }
     else if (intent.kind === 'body.begin') value = beginBody(chat, intent)
@@ -524,7 +627,10 @@ export function createStoryTimeline(options = {}) {
   function complete(input) {
     const chat = ensure(input && input.chat)
     const operation = chat.timeline.operations[str(input && input.operationId)]
-    if (operation === undefined || operation.status !== 'running' || !sameBasedOn(operation.basedOn, input && input.basedOn) || !sameBasedOn(operation.basedOn, basedOn(chat))) {
+    const currentBasis = operation?.kind === 'body'
+      ? str(operation.basedOn?.branchId) === chat.timeline.branchId
+      : sameBasedOn(operation?.basedOn, basedOn(chat))
+    if (operation === undefined || operation.status !== 'running' || !sameBasedOn(operation.basedOn, input && input.basedOn) || !currentBasis) {
       if (operation !== undefined && operation.status === 'running') operation.status = 'stale'
       return { chat, value: { status: 'stale', branchId: chat.timeline.branchId, revision: chat.timeline.revision } }
     }
@@ -540,7 +646,7 @@ export function createStoryTimeline(options = {}) {
       return { chat, value: { status: 'deferred', branchId: chat.timeline.branchId, revision: chat.timeline.revision } }
     }
     if (outcome.status !== 'success') {
-      commitParticipant(chat, operation, outcome.participant)
+      commitParticipant(chat, operation, outcome.participant, true)
       operation.status = 'failed'
       operation.completedAt = now()
       if (operation.kind === 'agent' && operation.role === 'settlement') updateSettlementBackground(chat, operation, 'failed')
@@ -551,7 +657,7 @@ export function createStoryTimeline(options = {}) {
       settlementRound = chat.timeline.operations[operation.roundOperationId]
       if (!settlementRound || settlementRound.kind !== 'body' || settlementRound.status !== 'completed'
         || str(settlementRound.committedBranchId) !== str(operation.basedOn.branchId)
-        || Number(settlementRound.committedRevision) !== Number(operation.basedOn.revision)) {
+        || Number(settlementRound.committedRevision) > Number(operation.basedOn.revision)) {
         operation.status = 'stale'
         return { chat, value: { status: 'stale', branchId: chat.timeline.branchId, revision: chat.timeline.revision } }
       }
@@ -575,11 +681,15 @@ export function createStoryTimeline(options = {}) {
   }
 
   function inspect(input) {
-    const chat = ensure(input && input.chat)
+    const source = input && input.chat
+    // Legacy unfinished bodies need the full migration. Normal queries only
+    // normalize timeline metadata, never message bodies or checkpoint payloads.
+    const legacy = Object.values(source?.timeline?.operations || {}).some(op => op?.kind === 'body' && op.status === 'foreground-completed')
+    const chat = legacy ? ensure(source) : ensure({ candidateAgent: source?.candidateAgent, timeline: source?.timeline && { ...source.timeline, checkpoints: [] } })
     return clone({
       branchId: chat.timeline.branchId,
       revision: chat.timeline.revision,
-      checkpointCount: chat.timeline.checkpoints.length,
+      checkpointCount: legacy ? chat.timeline.checkpoints.length : (source?.timeline?.checkpoints?.length || 0),
       participants: chat.timeline.participants,
       operations: chat.timeline.operations
     })
@@ -588,12 +698,13 @@ export function createStoryTimeline(options = {}) {
   function rollbackTarget(input) {
     const chat = ensure(input && input.chat)
     const checkpoint = chat.timeline.checkpoints[chat.timeline.checkpoints.length - 1]
-    if (checkpoint === undefined || checkpoint.before !== undefined) return null
+    if (checkpoint === undefined || checkpoint.before !== undefined &&
+      (Object.hasOwn(checkpoint.before, 'characterDesignDocument') || !chat.characterDesignDocument?.characters?.length || !(Number(checkpoint.beforeRevision) > 0))) return null
     return {
       checkpointId: str(checkpoint.id),
       beforeRevision: Math.max(0, Number(checkpoint.beforeRevision) || 0)
     }
   }
 
-  return Object.freeze({ apply, complete, inspect, rollbackTarget })
+  return Object.freeze({ apply, complete, inspect, rollbackTarget, rollbackPreview })
 }

@@ -14,7 +14,7 @@ function replaceExactlyOnce(source, original, replacement, label) {
   return source.slice(0, first) + replacement + source.slice(first + original.length)
 }
 
-let source = await readFile(configPath, 'utf8')
+let source = (await readFile(configPath, 'utf8')).replace(/\r\n/g, '\n')
 source = replaceExactlyOnce(
   source,
   "import child_process from 'node:child_process';\n",
@@ -87,7 +87,7 @@ await writeFile(configPath, source)
 
 const root = path.dirname(configPath)
 const uniqueScriptPath = path.join(root, 'util/script.ts')
-let uniqueScript = await readFile(uniqueScriptPath, 'utf8')
+let uniqueScript = (await readFile(uniqueScriptPath, 'utf8')).replace(/\r\n/g, '\n')
 uniqueScript = replaceExactlyOnce(
   uniqueScript,
   `        // 从共享状态中取出已注册实例集合（跨脚本实例共享在 window.parent）。
@@ -109,12 +109,12 @@ uniqueScript = uniqueScript.replaceAll('window.parent', 'window')
 await writeFile(uniqueScriptPath, uniqueScript)
 
 const globalPath = path.join(root, 'src/function/global/index.ts')
-let globalSource = await readFile(globalPath, 'utf8')
+let globalSource = (await readFile(globalPath, 'utf8')).replace(/\r\n/g, '\n')
 globalSource = globalSource.replaceAll('window.parent', 'window')
 await writeFile(globalPath, globalSource)
 
 const mainPath = path.join(root, 'src/main.ts')
-let mainSource = await readFile(mainPath, 'utf8')
+let mainSource = (await readFile(mainPath, 'utf8')).replace(/\r\n/g, '\n')
 mainSource = replaceExactlyOnce(
   mainSource,
   `    stop_list.push(initGlobals());
@@ -138,7 +138,7 @@ await writeFile(mainPath, mainSource)
 // trailing throttle returns the previous event's Promise and writes after the
 // current transaction has closed; each host event must await its own handler.
 const updatePath = path.join(root, 'src/function/update/index.ts')
-let updateSource = await readFile(updatePath, 'utf8')
+let updateSource = (await readFile(updatePath, 'utf8')).replace(/\r\n/g, '\n')
 updateSource = replaceExactlyOnce(updateSource,
   'is_jest_environment ? onMessageReceived : _.throttle(onMessageReceived, 3000)',
   'onMessageReceived', 'await each serialized host message event')
@@ -148,9 +148,54 @@ await writeFile(updatePath, updateSource)
 // Preserve upstream's prior-floor baseline when available; otherwise use that
 // current snapshot rather than silently skipping a valid host settlement.
 const variablesPath = path.join(root, 'src/function/update_variables.ts')
-let variablesSource = await readFile(variablesPath, 'utf8')
+let variablesSource = (await readFile(variablesPath, 'utf8')).replace(/\r\n/g, '\n')
 variablesSource = replaceExactlyOnce(variablesSource,
   'const variables = getLastValidVariable(request_message_id);',
   "const variables = getLastValidVariable(request_message_id) ?? (() => { const current = getVariables({ type: 'message', message_id }); return _.has(current, 'stat_data') && _.has(current, 'schema') ? current : undefined; })();",
   'allow complete current-floor MVU baseline when history has none')
 await writeFile(variablesPath, variablesSource)
+
+// ST JSONL compaction cannot write host-owned history snapshots through saveChat.
+// Disable it at the plugin boundary, including legacy enabled settings. Keep the
+// restore listener for imported chats and leave variable calculation untouched.
+for (const [file, signature, body] of [
+  ['legacy_chat.ts', 'export async function checkAndCleanupLegacyChat()', 'export async function checkAndCleanupLegacyChat() {}\n'],
+  ['cleanup_variables.ts', 'export function cleanupMessageVariables(', 'export function cleanupMessageVariables(_start: number, _end: number, _interval: number) { return 0; }\n'],
+]) {
+  const filePath = path.join(root, 'src/function/cleanup', file)
+  const original = (await readFile(filePath, 'utf8')).replace(/\r\n/g, '\n')
+  replaceExactlyOnce(original, signature, signature, 'disable host-incompatible cleanup: ' + file)
+  await writeFile(filePath, '// DSH Tavern preserves authoritative historical variable snapshots.\n' + body)
+}
+const buttonsPath = path.join(root, 'src/button.ts')
+let buttonsSource = (await readFile(buttonsPath, 'utf8')).replace(/\r\n/g, '\n')
+const cleanupButton = buttonsSource.match(/    \{\n        name: '清除旧楼层变量',[\s\S]*?\n    \},/)
+if (!cleanupButton) throw new Error('官方 MVU 清理按钮已变化，无法安全应用宿主转换')
+buttonsSource = replaceExactlyOnce(buttonsSource, cleanupButton[0], '', 'remove unsupported manual cleanup button')
+await writeFile(buttonsPath, buttonsSource)
+
+const cleanupPanelPath = path.join(root, 'src/panel/Cleanup.vue')
+const cleanupPanel = (await readFile(cleanupPanelPath, 'utf8')).replace(/\r\n/g, '\n')
+replaceExactlyOnce(cleanupPanel, '<Section :label="t(\'panel.cleanup.section\')">', '', 'replace unsupported cleanup controls')
+await writeFile(cleanupPanelPath, `<template>
+    <Section :label="t('panel.cleanup.section')">
+        <template #content>
+            <p>DSH Tavern 暂不支持旧变量清理，历史变量会保留用于回退和恢复。</p>
+        </template>
+    </Section>
+</template>
+<script setup lang="ts">
+import Section from '@/panel/component/Section.vue';
+import { useMvuI18n } from '@/i18n';
+const { t } = useMvuI18n();
+</script>
+`)
+
+const notificationPath = path.join(root, 'src/function/notification/index.ts')
+let notificationSource = (await readFile(notificationPath, 'utf8')).replace(/\r\n/g, '\n')
+for (const flag of ['已提醒自动清理旧变量功能', '已默认开启自动清理旧变量功能']) {
+  notificationSource = replaceExactlyOnce(notificationSource,
+    `if (store.settings.internal.${flag} === false) {`,
+    'if (false) {', 'suppress unsupported cleanup notification: ' + flag)
+}
+await writeFile(notificationPath, notificationSource)

@@ -17,10 +17,12 @@ export const POSTURE_SUBMIT_TOOL = Object.freeze({
 
 export function normalizePostureSubmission(value, context = {}) {
   const source = typeof value?.posture === 'string' ? value.posture.trim() : ''
+  if (source.length > 2000) throw new Error('posture_submit 的 posture 超过 2000 字')
   const posture = source === '' ? '' : resolveRuntimeMacroText(source, {
     charName: context.charName,
     macroState: context.macroState
   }).text.trim()
   if (posture === '') throw new Error('posture_submit 缺少非空 posture')
+  if (posture.length > 2000) throw new Error('posture_submit 的 posture 展开后超过 2000 字')
   return Object.freeze({ posture })
 }

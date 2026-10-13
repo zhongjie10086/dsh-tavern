@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "build": "local-repair",
+  "notice": "这是本地修复版，已关闭应用内更新；请按交付说明更新。"
+}

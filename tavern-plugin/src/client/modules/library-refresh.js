@@ -26,6 +26,7 @@ function createCardLibraryRefreshModule(options) {
 	function dispose() {
 		if (activationTimer !== null) cancel(activationTimer);
 		activationTimer = null;
+		activeLoads.clear();
 	}
 	return Object.freeze({ activate: activate, load: load, dispose: dispose });
 }
@@ -60,7 +61,7 @@ function createWorldBookLibraryRefreshModule(options) {
 				start();
 				return;
 			}
-			if (typeof options.onBusyChange === "function") options.onBusyChange(false);
+			if (!disposed && typeof options.onBusyChange === "function") options.onBusyChange(false);
 			resolveIdle();
 		});
 		active = request;

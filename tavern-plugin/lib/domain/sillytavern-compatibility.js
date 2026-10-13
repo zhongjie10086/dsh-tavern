@@ -1,3 +1,4 @@
+import { inputAttachments } from './player-input-content.js'
 function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
 }
@@ -18,8 +19,8 @@ function exampleMessages(value, options = {}) {
   let source = str(value)
   if (source === '' || source === '<START>') return []
   source = source
-    .replace(/{{\s*user\s*}}/gi, str(options.userName))
-    .replace(/{{\s*char\s*}}/gi, str(options.charName))
+    .replace(/{{\s*user\s*}}/gi, () => str(options.userName))
+    .replace(/{{\s*char\s*}}/gi, () => str(options.charName))
   if (!source.startsWith('<START>')) source = '<START>\n' + source.trim()
   const blocks = source.split(/<START>/i).slice(1)
   const messages = []
@@ -64,20 +65,20 @@ function markerMessages(identifier, input) {
       const value = str(card.personality).trim()
       if (!value) return []
       const format = str(settings.personality_format)
-      return [{ role: 'system', content: format ? format.replace(/{{\s*personality\s*}}/gi, value) : value }]
+      return [{ role: 'system', content: format ? format.replace(/{{\s*personality\s*}}/gi, () => value) : value }]
     }
     case 'scenario': {
       const value = str(card.scenario).trim()
       if (!value) return []
       const format = str(settings.scenario_format)
-      return [{ role: 'system', content: format ? format.replace(/{{\s*scenario\s*}}/gi, value) : value }]
+      return [{ role: 'system', content: format ? format.replace(/{{\s*scenario\s*}}/gi, () => value) : value }]
     }
     case 'personaDescription': return input.persona ? [{ role: 'system', content: input.persona }] : []
-    case 'dialogueExamples': return exampleMessages(card.mes_example, {
+    case 'dialogueExamples': return (input.examplesBefore || []).map(content=>({role:'system',content})).concat(exampleMessages(card.mes_example, {
       userName: input.userName,
       charName: card.name,
       newExampleChatPrompt: settings.new_example_chat_prompt
-    })
+    }), (input.examplesAfter || []).map(content=>({role:'system',content})))
     case 'chatHistory': return input.history
     default: return null
   }
@@ -150,11 +151,11 @@ export function compileSillyTavernRequest(options = {}) {
   const diagnostics = []
   const history = (Array.isArray(options.history) ? options.history : []).map(function (item) {
     const sourceText = str(item.sourceText || item.text || item.content)
-    return { role: role(item.role), content: sourceText, source: { kind: 'chat-history' } }
+    return { role: role(item.role), content: sourceText, ...(item.inputAttachments?.length ? { inputAttachments: inputAttachments(item.inputAttachments) } : {}), source: { kind: 'chat-history' } }
   })
   const inputText = str(options.input).trim()
-  if (inputText !== '') {
-    history.push({ role: 'user', content: inputText, source: { kind: 'current-input' } })
+  if (inputText !== '' || options.inputAttachments?.length) {
+    history.push({ role: 'user', content: inputText, ...(options.inputAttachments?.length ? { inputAttachments: inputAttachments(options.inputAttachments) } : {}), source: { kind: 'current-input' } })
   }
   for (const [index, item] of history.entries()) {
     const rendered = macro(item.content, resolveMacros, state, card)
@@ -173,7 +174,7 @@ export function compileSillyTavernRequest(options = {}) {
     return entry && entry.ordered === true && entry.enabled === true
   })
   const regular = []
-  const absolute = []
+  const absolute = (options.worldInfoDepth || []).map(entry=>({content:entry.content,role:entry.role,injectionDepth:entry.depth,injectionOrder:0,entryKey:entry.ref,identifier:'worldbook:'+entry.ref}))
   for (const entry of selected) {
     if (Number(entry.injectionPosition) === 1 && entry.marker !== true) absolute.push(entry)
     else regular.push(entry)
@@ -192,22 +193,29 @@ export function compileSillyTavernRequest(options = {}) {
   }
 
   const messages = []
+  const expandedMarkers = new Set()
   for (const entry of regular) {
     const marker = markerMessages(str(entry.identifier), {
       card, settings, history,
       userName: state.userName,
       persona: str(options.persona),
       worldInfoBefore: str(options.worldInfoBefore),
-      worldInfoAfter: str(options.worldInfoAfter)
+      worldInfoAfter: str(options.worldInfoAfter),
+      examplesBefore: options.worldInfoExamplesBefore, examplesAfter: options.worldInfoExamplesAfter
     })
+    if (marker !== null) {
+      if (expandedMarkers.has(entry.identifier)) { diagnostics.push({ code:'duplicate-marker', entryKey:entry.entryKey, message:'已跳过重复的系统占位：'+entry.identifier }); continue }
+      expandedMarkers.add(entry.identifier)
+    }
     const values = marker === null ? [{ role: entry.role, content: overrideContent(entry, card) }] : marker
     for (const value of values) {
       const alreadyProjected = value.source && (value.source.kind === 'chat-history' || value.source.kind === 'current-input' || value.source.kind === 'preset-depth')
       const rendered = alreadyProjected ? { text: value.content, diagnostics: [] } : macro(value.content, resolveMacros, state, card)
       diagnostics.push(...rendered.diagnostics)
-      if (rendered.text.trim() === '') continue
+      if (rendered.text.trim() === '' && !value.inputAttachments?.length) continue
       messages.push({
         role: role(value.role), content: rendered.text,
+        ...(value.inputAttachments?.length ? { inputAttachments: inputAttachments(value.inputAttachments) } : {}),
         ...(value.name ? { name: value.name } : {}),
         source: { kind: entry.marker ? 'marker' : 'preset', entryKey: entry.entryKey, identifier: entry.identifier, name: entry.name }
       })

@@ -1,4 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { createDurableFilePromotion } from './durable-file-promotion.js'
+import { promoteUpdateStatus } from './update-status.js'
+import { processBirth } from './process-identity.js'
 import { randomUUID } from 'node:crypto'
 import { recordUpdateDiagnostic, readUpdateDiagnostics } from '../../bin/update-diagnostics.mjs'
 import { execFile, spawn } from 'node:child_process'
@@ -8,16 +11,18 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 
 import { createProfileDataStore } from './profile-data-store.js'
+import {assertOutboundEnabled} from './domain/outbound-network-policy.js'
+import { readLocalBuild } from './local-build.js'
 
 const STATUS_FILE = 'update-status.json'
 const RELEASE_FILE = '.dsh-tavern-release.json'
 const RUNNING_TIMEOUT_MS = 15 * 60 * 1000
-const VERSION_URL = 'https://raw.githubusercontent.com/flizzywine/dsh-tavern/main/package.json'
-const COMMIT_URL = 'https://api.github.com/repos/flizzywine/dsh-tavern/commits/main'
-const COMPARE_URL = 'https://api.github.com/repos/flizzywine/dsh-tavern/compare'
+const VERSION_URL = 'https://raw.githubusercontent.com/zhongjie10086/dsh-tavern/release-r15-clean/package.json'
+const COMMIT_URL = 'https://api.github.com/repos/zhongjie10086/dsh-tavern/commits/release-r15-clean'
+const COMPARE_URL = 'https://api.github.com/repos/zhongjie10086/dsh-tavern/compare'
 const execFileAsync = promisify(execFile)
 const UPDATE_CHECK_POLICY = 3
-const CDN_METADATA_URL = 'https://cdn.jsdelivr.net/gh/flizzywine/dsh-tavern@main/dsh-tavern-runtime.json'
+const CDN_METADATA_URL = 'https://cdn.jsdelivr.net/gh/zhongjie10086/dsh-tavern@release-r15-clean/dsh-tavern-runtime.json'
 const RUNTIME_FILES = new Set(['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'cordis.patch.yml', 'install.ps1', 'install.sh'])
 const RUNTIME_DIRECTORIES = ['bin/', 'config/', 'presets/', 'tavern-plugin/', 'patches/']
 
@@ -87,6 +92,7 @@ async function readVerifiedRuntimeMetadata(sourceRoot) {
 
 export function sanitizeUpdateError(value) {
   const message = String(value || '').trim()
+  if (/PostQueuedCompletionStatus:\s*\(6\)/.test(message)) return '更新失败：Windows 安装子进程退出异常（PostQueuedCompletionStatus: 6，句柄无效）。请使用修复后的更新程序重试；原始详情见更新诊断日志。'
   const replacements = (message.match(/\uFFFD/g) || []).length
   if (replacements >= 2) return '更新失败：安装程序输出编码异常。建议重新安装一次。'
   return message || '更新失败，请重新安装一次。'
@@ -188,6 +194,8 @@ export function createApplicationUpdater(options) {
   const spawnProcess = options.spawnProcess || spawn
   const now = typeof options.now === 'function' ? options.now : Date.now
   const isProcessAlive = typeof options.isProcessAlive === 'function' ? options.isProcessAlive : processIsAlive
+  const processIdentity = options.readProcessIdentity || (pid => processBirth(pid)?.id)
+  const operationFiles = createDurableFilePromotion()
   const diagnosticContext = new AsyncLocalStorage()
   const record = (event, details = {}) => recordUpdateDiagnostic(dataRoot, { attemptId: diagnosticContext.getStore(), event, ...details })
   async function stage(name, operation) {
@@ -204,6 +212,7 @@ export function createApplicationUpdater(options) {
   }
   async function diagnosticFetch(url, init, timeoutMs = 5000) {
     record('request', { url, timeoutMs })
+    assertOutboundEnabled()
     const response = await fetch(url, init)
     record('response', { url, status: response.status })
     return response
@@ -257,9 +266,10 @@ export function createApplicationUpdater(options) {
   }
   const store = createProfileDataStore({ dataRoot })
 
-  async function writeStatus(value) {
-    await store.writeJson(STATUS_FILE, value)
-    record('status', value)
+  async function writeStatus(value, guards) {
+    const written = await promoteUpdateStatus(path.join(dataRoot, STATUS_FILE), value, guards)
+    record('status', written)
+    return written
   }
   const loadLocalIdentity = typeof options.readLocalIdentity === 'function' ? options.readLocalIdentity : async function () {
     let local
@@ -351,36 +361,37 @@ export function createApplicationUpdater(options) {
     if (current !== undefined) {
       if (current.phase === 'update-available' && (current.checkPolicy !== UPDATE_CHECK_POLICY || current.checkedForCommit !== identity.currentCommit)) {
         const invalidated = { phase: 'idle', host: await host(), ...identity }
-        await writeStatus( invalidated)
-        return invalidated
+        return { ...await writeStatus(invalidated, { expected: current }), ...identity }
       }
       const checkedAt = now()
       const updatePid = Number(current.pid)
-      const stopped = Number.isInteger(updatePid) && updatePid > 0 && !isProcessAlive(updatePid)
-      if (current.phase === 'running' && (stopped || checkedAt - Number(current.startedAt || 0) >= RUNNING_TIMEOUT_MS)) {
+      const hasPid = Number.isInteger(updatePid) && updatePid > 0
+      const liveIdentity = current.phase === 'running' && hasPid && current.processIdentity ? await processIdentity(updatePid) : undefined
+      const stopped = hasPid && (!isProcessAlive(updatePid) || (liveIdentity !== undefined && current.processIdentity && liveIdentity !== current.processIdentity))
+      if (current.phase === 'running' && (stopped || (!hasPid && checkedAt - Number(current.startedAt || 0) >= RUNNING_TIMEOUT_MS))) {
         const interrupted = {
           phase: 'failed',
           host: installHostOf({ dshTavern: { host: current.host } }),
           failedAt: checkedAt,
           error: '上次更新已中断',
         }
-        await writeStatus( interrupted)
-        return { ...interrupted, ...identity }
+        return { ...await writeStatus(interrupted, { expected: current }), ...identity }
       }
-      if (current.phase === 'installed-restart-required' && current.host !== 'desktop') {
-        const completed = {
-          phase: 'completed', host: current.host, completedAt: checkedAt,
-          targetCommit: current.targetCommit, recoveredByRestart: true,
+      if (current.phase === 'installed-restart-required') {
+        // Older installers inferred success from copied source files, which
+        // does not prove dependency installation or profile setup succeeded.
+        const recovered = {
+          phase: 'failed', repairRequired: true, host: current.host, failedAt: checkedAt,
+          targetCommit: current.targetCommit,
+          error: '上次更新未确认安装完成，请重新检查并重试更新。',
         }
-        await writeStatus( completed)
-        return { ...completed, ...identity }
+        return { ...await writeStatus(recovered, { expected: current }), ...identity }
       }
       if (current.phase === 'failed') {
         const error = sanitizeUpdateError(current.error)
         if (error !== current.error) {
           const readable = { ...current, error }
-          await writeStatus( readable)
-          return { ...readable, ...identity }
+          return { ...await writeStatus(readable, { expected: current }), ...identity }
         }
       }
       return { ...current, ...identity }
@@ -388,15 +399,29 @@ export function createApplicationUpdater(options) {
     return { phase: 'idle', host: await host(), ...identity }
   }
 
+  // Z89: a local repair build never asks upstream and ignores any status an
+  // upstream build left behind, so no stale "update-available" offers a button.
+  async function localBuildStatus(refresh = false) {
+    const build = await readLocalBuild(sourceRoot)
+    return build ? { phase: 'local-build', host: await host(), notice: build.notice, ...await localIdentity(refresh) } : null
+  }
+
+  let pendingAction = ''
   async function status() {
-    return await statusWithIdentity(await localIdentity())
+    const local = await localBuildStatus()
+    if (local) return local
+    const current=await statusWithIdentity(await localIdentity())
+    return pendingAction?{...current,phase:pendingAction==='check'?'checking':'starting'}:current
   }
 
   async function check() {
+    const local = await localBuildStatus(true)
+    if (local) return local
+    assertOutboundEnabled()
     const identity = await localIdentity(true)
     record('identity', identity)
     const current = await statusWithIdentity(identity)
-    if (current.phase === 'running' && now() - Number(current.startedAt || 0) < RUNNING_TIMEOUT_MS) {
+    if (current.phase === 'running') {
       throw new Error('更新正在进行，暂时无法重新检查')
     }
     const installHost = await host()
@@ -406,6 +431,7 @@ export function createApplicationUpdater(options) {
     } catch (error) {
       const failed = {
         phase: 'check-failed', host: installHost, checkedAt: now(),
+        ...(current.repairRequired ? { repairRequired: true } : {}),
         currentVersion: current.currentVersion, currentCommit: current.currentCommit,
         error: `无法检查更新：${sanitizeUpdateError(error?.message || error)}`,
       }
@@ -415,7 +441,8 @@ export function createApplicationUpdater(options) {
     const checked = {
       checkPolicy: UPDATE_CHECK_POLICY,
       checkedForCommit: identity.currentCommit,
-      phase: version.updateAvailable ? 'update-available' : 'up-to-date',
+      phase: version.updateAvailable || current.repairRequired ? 'update-available' : 'up-to-date',
+      ...(current.repairRequired ? { repairRequired: true } : {}),
       host: installHost, checkedAt: now(),
       currentVersion: version.currentVersion, latestVersion: version.latestVersion,
       currentCommit: version.currentCommit, latestCommit: version.latestCommit,
@@ -426,10 +453,13 @@ export function createApplicationUpdater(options) {
   }
 
   async function start() {
+    const local = await localBuildStatus()
+    if (local) throw new Error(local.notice)
+    assertOutboundEnabled()
     const identity = await localIdentity(true)
     record('identity', identity)
     const current = await statusWithIdentity(identity)
-    if (current.phase === 'running' && now() - Number(current.startedAt || 0) < RUNNING_TIMEOUT_MS) {
+    if (current.phase === 'running') {
       throw new Error('更新正在进行，请勿重复启动')
     }
     const installHost = await host()
@@ -437,11 +467,11 @@ export function createApplicationUpdater(options) {
     try {
       version = await versions(identity)
     } catch (error) {
-      const failed = { phase: 'failed', host: installHost, failedAt: now(), error: `无法检查最新版，尚未开始下载：${sanitizeUpdateError(error?.message || error)}` }
+      const failed = { phase: 'failed', ...(current.repairRequired ? { repairRequired: true } : {}), host: installHost, failedAt: now(), error: `无法检查最新版，尚未开始下载：${sanitizeUpdateError(error?.message || error)}` }
       await writeStatus( failed)
       throw new Error(failed.error)
     }
-    if (!version.updateAvailable) {
+    if (!version.updateAvailable && !current.repairRequired) {
       const upToDate = {
         phase: 'up-to-date', host: installHost, checkedAt: now(),
         currentVersion: version.currentVersion, latestVersion: version.latestVersion,
@@ -452,7 +482,7 @@ export function createApplicationUpdater(options) {
       return upToDate
     }
     const running = {
-      phase: 'running', host: installHost, startedAt: now(),
+      phase: 'running', host: installHost, startedAt: now(), attemptId: randomUUID(),
       ...(version.currentVersion === 'unknown' ? {} : {
         currentVersion: version.currentVersion, latestVersion: version.latestVersion,
         currentCommit: version.currentCommit, latestCommit: version.latestCommit,
@@ -466,6 +496,7 @@ export function createApplicationUpdater(options) {
       'update',
       '--host', installHost,
       '--status-file', statusFile,
+      '--attempt-id', running.attemptId,
       '--delay=800',
       ...(version.latestCommit ? ['--target-commit', version.latestCommit] : []),
     ]
@@ -500,12 +531,14 @@ export function createApplicationUpdater(options) {
       // On Windows this PID belongs to the short-lived double-detach helper.
       // The real updater writes its own PID before beginning the delayed update.
       if (platform !== 'win32' && Number.isInteger(childPid) && childPid > 0) {
+        const initial = { ...running }
         running.pid = childPid
-        await writeStatus( running)
+        const written = await writeStatus(running, { expected: initial })
+        Object.assign(running, written)
       }
     } catch (error) {
-      const failed = { phase: 'failed', host: installHost, failedAt: now(), error: String(error?.message || error) }
-      await writeStatus( failed)
+      const failed = { phase: 'failed', ...(current.repairRequired ? { repairRequired: true } : {}), host: installHost, failedAt: now(), error: String(error?.message || error) }
+      await writeStatus({ ...failed, attemptId: running.attemptId }, { expected: running })
       throw error
     }
     return running
@@ -517,5 +550,17 @@ export function createApplicationUpdater(options) {
       return operation()
     }))
   }
-  return { check: traced('check', check), start: traced('start', start), status, diagnostics: () => readUpdateDiagnostics(dataRoot) }
+  function exclusive(action, operation) {
+    const run = traced(action, operation)
+    return async () => {
+      if (pendingAction) throw new Error('更新操作正在进行，请勿重复启动')
+      pendingAction = action
+      try { return await operationFiles.withLock(path.join(dataRoot, 'update-operation'), run) }
+      catch (error) {
+        if (error?.code === 'DSH_TAVERN_WRITE_CONFLICT') throw new Error('另一个更新操作正在进行，请勿重复启动', { cause: error })
+        throw error
+      } finally { pendingAction = '' }
+    }
+  }
+  return { check: exclusive('check', check), start: exclusive('start', start), status, diagnostics: () => readUpdateDiagnostics(dataRoot) }
 }

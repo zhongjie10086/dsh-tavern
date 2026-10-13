@@ -1,0 +1,102 @@
+import { conversionInputError } from './mvu-conversion-guidance.js'
+import { createHash } from 'node:crypto'
+import {withMvuConversionPage} from './mvu-conversion-browser.js'
+
+const hash = text => createHash('sha256').update(text).digest('hex')
+const capturePattern = /\$([1-9]\d?)/g
+export function appearanceSources(data) {
+  return (data.extensions?.regex_scripts || []).flatMap((rule, index) => {
+    const html = String(rule.replaceString || '')
+    if (!/<(?:html|style|div|details|table|section|main|script|iframe|p|span|h[1-6]|ul|ol|dl|svg)\b/i.test(html)) return []
+    return [{ path: `/extensions/regex_scripts/${index}/replaceString`, name: rule.scriptName || rule.id || String(index), enabled: rule.disabled !== true && rule.enabled !== false,
+      digest: hash(html), captures: [...new Set([...html.matchAll(capturePattern)].map(m => Number(m[1])))].sort((a,b)=>a-b) }]
+  })
+}
+
+// Read source bytes ourselves. Model input is a source pointer plus data bindings,
+// never a rewritten template. Unknown executable views must not silently lose skin.
+export async function freezeMvuAppearance(data, plan) {
+  if (plan && Object.hasOwn(plan,'html')) {
+    if (appearanceSources(data).length) throw Error('原卡已有美化，不能用生成样式覆盖；请固化原视图，不接受模型重写 HTML')
+    if (Object.keys(plan).some(key=>!['html','bindings','collectionPath'].includes(key)) || typeof plan.html!=='string' || !plan.html.trim()) throw Error('生成美化只接受 html、bindings 和 collectionPath')
+    const frozen = await freezeMvuAppearance({extensions:{regex_scripts:[{replaceString:plan.html}]}}, {
+      sourcePath:'/extensions/regex_scripts/0/replaceString',bindings:plan.bindings,...(plan.collectionPath?{collectionPath:plan.collectionPath}:{})
+    })
+    return {...frozen,sourcePath:null,generated:true}
+  }
+
+  if (!plan || typeof plan !== 'object' || Object.keys(plan).some(k => !['sourcePath','bindings','collectionPath'].includes(k))) throw Error('美化方案只接受 sourcePath 和 bindings，不接受模型重写 HTML')
+  const entry = appearanceSources(data).find(x => x.path === plan.sourcePath)
+  if (!entry) throw Error('美化来源不存在，请从 inspect.appearanceSources 选择')
+  const source = data.extensions.regex_scripts[Number(plan.sourcePath.split('/')[3])].replaceString
+  const fenced = source.trim().match(/^```html\s*\n([\s\S]*?)\n```$/i)
+  const html = fenced ? fenced[1] : source
+  const unsupported = /```|<%|&lt;%|\{\{[^}]*\}\}|\{\{|\$[&`']|\$<|\$\$/.exec(html)
+  if (unsupported) throw conversionInputError('MVU_APPEARANCE_UNSUPPORTED_SYNTAX', '美化包含动态模板或特殊替换语法: ' + unsupported[0], {
+    field:'html',token:unsupported[0],offset:unsupported.index,
+    hint:'可选转换目前只能保真绑定文本节点的 $1、$2 等占位，不能自动等价转换 EJS 或其他动态语法。保留原卡直接导入和运行；如需转换，另行适配这些交互，不删除复杂模板或用默认面板覆盖原美化。'
+  })
+  const captures = await withMvuConversionPage(page => page.evaluate(html => {
+    const doc = new DOMParser().parseFromString(html, "text/html")
+    const capturePattern = /\$([1-9]\d?)/g
+    if (doc.querySelector('script,iframe,object,embed,base,meta[http-equiv]')) throw Error('美化包含自定义脚本或嵌入文档，需专门适配；原视图保留，不自动删除')
+    for (const element of doc.querySelectorAll('*')) {
+      for (const attr of element.attributes) {
+        if (/^on/i.test(attr.name) || /javascript\s*:/i.test(attr.value) || /\$[1-9]\d?/.test(attr.value)) throw Error('美化含事件处理或属性中的动态取值，需专门适配: ' + attr.name)
+      }
+    }
+    if ([...doc.querySelectorAll('style,title,textarea')].some(el => /\$[1-9]\d?/.test(el.textContent))) throw Error('美化的样式或特殊文本区域含动态捕获，需专门适配')
+    const captures = [...new Set([...html.matchAll(capturePattern)].map(m=>Number(m[1])))].sort((a,b)=>a-b)
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT)
+    const visible = new Set(); let node
+    while ((node=walker.nextNode())) if (!['STYLE','SCRIPT'].includes(node.parentElement?.tagName)) for (const m of node.textContent.matchAll(capturePattern)) visible.add(Number(m[1]))
+    if (captures.some(n=>!visible.has(n))) throw Error('美化捕获不在可更新的正文文本节点中')
+    if (!captures.length) throw Error('美化没有可映射的 $1、$2 状态字段，需专门适配')
+    return captures
+  }, html))
+    if (!Array.isArray(plan.bindings) || plan.bindings.length !== captures.length || new Set(plan.bindings.map(b=>b.capture)).size !== captures.length || plan.bindings.some(b=>!captures.includes(b.capture) || typeof b.path !== 'string' || Object.keys(b).some(k=>!['capture','path'].includes(k)))) throw Error('必须为原美化的每个捕获字段提供唯一变量映射')
+    return { version:1, ...(plan.collectionPath ? {collectionPath:plan.collectionPath} : {}), sourcePath:entry.path, sourceDigest:entry.digest, html, htmlDigest:hash(html), bindings:structuredClone(plan.bindings) }
+
+}
+
+export async function renderFrozenAppearance(frozen, pointerKeys, initialState) {
+  if (frozen.version !== 1 || hash(frozen.html) !== frozen.htmlDigest) throw Error('固化美化内容指纹不匹配')
+  // Revalidate persisted metadata before the validator executes the host binder.
+  await freezeMvuAppearance({extensions:{regex_scripts:[{replaceString:frozen.html}]}}, {sourcePath:'/extensions/regex_scripts/0/replaceString',bindings:frozen.bindings,...(frozen.collectionPath?{collectionPath:frozen.collectionPath}:{})})
+  let examples = [initialState]
+  const collectionKeys = frozen.collectionPath ? pointerKeys(frozen.collectionPath) : null
+  if (collectionKeys) {
+    let collection = initialState
+    for (const key of collectionKeys) collection = collection?.[key]
+    if (!collection || typeof collection !== 'object') throw Error('美化集合路径不存在: '+frozen.collectionPath)
+    examples = Object.entries(collection).filter(([key])=>!key.startsWith('$') && !key.startsWith('__')).map(([,value])=>value)
+    if (!examples.length && collection.$meta?.template) examples = [collection.$meta.template]
+  }
+  const bindings = frozen.bindings.map(binding => {
+    const keys = pointerKeys(binding.path)
+    for (let value of examples) for (const key of keys) {
+      if (value == null || !Object.hasOwn(value,key)) throw Error('美化变量路径不存在: '+binding.path)
+      value=value[key]
+    }
+    return {capture:binding.capture,keys}
+  })
+  const encoded=JSON.stringify(bindings).replace(/</g,'\\u003c')
+  const script=`<script data-dsh-frozen-mvu>
+(function(){
+const bindings=${encoded};
+const collectionKeys=${JSON.stringify(collectionKeys).replace(/</g,'\\u003c')};
+const nodes=[];const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let node;
+while((node=walker.nextNode())){if(['SCRIPT','STYLE'].includes(node.parentElement?.tagName))continue;if(/[\\x24]([1-9]\\d?)/.test(node.nodeValue))nodes.push({node,source:node.nodeValue});}
+function bind(items,state){const values={};for(const binding of bindings){let value=state;for(const key of binding.keys)value=value!=null&&Object.prototype.hasOwnProperty.call(value,key)?value[key]:undefined;values[binding.capture]=value==null?'':typeof value==='object'?JSON.stringify(value):String(value);}for(const item of items)item.node.nodeValue=item.source.replace(/[\\x24]([1-9]\\d?)/g,(_,id)=>values[id]??'');}
+let prototypeView,container;const members=new Map();
+if(collectionKeys){prototypeView=document.createElement('template');for(const child of [...document.body.childNodes]){if(child.nodeName==='SCRIPT'||child.nodeName==='STYLE')continue;prototypeView.content.appendChild(child);}container=document.createElement('div');document.body.appendChild(container);}
+function render(){const state=Mvu.getMvuData({type:'message',message_id:'latest'}).stat_data;if(!collectionKeys){bind(nodes,state);return;}let collection=state;for(const key of collectionKeys)collection=collection?.[key];const entries=Object.entries(collection||{}).filter(([key])=>!key.startsWith('$')&&!key.startsWith('__'));const active=new Set(entries.map(([key])=>key));for(const [key,item] of members)if(!active.has(key)){item.root.remove();members.delete(key);}for(const [key,value] of entries){let item=members.get(key);if(!item){const root=document.createElement('div');root.appendChild(prototypeView.content.cloneNode(true));const items=[],walk=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);let text;while((text=walk.nextNode()))if(!['STYLE','SCRIPT'].includes(text.parentElement?.tagName))items.push({node:text,source:text.nodeValue});item={root,items};members.set(key,item);container.appendChild(root);}bind(item.items,value);}}
+async function start(){await waitGlobalInitialized('Mvu');for(const event of new Set([Mvu.events.VARIABLE_INITIALIZED,Mvu.events.VARIABLE_UPDATE_ENDED,...Object.values(tavern_events)]))eventOn(event,render);render();}
+start().catch(error=>{console.error('MVU 原样式状态更新失败',error);});
+})();
+</script>`
+  // Original layout/CSS bytes are preserved. Only append host-owned data binding.
+  const html=/<\/body\s*>/i.test(frozen.html) ? frozen.html.replace(/<\/body\s*>/i,match=>script+'\n'+match) : frozen.html+'\n'+script
+  // Avoid regex replacement captures and identity macros in the outer display rule.
+  return html.replace(/<script data-dsh-frozen-mvu>([\s\S]*?)<\/script>/,(_,body)=>'<script data-dsh-frozen-mvu>'+body.replace(/\$/g,'\\u0024')+'</script>').replace(capturePattern,(_,id)=>'&#36;'+id)
+}

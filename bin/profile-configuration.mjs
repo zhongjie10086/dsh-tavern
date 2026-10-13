@@ -239,8 +239,10 @@ export async function beginProfileConfigurationUpdate({ profileDir, manifest, pa
   }
   let active = true
   try {
-    await files.write(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    // Publish the idempotent patch migration before its completion version.
+    // A process exit between files leaves an old version that safely retries.
     if (patchText !== undefined) await files.write(patchPath, patchText)
+    await files.write(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
   } catch (error) {
     await restore(files, manifestPath, originalManifest)
     if (patchText !== undefined) await restore(files, patchPath, originalPatch)

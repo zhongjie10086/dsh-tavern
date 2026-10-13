@@ -1,3 +1,4 @@
+import { tavernAssistantTurn } from './session-surface-edit.js'
 import { sessionEvents } from './session-events.js'
 function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
@@ -27,7 +28,7 @@ export function assistantResultForTurn(session, turn) {
   const start = turnStartIndex(events, turn)
   for (let index = events.length - 1; index > start; index -= 1) {
     const event = events[index]
-    if (!event || event.type !== 'assistant/message' || Number(event.data && event.data.turn) !== Number(turn)) continue
+    if (!event || event.type !== 'assistant/message' || tavernAssistantTurn(event, events) !== Number(turn)) continue
     const message = event.data && event.data.message
     const source = message && message.source
     if (!source || source.kind !== 'model') continue

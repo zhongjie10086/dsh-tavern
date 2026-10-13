@@ -1,5 +1,6 @@
-import { access, readFile } from 'node:fs/promises'
+import { access, readFile, readdir, lstat } from 'node:fs/promises'
 import path from 'node:path'
+import { parse } from 'yaml'
 import { createDurableFilePromotion } from '../durable-file-promotion.js'
 
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
@@ -31,6 +32,7 @@ function renderSkill(input) {
     'description: ' + JSON.stringify(description),
     ...(input.modelInvocable === false ? ['disable-model-invocation: true'] : []),
     ...(input.userInvocable === false ? ['user-invocable: false'] : []),
+    ...(input.purpose ? ['metadata:', '  tavern:', '    purpose: ' + input.purpose] : []),
     '---'
   ]
   return frontmatter.join('\n') + '\n\n' + body + '\n'
@@ -46,6 +48,17 @@ export function createTavernSkillModule(options = {}) {
     return path.join(root, normalizeTavernSkillName(name), 'SKILL.md')
   }
 
+  const listeners = new Set()
+  async function list() {
+    const names = new Set()
+    for (const root of [builtInDirectory,directory]) {
+      let entries; try { entries = await readdir(root,{withFileTypes:true}) } catch(error) { if(error.code==='ENOENT')continue;throw error }
+      for(const entry of entries)if(entry.isDirectory()&&SKILL_NAME.test(entry.name))names.add(entry.name)
+    }
+    const result=[]
+    for(const name of [...names].sort()){const skill=await read(name);if(skill)result.push(skill)}
+    return result
+  }
   async function read(name) {
     const normalized = normalizeTavernSkillName(name)
     for (const source of [
@@ -53,8 +66,12 @@ export function createTavernSkillModule(options = {}) {
       { kind: 'user', path: target(directory, normalized) }
     ]) {
       try {
+        if((await lstat(path.dirname(source.path))).isSymbolicLink()||(await lstat(source.path)).isSymbolicLink())throw Error('Skill 入口不能是符号链接')
         const content = await readFile(source.path, 'utf8')
-        return { name: normalized, source: source.kind, content, path: source.path }
+        const match=content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)
+        const meta=match ? parse(match[1])||{} : {}
+        const purpose=meta.metadata?.tavern?.purpose || (normalized.startsWith('tavern-style-')?'writing':'card')
+        return { name: normalized, source: source.kind, content, path: source.path, purpose, description:meta.description||'', agents:purpose==='writing'?['card','foreground']:['card'],modelInvocable:meta['disable-model-invocation']!==true,userInvocable:meta['user-invocable']!==false }
       } catch (error) {
         if (!error || error.code !== 'ENOENT') throw error
       }
@@ -68,7 +85,10 @@ export function createTavernSkillModule(options = {}) {
     const destination = target(directory, name)
     const present = await exists(destination)
     if (present && input.overwrite !== true) throw new Error('Skill 已存在；确认修改后请明确覆盖: ' + name)
+    if(input.purpose!==undefined&&!['card','writing'].includes(input.purpose))throw Error('Skill 用途必须是 card 或 writing')
+    const previous=present?await read(name):null
     const content = renderSkill({
+      purpose:input.purpose??previous?.purpose,
       name,
       description: input.description,
       body: input.body,
@@ -76,8 +96,22 @@ export function createTavernSkillModule(options = {}) {
       userInvocable: input.userInvocable
     })
     await files.write(destination, content)
+    for(const listener of listeners)listener()
     return { name, source: 'user', path: destination, content, chars: content.length, overwritten: present }
   }
 
-  return Object.freeze({ read, write })
+  return Object.freeze({ read, write, list, subscribe(listener){listeners.add(listener);return ()=>listeners.delete(listener)} })
+}
+
+// The ST wire lane has no skill tool loop. Project enabled writing instructions
+// into this request only, so disabling a skill cannot leave instructions in history.
+export async function compatibilityWritingMessages(library,chat,settings={}) {
+ const disabled=new Set(Array.isArray(chat?.disabledWritingSkills)?chat.disabledWritingSkills:settings.defaultDisabledWritingSkills||[]),messages=[];let chars=0
+ for(const skill of await library.list()) {
+  if(skill.purpose!=='writing'||!skill.modelInvocable||disabled.has(skill.name))continue
+  const body=skill.content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/,'').trim()
+  chars+=body.length;if(chars>500000)throw Error('启用的写作技能内容过多，请在本局设置中停用部分技能后重试')
+  messages.push({role:'system',content:[{type:'text',text:'写作技能 '+skill.name+'：\n'+body}]})
+ }
+ return messages
 }

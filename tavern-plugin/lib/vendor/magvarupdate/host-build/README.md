@@ -21,6 +21,10 @@ The deterministic host build applies these adaptations:
 - uses the complete current-floor snapshot when no earlier floor has valid MVU
   data, so resumed/imported games can settle without rewriting historical floors.
 
+- disables ST JSONL variable compaction, its legacy prompt, manual cleanup button,
+  and enable controls; historical snapshots remain available for rollback and
+  imported-chat restoration. Existing cleanup settings do not trigger writes.
+
 It does not patch MVU parsing, validation or variable calculation.
 The sandbox-local uniqueness change is valid because the Host enforces exactly
 one official MVU core per chat sandbox; the readiness barrier only restores the
@@ -29,3 +33,15 @@ shared-page registration order before official chat initialization starts.
 Run `./build-host-bundle.sh` to rebuild in a temporary directory and compare the
 result with the committed artifact. The build needs registry access; the
 committed runtime artifact does not.
+
+## Installation release
+
+The release retains the source, integration transform, build inputs and license
+needed to reproduce this artifact. Development tests, examples, logs and
+screenshots are not included. Test/example package scripts and the five direct
+Jest development dependencies were removed; the workspace declarations in the
+Yarn lock match the package manifest. Build commands and required dependency
+versions remain pinned, while unused resolved lock records are retained.
+The production environment probe in `src/jest.ts` remains available to the
+store and update modules. These packaging changes do not modify business
+source, the host bundle or its license notice.

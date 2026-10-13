@@ -42,8 +42,11 @@
         - llm
         - webServer
         - tools
+        - commands
         - agentDefaultModel
         - sandboxPolicy
         - shell
         - agentPresets
+        - settings
         - tokenMeter
+        - skills

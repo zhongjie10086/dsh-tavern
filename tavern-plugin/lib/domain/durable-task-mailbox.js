@@ -9,10 +9,12 @@ function mailboxOf(chat) {
   const source = chat && chat.taskMailbox
   if (source && typeof source === 'object' && source.tasks && typeof source.tasks === 'object') {
     if (!source.latestByKind || typeof source.latestByKind !== 'object') source.latestByKind = {}
+    source.tasks = Object.assign(Object.create(null), source.tasks)
+    source.latestByKind = Object.assign(Object.create(null), source.latestByKind)
     if (!Number.isSafeInteger(source.version) || source.version < 0) source.version = 0
     return source
   }
-  const mailbox = { version: 0, tasks: {}, latestByKind: {} }
+  const mailbox = { version: 0, tasks: Object.create(null), latestByKind: Object.create(null) }
   chat.taskMailbox = mailbox
   return mailbox
 }
@@ -97,6 +99,16 @@ export function createDurableTaskMailbox(options = {}) {
     return true
   }
 
+  function prune(mailbox, protectedId) {
+    const finished = Object.values(mailbox.tasks).filter(task => task && TERMINAL.has(task.status) && task.taskId !== protectedId)
+      .sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt) || Number(b.version) - Number(a.version))
+    const protectedFinished = TERMINAL.has(mailbox.tasks[protectedId]?.status) ? 1 : 0
+    for (const task of finished.slice(30 - protectedFinished)) delete mailbox.tasks[task.taskId]
+    const latest = Object.create(null)
+    for (const task of Object.values(mailbox.tasks).filter(Boolean).sort((a, b) => Number(a.createdAt) - Number(b.createdAt))) latest[task.kind] = task.taskId
+    mailbox.latestByKind = latest
+  }
+
   async function submit(chatId, input = {}) {
     return await serialize(chatId, async function () {
       const chat = await store.readChat(chatId)
@@ -111,6 +123,7 @@ export function createDurableTaskMailbox(options = {}) {
         if (str(existing.kind) !== kind) throw new Error('同一 requestId 对应了不同任务类型')
         return publicTask(existing)
       }
+      if (Object.values(mailbox.tasks).filter(task => task && !TERMINAL.has(task.status)).length >= 30) throw new Error('待处理任务已达 30 项，请等待完成或取消后再提交')
       sequence += 1
       const timestamp = now()
       const taskId = 'task-' + timestamp.toString(36) + '-' + sequence.toString(36)
@@ -131,10 +144,7 @@ export function createDurableTaskMailbox(options = {}) {
       }
       mailbox.tasks[taskId] = task
       mailbox.latestByKind[kind] = taskId
-      const ids = Object.keys(mailbox.tasks).sort(function (left, right) {
-        return (Number(mailbox.tasks[right].createdAt) || 0) - (Number(mailbox.tasks[left].createdAt) || 0)
-      })
-      for (const oldId of ids.slice(30)) delete mailbox.tasks[oldId]
+      prune(mailbox, taskId)
       await store.writeChat(chat, { source: kind + '.mailbox.queued', requestId })
       return publicTask(task)
     })
@@ -147,7 +157,10 @@ export function createDurableTaskMailbox(options = {}) {
       const mailbox = mailboxOf(chat)
       const task = findTask(mailbox, { taskId })
       if (!task) throw new Error('持久任务不存在: ' + taskId)
-      if (applyPatch(mailbox, task, patch)) await store.writeChat(chat, { source: str(task.kind) + '.mailbox.' + (str(patch.stage) || str(patch.status) || 'transition'), requestId: str(task.requestId), operationId: str(patch.operationId || task.operationId) })
+      if (applyPatch(mailbox, task, patch)) {
+        prune(mailbox, taskId)
+        await store.writeChat(chat, { source: str(task.kind) + '.mailbox.' + (str(patch.stage) || str(patch.status) || 'transition'), requestId: str(task.requestId), operationId: str(patch.operationId || task.operationId) })
+      }
       return publicTask(task)
     })
   }
@@ -160,7 +173,7 @@ export function createDurableTaskMailbox(options = {}) {
       const task = findTask(mailbox, selector)
       if (!task) return { mailboxVersion: mailbox.version, task: null }
       const repair = await reconcile(chat, publicTask(task))
-      if (repair && typeof repair === 'object' && applyPatch(mailbox, task, repair)) await store.writeChat(chat, { source: str(task.kind) + '.mailbox.reconcile', requestId: str(task.requestId), operationId: str(task.operationId) })
+      if (repair && typeof repair === 'object' && applyPatch(mailbox, task, repair)) {prune(mailbox,task.taskId);await store.writeChat(chat, { source: str(task.kind) + '.mailbox.reconcile', requestId: str(task.requestId), operationId: str(task.operationId) })}
       return { mailboxVersion: mailbox.version, task: publicTask(task) }
     })
   }
@@ -178,7 +191,7 @@ export function createDurableTaskMailbox(options = {}) {
           status: 'interrupted', stage: 'interrupted', error: '服务重启中断了本次后台任务'
         }) || changed
       }
-      if (changed) await store.writeChat(chat, { source: 'mailbox.recover' })
+      if (changed) {prune(mailbox);await store.writeChat(chat, { source: 'mailbox.recover' })}
       return { mailboxVersion: mailbox.version, tasks: Object.values(mailbox.tasks).map(publicTask) }
     })
   }

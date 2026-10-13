@@ -6,6 +6,8 @@ import { MACRO_VARIABLE_SHORTHAND_PATTERN } from '../vendor/sillytavern-macros/M
 import { collectMacroDiagnostics } from '../vendor/sillytavern-macros/MacroDiagnostics.js'
 import { ELSE_MARKER } from '../vendor/sillytavern-macros/constants.js'
 import { isFalseBoolean } from '../vendor/sillytavern-macros/runtime.js'
+import {sha256Hex} from './portable-sha256.js'
+import {macroDateFormat} from './macro-date-format.js'
 
 let registered = false
 
@@ -19,7 +21,7 @@ function str(value) {
 }
 
 function variableStore(initial = {}) {
-  const values = Object.assign({}, initial && typeof initial === 'object' ? initial : {})
+  const values = Object.assign(Object.create(null), initial && typeof initial === 'object' ? initial : {})
   return {
     get(name) { return values[name] },
     has(name) { return Object.hasOwn(values, name) },
@@ -44,7 +46,7 @@ function variableStore(initial = {}) {
       return values[name]
     },
     delete(name) { delete values[name] },
-    snapshot() { return Object.assign({}, values) }
+    snapshot() { return Object.fromEntries(Object.entries(values)) }
   }
 }
 
@@ -91,6 +93,33 @@ function registerMacros() {
 
   MacroRegistry.registerMacro('user', { category: MacroCategory.NAMES, handler: ({ env }) => env.names.user })
   MacroRegistry.registerMacro('char', { category: MacroCategory.NAMES, handler: ({ env }) => env.names.char })
+  MacroRegistry.registerMacro('newline',{category:MacroCategory.UTILITY,handler:()=> '\n'})
+  MacroRegistry.registerMacro('noop',{category:MacroCategory.UTILITY,handler:()=> ''})
+  MacroRegistry.registerMacro('reverse',{category:MacroCategory.UTILITY,unnamedArgs:[{name:'text'}],handler:({unnamedArgs:[value]})=>Array.from(str(value)).reverse().join('')})
+  MacroRegistry.registerMacro('weekday',{category:MacroCategory.UTILITY,handler:({env})=>env.clock.toLocaleDateString(env.locale||'en-US',{weekday:'long'})})
+  MacroRegistry.registerMacro('isodate',{category:MacroCategory.UTILITY,handler:({env})=>macroDateFormat(env.clock,'YYYY-MM-DD',env.locale)})
+  MacroRegistry.registerMacro('datetimeformat',{category:MacroCategory.UTILITY,unnamedArgs:[{name:'format',optional:true,defaultValue:''}],handler:({unnamedArgs:[format],env})=>macroDateFormat(env.clock,format,env.locale)})
+  MacroRegistry.registerMacro('pick',{category:MacroCategory.UTILITY,list:true,strictArgs:false,handler:({args,env})=>{
+    const choices=args.length===1?str(args[0]).split(/(?<!\\),/).map(s=>s.trim().replaceAll('\\,',',')):args
+    if(!choices.length)return ''
+    const source=JSON.stringify(args),seed=JSON.stringify([env.pickSeed,source,env.nextPick(source)]);return choices[parseInt(sha256Hex(seed).slice(0,8),16)%choices.length]
+  }})
+  MacroRegistry.registerMacro('random', { category:MacroCategory.UTILITY,list:true,strictArgs:false,handler:({args,env})=>{
+    const choices=args.length===1?str(args[0]).split(',').map(value=>value.trim()):args
+    if(!choices.length)return ''
+    return choices[Math.min(choices.length-1,Math.floor(env.random()*choices.length))]
+  }})
+  MacroRegistry.registerMacro('roll', { category:MacroCategory.UTILITY,unnamedArgs:[{name:'dice',optional:true,defaultValue:'1d6'}],handler:({unnamedArgs:[value],env,warn,rawOriginal})=>{
+    const match=str(value).trim().match(/^(\d*)d(\d+)([+-]\d+)?$/i),count=Number(match?.[1]||1),sides=Number(match?.[2]),modifier=Number(match?.[3]||0)
+    if(!match||!Number.isSafeInteger(count)||count<1||count>100||!Number.isSafeInteger(sides)||sides<1||sides>1e9||!Number.isSafeInteger(modifier)||Math.abs(modifier)>1e12){warn('骰子表达式无效或超过数量限制');return rawOriginal}
+    let sum=modifier;for(let i=0;i<count;i++)sum+=1+Math.min(sides-1,Math.floor(env.random()*sides));return String(sum)
+  }})
+  MacroRegistry.registerMacro('date',{category:MacroCategory.UTILITY,handler:({env})=>env.clock.toLocaleDateString(env.locale)})
+  MacroRegistry.registerMacro('time',{category:MacroCategory.UTILITY,unnamedArgs:[{name:'offset',optional:true,defaultValue:''}],handler:({unnamedArgs:[offset],env,warn,rawOriginal})=>{
+    if(!offset)return env.clock.toLocaleTimeString(env.locale,{hour:'2-digit',minute:'2-digit'})
+    const match=str(offset).match(/^UTC([+-]\d{1,2})$/i);if(!match||Math.abs(Number(match[1]))>14){warn('时区偏移无效');return rawOriginal}
+    return new Date(env.clock.getTime()+Number(match[1])*3600000).toLocaleTimeString(env.locale,{timeZone:'UTC',hour:'2-digit',minute:'2-digit'})
+  }})
   MacroRegistry.registerMacro('//', {
     category: MacroCategory.UTILITY,
     unnamedArgs: [{ name: 'comment', optional: true, defaultValue: '' }],
@@ -98,6 +127,10 @@ function registerMacros() {
     strictArgs: false,
     handler: () => ''
   })
+
+  for (const name of ['lastUserMessage', 'lastCharMessage', 'lastMessage']) {
+    MacroRegistry.registerMacro(name, { category: MacroCategory.NAMES, handler: ({ env }) => str(env.extra[name]) })
+  }
 
   registerAccessor('getvar', 'local', 'get')
   registerAccessor('setvar', 'local', 'set')
@@ -159,6 +192,10 @@ export function renderTavernMacros(text, context = {}) {
   const local = variableStore(context.localVariables)
   const global = variableStore(context.globalVariables)
   const env = {
+    pickSeed:context.chatId||context.pickSeed||context.charName||'',nextPick:(()=>{const occurrences=new Map();return source=>{const index=occurrences.get(source)||0;occurrences.set(source,index+1);return index}})(),
+    random:typeof context.random==='function'?context.random:Math.random,
+    clock:new Date(typeof context.now==='function'?context.now():context.now??Date.now()),
+    locale:context.locale,
     content: str(text),
     names: { user: str(context.userName) || '你', char: str(context.charName) },
     character: {},
@@ -166,9 +203,9 @@ export function renderTavernMacros(text, context = {}) {
     functions: { postProcess: value => value },
     variables: { local, global },
     dynamicMacros: {},
-    extra: {}
+    extra: { lastUserMessage: str(context.lastUserMessage), lastCharMessage: str(context.lastCharMessage), lastMessage: str(context.lastMessage ?? context.lastUserMessage) }
   }
-  let rendered = normalizeLegacyVariableExpressions(text)
+  let rendered = normalizeLegacyVariableExpressions(text).replace(/\{\{datetimeformat +([^}]*)\}\}/gi,'{{datetimeformat::$1}}')
   const diagnostics = []
   // Some ecosystem cards deliberately escape a macro once so that an outer
   // macro pass exposes it for the next pass. Resolve those delayed macros, but

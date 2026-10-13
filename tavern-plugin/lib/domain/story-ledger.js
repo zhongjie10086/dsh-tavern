@@ -71,7 +71,7 @@ export function ledgerContext(value) { return '【当前台账（已结算）】
 
 /** Pure, atomic delta projection. A failed call leaves the authoritative ledger untouched. */
 export function applyLedgerDelta(current, delta, turn) {
-  if (!object(delta)) throw new Error('ledger_submit 参数须为对象')
+  if (!object(delta)) throw new Error('台账修改参数须为对象')
   for (const name of Object.keys(delta)) if (!['location', 'locationPath', ...Object.keys(fields)].includes(name)) throw new Error('未知台账分类：' + name)
   const next = readLedger(current)
   if (Object.hasOwn(delta, 'location')) {
@@ -130,6 +130,7 @@ export function applyLedgerDelta(current, delta, turn) {
   next.updatedTurn = turn
   return next
 }
+
 
 /** One submission per model task. Retrying the accepted call cannot double-add quantities. */
 export function createLedgerSubmission({ enabled, current, turn }) {

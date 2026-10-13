@@ -7,9 +7,10 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { createHash, randomInt, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { request } from "node:https";
-import { Readable } from "node:stream";
-import { inflateRawSync } from "node:zlib";
+import http from "node:http";
+import https, { request } from "node:https";
+import { Readable, Transform, pipeline } from "node:stream";
+import { createBrotliDecompress, createGunzip, createInflate, inflateRawSync } from "node:zlib";
 import { setTimeout as setTimeout$1 } from "node:timers/promises";
 //#region lib/types/shared.js
 /** Browser route used by the generated-image card. */
@@ -2881,6 +2882,251 @@ function redactSceneDiagnostic(value, secrets = [], depth = 0) {
 	return value;
 }
 //#endregion
+//#region lib/types/tavern/outbound-network-policy.js
+const stripBrackets = (value) => value.replace(/^\[|\]$/g, "").toLowerCase();
+const ipv4 = (value) => value.split(".").reduce((n, part) => n << 8n | BigInt(part), 0n);
+const in4 = (value, base, bits) => value >> BigInt(32 - bits) === ipv4(base) >> BigInt(32 - bits);
+function ipv6(value) {
+	if (value.includes(".")) value = value.replace(/(?:\d+\.){3}\d+$/, (part) => {
+		const n = ipv4(part);
+		return (n >> 16n).toString(16) + ":" + (n & 65535n).toString(16);
+	});
+	const [left, right] = value.split("::"), a = left ? left.split(":") : [], b = right ? right.split(":") : [];
+	return (right === void 0 ? a : [
+		...a,
+		...Array(8 - a.length - b.length).fill("0"),
+		...b
+	]).reduce((n, part) => n << 16n | BigInt("0x" + part), 0n);
+}
+const in6 = (value, base, bits) => value >> BigInt(128 - bits) === ipv6(base) >> BigInt(128 - bits);
+const isProxyFakeIp = (row) => isIP(row.address) === 4 && Number(row.family) === 4 && in4(ipv4(row.address), "198.18.0.0", 15);
+function outboundAddressKind(address) {
+	const host = stripBrackets(String(address)), family = isIP(host);
+	if (family === 4) {
+		const n = ipv4(host);
+		if (host === "100.100.100.200" || host === "168.63.129.16") return "blocked";
+		if ([
+			["10.0.0.0", 8],
+			["127.0.0.0", 8],
+			["172.16.0.0", 12],
+			["192.168.0.0", 16]
+		].some(([base, bits]) => in4(n, base, bits))) return "local";
+		if ([
+			["0.0.0.0", 8],
+			["100.64.0.0", 10],
+			["169.254.0.0", 16],
+			["192.0.0.0", 24],
+			["192.0.2.0", 24],
+			["192.88.99.0", 24],
+			["198.18.0.0", 15],
+			["198.51.100.0", 24],
+			["203.0.113.0", 24],
+			["224.0.0.0", 3]
+		].some(([base, bits]) => in4(n, base, bits))) return "blocked";
+		return "public";
+	}
+	if (family === 6) {
+		const n = ipv6(host);
+		if (n === 1n || in6(n, "fc00::", 7)) return "local";
+		if (!in6(n, "2000::", 3) || [
+			["2001::", 32],
+			["2001:2::", 48],
+			["2001:10::", 28],
+			["2001:20::", 28],
+			["2001:db8::", 32],
+			["2002::", 16],
+			["3fff::", 20]
+		].some(([base, bits]) => in6(n, base, bits))) return "blocked";
+		return "public";
+	}
+	return "blocked";
+}
+function allowedOrigin(url, purpose, allowedModelOrigins) {
+	if (purpose !== "model") return false;
+	return (allowedModelOrigins || []).some((value) => {
+		try {
+			return new URL(value).origin === url.origin;
+		} catch {
+			return false;
+		}
+	});
+}
+function validateOutboundUrl(value, { purpose = "resource", allowedModelOrigins = [], trustedResource = false } = {}) {
+	let url;
+	try {
+		url = new URL(value);
+	} catch {
+		throw new Error("外连目标 URL 无效");
+	}
+	if (!(purpose === "model" || trustedResource ? ["https:", "http:"] : ["https:"]).includes(url.protocol)) throw new Error("外连目标协议禁止");
+	if (url.username || url.password) throw new Error("外连目标不能包含凭据");
+	const host = stripBrackets(url.hostname), local = trustedResource || allowedOrigin(url, purpose, allowedModelOrigins);
+	const kind = isIP(host) ? outboundAddressKind(host) : null;
+	if (kind === "blocked" || kind === "local" && !local || !local && /(?:^|\.)(?:localhost|local|internal|home|lan)$/.test(host.replace(/\.$/, ""))) throw new Error("禁止访问私网或保留地址");
+	url.hash = "";
+	return url;
+}
+async function resolveOutboundTarget(value, { lookup: lookup$1 = lookup, purpose = "resource", allowedModelOrigins = [], trustedResource = false } = {}) {
+	const url = validateOutboundUrl(value, {
+		purpose,
+		allowedModelOrigins,
+		trustedResource
+	}), host = stripBrackets(url.hostname);
+	let addresses = isIP(host) ? [{
+		address: host,
+		family: isIP(host)
+	}] : await lookup$1(host, {
+		all: true,
+		verbatim: true
+	});
+	if (!Array.isArray(addresses) || !addresses.length) throw new Error("外连目标没有可用地址");
+	const hasFakeIp = !isIP(host) && addresses.some(isProxyFakeIp);
+	const local = trustedResource || allowedOrigin(url, purpose, allowedModelOrigins);
+	const trustedFakeIp = hasFakeIp && addresses.every((row) => isProxyFakeIp(row) || Number(row.family) === isIP(row.address) && (outboundAddressKind(row.address) === "public" || local && outboundAddressKind(row.address) === "local"));
+	for (const row of addresses) {
+		const kind = outboundAddressKind(row.address);
+		if (!isIP(row.address) || Number(row.family) !== isIP(row.address) || kind !== "public" && !(trustedFakeIp && isProxyFakeIp(row)) && !(local && kind === "local")) throw Object.assign(/* @__PURE__ */ new Error("DNS 解析包含禁止的私网或保留地址"), {
+			code: "RESOURCE_DNS_POLICY",
+			status: 403
+		});
+	}
+	return {
+		url,
+		addresses: addresses.map((row) => ({
+			address: row.address,
+			family: Number(row.family)
+		}))
+	};
+}
+/** Fetch subset used by this plugin. DNS is pinned in the actual TCP/TLS connection,
+* while the original hostname is retained for Host, SNI and certificate validation.
+* Reuse sockets only while the validated system DNS answer remains identical.
+* No proxy environment variables, alternate DNS, or ambient cookies are used. */
+var PinnedHttpAgent = class extends http.Agent {
+	getName(options) {
+		return super.getName(options) + ":" + options.dshAddressKey;
+	}
+};
+var PinnedHttpsAgent = class extends https.Agent {
+	getName(options) {
+		return super.getName(options) + ":" + options.dshAddressKey;
+	}
+};
+const httpAgent = new PinnedHttpAgent({
+	keepAlive: true,
+	maxSockets: 16,
+	maxFreeSockets: 4,
+	timeout: 3e4
+});
+const httpsAgent = new PinnedHttpsAgent({
+	keepAlive: true,
+	maxSockets: 16,
+	maxFreeSockets: 4,
+	timeout: 3e4
+});
+function pinnedRequest(target, init, { httpRequest = http.request, httpsRequest = https.request, maxDecodedBytes = 67108864 } = {}) {
+	return new Promise((resolve, reject) => {
+		const { url, addresses } = target, host = stripBrackets(url.hostname);
+		const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, {
+			method: init.method || "GET",
+			headers: {
+				...init.headers,
+				"Accept-Encoding": "gzip, br, deflate"
+			},
+			signal: init.signal,
+			agent: url.protocol === "https:" ? httpsAgent : httpAgent,
+			dshAddressKey: addresses.map((row) => row.address + "/" + row.family).join(","),
+			autoSelectFamily: true,
+			autoSelectFamilyAttemptTimeout: 250,
+			lookup: (_name, options, callback) => {
+				const row = addresses[0];
+				if (options?.all) callback(null, addresses);
+				else callback(null, row.address, row.family);
+			},
+			...url.protocol === "https:" && !isIP(host) ? { servername: host } : {}
+		}, (incoming) => {
+			try {
+				const headers = new Headers();
+				for (let i = 0; i < incoming.rawHeaders.length; i += 2) headers.append(incoming.rawHeaders[i], incoming.rawHeaders[i + 1]);
+				const noBody = init.method === "HEAD" || [
+					204,
+					205,
+					304
+				].includes(incoming.statusCode);
+				const encoding = (headers.get("content-encoding") || "identity").toLowerCase();
+				const decompressor = encoding === "gzip" ? createGunzip() : encoding === "br" ? createBrotliDecompress() : encoding === "deflate" ? createInflate() : null;
+				if (!noBody && !decompressor && encoding !== "identity") throw Error("不支持的响应压缩编码：" + encoding);
+				let bytes = 0;
+				const bounded = new Transform({ transform(chunk, _encoding, done) {
+					bytes += chunk.length;
+					done(bytes > maxDecodedBytes ? Error("外连响应解压后超过上限") : null, chunk);
+				} });
+				if (decompressor) {
+					headers.delete("content-encoding");
+					headers.delete("content-length");
+				}
+				if (!noBody) pipeline(incoming, ...decompressor ? [decompressor] : [], bounded, () => {});
+				const response = new Response(noBody ? null : Readable.toWeb(bounded), {
+					status: incoming.statusCode,
+					headers
+				});
+				Object.defineProperty(response, "url", { value: url.href });
+				if (noBody) incoming.resume();
+				resolve(response);
+			} catch (error) {
+				incoming.destroy();
+				reject(error);
+			}
+		});
+		request.on("error", reject);
+		if (init.body !== void 0) request.write(init.body);
+		request.end();
+	});
+}
+async function safeOutboundFetch(value, init = {}, options = {}) {
+	assertOutboundEnabled();
+	const origins = typeof options.allowedModelOrigins === "function" ? await options.allowedModelOrigins() : options.allowedModelOrigins;
+	const target = await resolveOutboundTarget(value, {
+		...options,
+		allowedModelOrigins: origins
+	});
+	init.signal?.throwIfAborted();
+	let response;
+	try {
+		response = options.fetcher ? await options.fetcher(target.url.href, {
+			...init,
+			redirect: init.redirect === "error" ? "error" : "manual"
+		}, target) : await pinnedRequest(target, init, options);
+	} catch (error) {
+		if (!init.signal?.aborted && isProxyFakeIp(target.addresses[0])) throw Object.assign(new Error("信任本机代理连接失败，请确认代理/TUN 已启用且 Fake-IP 映射有效", { cause: error }), {
+			code: "TRUSTED_PROXY_CONNECTION_FAILED",
+			status: 502
+		});
+		throw error;
+	}
+	if (response?.url && new URL(response.url).href !== target.url.href) {
+		await response.body?.cancel?.();
+		throw new Error("外连传输发生未校验的重定向");
+	}
+	if ([
+		301,
+		302,
+		303,
+		307,
+		308
+	].includes(response?.status) && init.redirect === "error") {
+		await response.body?.cancel?.();
+		throw new Error("模型接口禁止重定向");
+	}
+	return response;
+}
+function outboundDisabled() {
+	return /^(?:1|true)$/i.test(process.env.DSH_TAVERN_OFFLINE || "");
+}
+function assertOutboundEnabled() {
+	if (outboundDisabled()) throw new Error("离线模式已关闭主动外连（DSH_TAVERN_OFFLINE）");
+}
+//#endregion
 //#region lib/types/tavern/scene-image-connection.js
 const MAX_BYTES = 262144;
 function endpoint$1(value) {
@@ -2918,7 +3164,7 @@ async function limitedJson(response) {
 	}
 }
 /** Read-only setup checks. No generation, settings writes, or redirect following. */
-function createSceneImageConnection({ settings, credentials, fetchImpl = fetch, timeoutMs = 5e3, onDiagnostic = void 0 }) {
+function createSceneImageConnection({ settings, credentials, fetchImpl, lookup, timeoutMs = 5e3, onDiagnostic = void 0 }) {
 	async function probeRequest(input, listModels, diagnostic, secrets) {
 		if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("连接配置必须是对象");
 		const channel = sceneImageChannel(input.provider);
@@ -2966,7 +3212,12 @@ function createSceneImageConnection({ settings, credentials, fetchImpl = fetch, 
 			};
 			diagnostic.requests.push(entry);
 			try {
-				const result = await fetchImpl(url, init);
+				const result = await safeOutboundFetch(url, init, {
+					purpose: "model",
+					trustedResource: true,
+					fetcher: fetchImpl,
+					lookup
+				});
 				entry.httpStatus = result.status;
 				return result;
 			} catch (error) {
@@ -3642,7 +3893,7 @@ function readChannel(value, id) {
 	return channelSettings(data, id);
 }
 /** A private in-process interface: secrets never cross the Studio HTTP route. */
-function createImageConfiguration({ read, write, restore = void 0, credentials, attachments, fetchImpl = fetch, generateImpl = generateSceneImage, onDiagnostic = void 0 }) {
+function createImageConfiguration({ read, write, restore = void 0, credentials, attachments, fetchImpl = void 0, lookup = void 0, generateImpl = generateSceneImage, onDiagnostic = void 0 }) {
 	let pending = Promise.resolve();
 	/** @template T @param {() => T | Promise<T>} fn @returns {Promise<T>} */
 	function serial(fn) {
@@ -3713,6 +3964,7 @@ function createImageConfiguration({ read, write, restore = void 0, credentials, 
 			return credentials.resolve(id && mapped[id] ? mapped[id][3] : oldRef);
 		} }),
 		fetchImpl,
+		lookup,
 		onDiagnostic
 	});
 	return {
@@ -3749,7 +4001,12 @@ function createImageConfiguration({ read, write, restore = void 0, credentials, 
 				};
 			});
 			request.signal?.throwIfAborted();
-			const generated = await generateImpl(request, fetchImpl === globalThis.fetch ? {} : { fetch: fetchImpl });
+			const generated = await generateImpl(request, { fetch: (url, init) => safeOutboundFetch(url, init, {
+				purpose: "model",
+				trustedResource: true,
+				fetcher: fetchImpl,
+				lookup
+			}) });
 			if (!attachments) return generated;
 			try {
 				const attachment = await attachments.saveImage({

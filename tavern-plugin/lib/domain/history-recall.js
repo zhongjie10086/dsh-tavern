@@ -1,3 +1,5 @@
+import { readToolPage, TOOL_READ_PAGE_SCHEMA } from './tool-read-page.js'
+
 function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
 }
@@ -79,7 +81,9 @@ export const HISTORY_RECALL_TOOL = Object.freeze({
       query: { type: 'string', minLength: 1, description: '要回忆的人物、地点、物品、承诺或事件关键词；多个关键词用空格分隔。' },
       turn: { type: 'integer', minimum: 1, description: '读取指定剧情轮次及其附近原文。' },
       radius: { type: 'integer', minimum: 0, maximum: 3, description: '按轮读取时包含前后多少轮，默认 1。' },
-      limit: { type: 'integer', minimum: 1, maximum: 8, description: '关键词检索最多返回多少条命中，默认 5。' }
+      limit: { type: 'integer', minimum: 1, maximum: 8, description: '关键词检索最多返回多少条命中，默认 5。' },
+      offset: { type: 'integer', description: '按轮读取正文的 1 起始字符偏移；续读使用上页 to + 1。' },
+      chars: { type: 'integer', description: '按轮读取字符数，默认 6000，最多 12000；保持 turn/radius 不变翻页。' }
     }
   })
 })
@@ -94,6 +98,7 @@ export const HISTORY_RECALL_OUTPUT_SCHEMA = Object.freeze({
     mode: { type: 'string', required: true },
     query: { type: 'string', required: true },
     requestedTurn: { type: 'integer', required: true },
+    ...TOOL_READ_PAGE_SCHEMA,
     matches: {
       type: 'array', required: true,
       items: {
@@ -101,25 +106,6 @@ export const HISTORY_RECALL_OUTPUT_SCHEMA = Object.freeze({
         properties: {
           turn: { type: 'integer', required: true },
           excerpt: { type: 'string', required: true }
-        }
-      }
-    },
-    rounds: {
-      type: 'array', required: true,
-      items: {
-        type: 'object', additionalProperties: false,
-        properties: {
-          turn: { type: 'integer', required: true },
-          messages: {
-            type: 'array', required: true,
-            items: {
-              type: 'object', additionalProperties: false,
-              properties: {
-                role: { type: 'string', required: true },
-                text: { type: 'string', required: true }
-              }
-            }
-          }
         }
       }
     }
@@ -131,6 +117,7 @@ export function createHistoryRecall() {
     const chat = input.chat
     if (chat === null || typeof chat !== 'object') throw new Error('历史正文检索缺少 Tavern Chat')
     const query = str(input.query).trim()
+    if (query.length > 512) throw new Error('历史检索关键词不能超过 512 字')
     const hasQuery = query !== ''
     const hasTurn = input.turn !== undefined && input.turn !== null
     if (Number(hasQuery) + Number(hasTurn) !== 1) throw new Error('历史正文检索必须且只能提供 query 或 turn')
@@ -143,7 +130,7 @@ export function createHistoryRecall() {
       query: hasQuery ? query : '',
       requestedTurn: hasTurn ? Number(input.turn) : 0,
       matches: [],
-      rounds: []
+      ...readToolPage('')
     }
     if (hasQuery) {
       const terms = termsOf(query)
@@ -164,7 +151,8 @@ export function createHistoryRecall() {
     if (!Number.isInteger(requested) || requested < 1) throw new Error('历史正文轮次必须是大于 0 的整数')
     const radius = clampInteger(input.radius, 1, 0, 3)
     const selected = rounds.filter(function (round) { return Math.abs(round.turn - requested) <= radius })
-    return Object.assign(base, { found: selected.some(function (round) { return round.turn === requested }), rounds: selected })
+    const text = selected.map(round => '【第 ' + round.turn + ' 轮】\n' + round.messages.map(message => (message.role === 'user' ? '[玩家]' : '[正文]') + '\n' + message.text).join('\n\n')).join('\n\n')
+    return Object.assign(base, { found: selected.some(round => round.turn === requested), ...readToolPage(text, { offset: input.offset, limit: input.chars }) })
   }
 
   return Object.freeze({ recall })
@@ -178,9 +166,5 @@ export function renderHistoryRecall(value) {
       return '[第 ' + match.turn + ' 轮]\n' + match.excerpt
     }).join('\n\n') + '\n\n需要完整上下文时，请用 turn 读取对应轮次。'
   }
-  return warning + '\n\n' + value.rounds.map(function (round) {
-    return '【第 ' + round.turn + ' 轮】\n' + round.messages.map(function (message) {
-      return (message.role === 'user' ? '[玩家]' : '[正文]') + '\n' + message.text
-    }).join('\n\n')
-  }).join('\n\n')
+  return warning + '\n\n第 ' + value.from + '~' + value.to + ' 字 / 共 ' + value.totalChars + ' 字' + (value.done ? '（读取完成）' : '；续读 offset=' + (value.to + 1)) + '\n\n' + value.text
 }

@@ -8,48 +8,30 @@ import {
 import { variableDiagnosticSummary } from './mvu-diagnostics.js'
 import { normalizeBackgroundTasks } from './tavern-settings.js'
 import { POSTURE_SUBMIT_TOOL, POSTURE_SUBMIT_TOOL_NAME, normalizePostureSubmission } from './posture-submission.js'
+import {createLedgerSubmission,LEDGER_SUBMIT_TOOL,LEDGER_RULES,ledgerContext} from './story-ledger.js'
 import { resolveRuntimeMacroText } from './runtime-content-projection.js'
 
 export const MVU_SUBMIT_UPDATE_TOOL_NAME = 'mvu_submit_update'
 
-const jsonValueSchema = {
-  anyOf: [
-    { type: 'null' },
-    { type: 'boolean' },
-    { type: 'number' },
-    { type: 'string' },
-    { type: 'array', items: {} },
-    { type: 'object', additionalProperties: true }
-  ]
+// Keep the provider-facing schema flat: some OpenAI-compatible gateways narrow
+// arbitrary JSON unions to a single primitive type. Decode values at our boundary.
+// (upstream 01d10e39)
+const operationSchema = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    op: { type: 'string', enum: ['replace', 'insert', 'add', 'delta', 'remove', 'move'] },
+    path: { type: 'string' },
+    valueJson: { type: 'string', description: 'replace/insert/add/delta 必填：实际值的 JSON 编码字符串。例如数字编码为 999995，布尔编码为 false，对象编码为 {"名称":"长剑"}；字符串值须包含 JSON 双引号。delta 必须编码有限数字。remove/move 不需要此字段。' },
+    from: { type: 'string', description: '仅 move 必填：来源绝对路径。' }
+  },
+  required: ['op', 'path']
 }
-
-const operationSchemas = [
-  {
-    type: 'object', additionalProperties: false,
-    properties: { op: { type: 'string', enum: ['replace', 'insert', 'add'] }, path: { type: 'string' }, value: jsonValueSchema },
-    required: ['op', 'path', 'value']
-  },
-  {
-    type: 'object', additionalProperties: false,
-    properties: { op: { type: 'string', const: 'delta' }, path: { type: 'string' }, value: { type: 'number' } },
-    required: ['op', 'path', 'value']
-  },
-  {
-    type: 'object', additionalProperties: false,
-    properties: { op: { type: 'string', const: 'remove' }, path: { type: 'string' } },
-    required: ['op', 'path']
-  },
-  {
-    type: 'object', additionalProperties: false,
-    properties: { op: { type: 'string', const: 'move' }, from: { type: 'string' }, path: { type: 'string' } },
-    required: ['op', 'from', 'path']
-  }
-]
 
 export const MVU_SUBMIT_UPDATE_TOOL = Object.freeze({
   name: MVU_SUBMIT_UPDATE_TOOL_NAME,
   description: [
     '提交本轮正文确认的变量变化，以返回的实际执行校验结果为准。变量通过本工具提交，不在回复中输出 XML 变量协议；人物卡中的变量含义、更新条件和校验规则仍须遵守。',
+    '所有写入值使用 valueJson 提交 JSON 编码字符串，不使用 value；对象必须编码完整对象，数字不能用布尔值代替。',
     '最多提交三次。若 ok=false 且 retryable=true，读取 error、failures 和 runtimeDiagnostics，根据 currentVariables 与变量结构修正完整 operations 后重试，不要原样反复提交。',
     'rolledBack=true 表示整批修改未保存，可以基于原快照重新提交完整更新；不得用空 operations 掩盖尚未修复的失败。',
     '返回 ok=true 或 retryable=false 后停止调用本工具，不能重复执行已成功的变量更新，也不能绕过人物卡校验。'
@@ -61,7 +43,7 @@ export const MVU_SUBMIT_UPDATE_TOOL = Object.freeze({
       operations: {
         type: 'array',
         description: '官方 MVU JSON Patch 方言。path/from 使用完整变量快照中的绝对路径（例如 /stat_data/角色/好感度）；有变化时提交完整 operations，没有变化时提交空数组。',
-        items: { oneOf: operationSchemas }
+        items: operationSchema
       }
     },
     required: ['operations']
@@ -249,11 +231,27 @@ function normalizeOperation(raw, index) {
     return normalized
   }
   if (op === 'remove') return normalized
-  if (!Object.prototype.hasOwnProperty.call(operation, 'value')) throw new Error(label + ' 缺少 value')
-  if (op === 'delta' && (typeof operation.value !== 'number' || !Number.isFinite(operation.value))) {
+  let value
+  if (Object.hasOwn(operation, 'valueJson')) {
+    if (Object.hasOwn(operation, 'value')) throw new Error(label + ' 不得同时提交 valueJson 和 value')
+    if (typeof operation.valueJson !== 'string') throw new Error(label + ' 的 valueJson 必须是 JSON 编码字符串')
+    try {
+      value = JSON.parse(operation.valueJson, (_key, item) => {
+        if (typeof item === 'number' && !Number.isFinite(item)) throw new Error('非有限数字')
+        return item
+      })
+    } catch {
+      throw new Error(label + ' 的 valueJson 不是有效 JSON（数字必须有限）')
+    }
+  } else {
+    // Pending deliveries and older in-flight callers already store decoded values.
+    if (!Object.hasOwn(operation, 'value')) throw new Error(label + ' 缺少 valueJson（旧格式 value）')
+    value = operation.value
+  }
+  if (op === 'delta' && (typeof value !== 'number' || !Number.isFinite(value))) {
     throw new Error(label + ' 的 delta value 必须是有限数字')
   }
-  normalized.value = clone(operation.value)
+  normalized.value = clone(value)
   return normalized
 }
 
@@ -264,6 +262,54 @@ export function normalizeMvuToolSubmission(value) {
   // Older callers may still include `analysis`; it is intentionally ignored.
   return {
     operations: input.operations.map(normalizeOperation)
+  }
+}
+
+function valueKind(value) {
+  return Array.isArray(value) ? '列表' : value !== null && typeof value === 'object' ? '对象' : typeof value === 'number' ? '数字' : typeof value === 'boolean' ? '布尔值' : value === null ? '空值' : '文本'
+}
+// A replace that changes a field's shape (list <-> text <-> object) makes MVU's
+// schema diverge and the card's view mis-render. Let the agent fix it and retry.
+// (upstream a51ad3b0 shape check; list elements from a15ec319)
+function assertMvuValueKinds(operations, variables) {
+  const root = object(variables)
+  const compatible = (before, after) => before === after || (before === '数字' && after === '文本') || (before === '文本' && after === '数字')
+  const elementKind = list => {
+    const kinds = [...new Set(list.map(valueKind))]
+    return kinds.length === 1 ? kinds[0] : null
+  }
+  function lookup(keys) {
+    let target = keys[0] === 'stat_data' ? root : object(root.stat_data)
+    for (const key of keys) {
+      if (target === null || typeof target !== 'object' || !Object.hasOwn(target, key)) return { found: false }
+      target = target[key]
+    }
+    return { found: true, target }
+  }
+  const fail = (index, path, before, after, element) => {
+    throw new Error('变量操作 #' + (index + 1) + ' 类型不一致：' + path + (element ? ' 的列表元素' : '') + ' 当前是' + before + '，提交的是' + after + '；请按原类型提交（列表用 JSON 数组，元素与已有元素同形）')
+  }
+  for (const [index, operation] of operations.entries()) {
+    if (!['replace', 'insert', 'add'].includes(operation.op)) continue
+    const keys = operation.path.split('/').slice(1).map(key => key.replace(/~1/g, '/').replace(/~0/g, '~'))
+    const self = lookup(keys)
+    if (operation.op === 'replace' && self.found && self.target !== null) {
+      const before = valueKind(self.target), after = valueKind(operation.value)
+      if (!compatible(before, after)) fail(index, operation.path, before, after, false)
+      // Elements of a list keep the shape of the existing ones (MVU infers the element schema).
+      if (Array.isArray(self.target) && Array.isArray(operation.value) && self.target.length) {
+        const kind = elementKind(self.target)
+        const bad = kind && operation.value.find(item => !compatible(kind, valueKind(item)))
+        if (bad !== undefined && kind) fail(index, operation.path, kind, valueKind(bad), true)
+      }
+      continue
+    }
+    // Inserting into a list: the new element matches its siblings.
+    const parent = lookup(keys.slice(0, -1))
+    if (parent.found && Array.isArray(parent.target) && parent.target.length && (keys.at(-1) === '-' || /^\d+$/.test(keys.at(-1)))) {
+      const kind = elementKind(parent.target)
+      if (kind && !compatible(kind, valueKind(operation.value))) fail(index, operation.path, kind, valueKind(operation.value), true)
+    }
   }
 }
 
@@ -340,7 +386,7 @@ export function createMvuBackgroundTaskFrame(input = {}) {
       storyDigest: str(input.storyDigest)
     },
     foregroundOutput: { storyText },
-    authoritativeState: { currentVariables, variableSchema },
+    authoritativeState: { currentVariables, variableSchema,ledger:input.ledger || null },
     taskRules: {
       updateRules: Array.isArray(input.updateRules) ? input.updateRules.map(str).filter(Boolean) : [],
       backgroundTasks: normalizeBackgroundTasks(input.backgroundTasks),
@@ -371,19 +417,21 @@ export function projectMvuBackgroundRequest(frame) {
       JSON.stringify(promptVariables(state.currentVariables)),
       '【变量结构】',
       JSON.stringify(state.variableSchema || {}),
+      ...(tasks.ledger?[ledgerContext(state.ledger)]:[]),
       ...(updateRules.length === 0 ? [] : ['【人物卡变量更新规则】', updateRules.join('\n\n')]),
       ...(tasks.characterDesign ? ['【人物设计（按需）】',
       '若本轮出现值得长期保留的重要人物，可先调用 skill 加载 tavern-character-design，再按 Skill 读取或保存人物档案。人物设计独立保存，不属于 MVU operations。'] : [])
     ].join('\n'),
     system: [
       '只根据【正文】中已经确认发生的事实结算变量，不得读取或推断玩家意图。',
+      ...(tasks.ledger?[LEDGER_RULES]:[]),
       '不得根据旧轮剧情、隐藏思考、候选项或未发生事件更新变量。',
       ...(tasks.characterDesign ? ['若确实需要人物设计，在当前后台 Agent 内先加载 tavern-character-design 并调用人物档案工具；无需也不得创建另一个 Agent。完成后继续本轮结算。'] : ['本轮人物设计已关闭，不调用人物设计 Skill 或生成档案。']),
-      tasks.posture ? '在同一次回复中同时调用 posture_submit 和 mvu_submit_update，分别提交本轮结束时可见的人物姿势与变量变化；两者互不依赖，无需等待前一个工具返回。不得在回复正文输出 JSON。' : '本轮姿势结算已关闭，直接提交变量，不生成姿势。',
+      tasks.posture ? '在同一次回复中同时调用 posture_submit 和 mvu_submit_update，分别提交本轮结束时可见的人物姿势与变量变化；两者互不依赖，无需等待前一个工具返回。不得在回复正文输出 JSON。' : '本轮姿势结算已关闭，不生成姿势；设定资料存在缺口时可先补查，再提交变量。',
       '本轮必须调用 mvu_submit_update；姿势和变量分别以各自工具返回结果为准，只补交未完成项。',
       '数值不确定时，合理即可，不要求必须精确。'
     ].join('\n'),
-    tools: [...(tasks.posture ? [POSTURE_SUBMIT_TOOL] : []), ...(tasks.characterDesign ? [CHARACTER_DESIGN_READ_TOOL, CHARACTER_DESIGN_SAVE_TOOL] : []), MVU_SUBMIT_UPDATE_TOOL]
+    tools: [...(tasks.posture ? [POSTURE_SUBMIT_TOOL] : []), ...(tasks.characterDesign ? [CHARACTER_DESIGN_READ_TOOL, CHARACTER_DESIGN_SAVE_TOOL] : []),...(tasks.ledger?[LEDGER_SUBMIT_TOOL]:[]), MVU_SUBMIT_UPDATE_TOOL]
   }
 }
 
@@ -441,9 +489,11 @@ export function createMvuSettlementModule(options = {}) {
   }
 
   async function settleVariables(input = {}) {
+    let runtimeInput = { ...input }
     const frame = taskFrame(input)
     const request = projectMvuBackgroundRequest(frame)
     const tasks = normalizeBackgroundTasks(input.backgroundTasks)
+    const ledger=createLedgerSubmission({enabled:tasks.ledger,current:input.ledger,turn:input.turn})
     let attempt = 0
     let result = null
     let feedback = null
@@ -457,6 +507,7 @@ export function createMvuSettlementModule(options = {}) {
       try { await options.diagnostics?.record(input.sessionId, { diagnosticId, operationId: input.operationId, chatId: input.chatId, branchId: input.branchId, basedOnRevision: input.basedOnRevision, messageId: input.messageId, swipeId: input.swipeId, attempt, traceSessionId, stage, ...details }) } catch { /* Diagnostics must not change settlement behaviour. */ }
     }
     async function executeTool(call) {
+      if(call?.name===LEDGER_SUBMIT_TOOL.name)return ledger.execute(call)
       if (call && (call.name === CHARACTER_DESIGN_READ_TOOL_NAME || call.name === CHARACTER_DESIGN_SAVE_TOOL_NAME)) {
         if (!tasks.characterDesign) return JSON.stringify({ ok: false, error: '人物设计已关闭' })
         if (!characterDesign || typeof characterDesign.execute !== 'function') {
@@ -487,6 +538,7 @@ export function createMvuSettlementModule(options = {}) {
       try {
         if (!call || call.name !== MVU_SUBMIT_UPDATE_TOOL_NAME) throw new Error('后台 Agent 调用了未授权的变量工具')
         submission = resolveMvuSubmissionMacros(normalizeMvuToolSubmission(call.arguments), input)
+        assertMvuValueKinds(submission.operations, input.currentVariables)
         if (feedback && submission.operations.length === 0) throw new Error('上一批更新未通过校验，请修正完整 operations，不能用空数组跳过失败')
       } catch (error) {
         await record('submission-rejected', { error: error.message, argumentKeys: Object.keys(object(call?.arguments)), operations: object(call?.arguments).operations })
@@ -500,7 +552,7 @@ export function createMvuSettlementModule(options = {}) {
       try {
         const waitMs = retryNotBefore - Date.now()
         if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs))
-        applied = await applySubmission(input, frame, submission, diagnosticId)
+        applied = await applySubmission(runtimeInput, frame, submission, diagnosticId)
       } catch (error) {
         // A timeout or disk error may have an uncertain outcome; do not replay a delta.
         await record('failed', { error: str(error.message || error) })
@@ -524,6 +576,9 @@ export function createMvuSettlementModule(options = {}) {
       const after = applied.after
       const audit = applied.audit
       const rolledBack = applied.rolledBack
+      if (rolledBack && applied.applied.retryable === true && Number.isSafeInteger(applied.applied.retryLifecycleRevision)) {
+        runtimeInput = { ...runtimeInput, expectedLifecycleRevision: applied.applied.retryLifecycleRevision }
+      }
       retryNotBefore = rolledBack ? Date.now() + Math.max(0, Math.min(3100, Number(applied.applied.retryAfterMs) || 0)) : 0
       const changes = applied.changes
       const sideEffects = applied.sideEffects
@@ -553,8 +608,8 @@ export function createMvuSettlementModule(options = {}) {
         system: [str(input.system).trim(), request.system].filter(Boolean).join('\n\n'),
         tools: request.tools, maxToolCalls: maxAttempts + 12,
         toolLimitMessage: '本轮后台工具调用过多，请停止额外查询；变量更新仍不得跳过校验。',
-        stopToolsWhen: () => feedback !== null && (feedback.ok || !feedback.retryable) && (!tasks.posture || posture !== null),
-        acceptWithoutText: () => result !== null && (!tasks.posture || posture !== null),
+        stopToolsWhen: () => feedback !== null && (feedback.ok || !feedback.retryable) && (!tasks.posture || posture !== null) && ledger.complete,
+        acceptWithoutText: () => result !== null && (!tasks.posture || posture !== null) && ledger.complete,
         temperature: 0.1, sessionId: input.sessionId, turn: Math.max(0, Number(input.turn) || 0), signal: input.signal,
         webSearchEnabled: input.webSearchEnabled === true,
         onToolCall(call) {
@@ -569,7 +624,7 @@ export function createMvuSettlementModule(options = {}) {
       traceSessionId = str(error.traceSessionId) || traceSessionId
       await record('model-failed', { error: str(error.message || error) })
       // Never re-run the entire model task after a possible commit.
-      if (!result) {
+      if (!result || (error.cause?.code === 'BACKGROUND_MODEL_IDLE_TIMEOUT' && !['updated', 'unchanged'].includes(result.receipt?.status))) {
         error.traceSessionId = traceSessionId
         throw error
       }
@@ -587,11 +642,13 @@ export function createMvuSettlementModule(options = {}) {
       error.traceBoundary = traceBoundary
       throw error
     }
+    if(!ledger.complete)throw new Error('后台 Agent 未调用 ledger_submit 提交台账变化')
     await record('finished', { status: result.receipt.status })
     return {
       frame,
       text: str(run.text),
       posture: posture?.posture,
+      ledger:ledger.result,
       traceSessionId,
       traceBoundary,
       ...result

@@ -138,7 +138,7 @@ export function createBackgroundTaskCoordinator(options = {}) {
         error.activity = currentActivity
         throw error
       }
-      const next = timeline.apply({ chat: source, intent: { kind: 'agent.begin', role, requestId } })
+      const next = timeline.apply({ chat: source, intent: { kind: 'agent.begin', role, requestId, roundTurn: input.roundTurn } })
       await store.writeChat(next.chat, { source: 'background.' + requestedRole + '.begin', operationId: next.value.operationId, requestId })
       return next
     })

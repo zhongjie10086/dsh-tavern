@@ -35,6 +35,10 @@ export function forkConversationChat(source, options = {}) {
 
   delete chat._storageRevision
   delete chat.regenInProgress
+  delete chat.taskMailbox
+  delete chat.pendingSurfaceRollback
+  delete chat.pendingRegeneration
+  if (chat.contextCompaction) chat.contextCompaction.operation = null
   chat.id = targetChatId
   chat.sessionId = targetSessionId
   chat.createdAt = now

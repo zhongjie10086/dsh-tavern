@@ -66,9 +66,9 @@ function mergeDeep(current, incoming) {
   if (current && typeof current === 'object' && incoming && typeof incoming === 'object') {
     const result = { ...incoming, ...current }
     for (const key of new Set([...Object.keys(incoming), ...Object.keys(current)])) {
-      if (key in current && key in incoming) result[key] = mergeDeep(current[key], incoming[key])
+      if (Object.hasOwn(current, key) && Object.hasOwn(incoming, key)) result[key] = mergeDeep(current[key], incoming[key])
     }
-    if ('schemaVersion' in result) result.schemaVersion = Math.max(Number(current.schemaVersion) || 0, Number(incoming.schemaVersion) || 0)
+    if (Object.hasOwn(result, 'schemaVersion')) result.schemaVersion = Math.max(Number(current.schemaVersion) || 0, Number(incoming.schemaVersion) || 0)
     return result
   }
   return current === undefined ? incoming : current

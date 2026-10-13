@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
+import { processBirth, processOwnerIsLive } from '../process-identity.js'
 
 const localTickets = new Set()
 const queuePath = 'scene-images/request-queue.json'
 function alive(ticket) {
   if (ticket.pid === process.pid) return localTickets.has(ticket.id)
-  try { process.kill(ticket.pid, 0); return true } catch (error) { return error.code !== 'ESRCH' }
+  return processOwnerIsLive({ pid: ticket.pid, birth: ticket.processBirth, createdAt: ticket.enqueuedAt })
 }
 function normalize(value) {
   if (value === undefined) return { version: 1, entries: [], active: null }
@@ -29,7 +30,7 @@ export function createSceneImageQueue({ store, onStorageError }) {
   }
   return {
     async run({ requestId, signal }, operation) {
-      const ticket = { id: randomUUID(), pid: process.pid, requestId, enqueuedAt: Date.now() }
+      const ticket = { id: randomUUID(), pid: process.pid, processBirth: processBirth(), requestId, enqueuedAt: Date.now() }
       localTickets.add(ticket.id)
       try {
         await change(queue => ({ ...queue, entries: [...queue.entries, ticket] }), signal)

@@ -1,5 +1,9 @@
+import { inspectPresetCompatibility } from './st-preset-compatibility.js'
+import {inspectImportedVariables} from './import-variable-review.js'
+import { createHash } from 'node:crypto'
 import { normalizeResourcePath } from './file-resources.js'
-import { inspectPreset, nativeRegexScriptsOf } from './preset-reading.js'
+import { inspectPreset, nativeRegexScriptsOf, regexScriptsOf } from './preset-reading.js'
+import { regexImportWarnings } from './regex-safety.js'
 import { previewPresetConversion } from './preset-conversion-preview.js'
 import { createPresetEditor } from './preset-editor.js'
 import { createRuntimePresetModule } from './runtime-presets.js'
@@ -12,27 +16,47 @@ function str(value) {
 /** Own the preset library's reads, source mappings, selection and legacy migrations.
  * Editors/compilers still own their existing formats; raw documents are never rewritten here.
  */
-export function createPresetLibrary({ resources: fileResources, state: profileData, prepareImport: prepareTextImport, logger = console }) {
+export function createPresetLibrary({ resources: fileResources, state: profileData, prepareImport: prepareTextImport, decorateSnapshot, logger = console }) {
+  const normalizePath = fileResources.canonicalPath || normalizeResourcePath
   const readJson = function (path) { return profileData.readJson(path) }
+  const sourceCache=new Map();let sourceBytes=0
+  async function source(normalized){
+    const fingerprint=await fileResources.version?.(normalized),cached=sourceCache.get(normalized)
+    if(cached && fingerprint!==undefined && cached.fingerprint===fingerprint)return cached
+    const text=await fileResources.readText(normalized)
+    if(cached && cached.text===text){cached.fingerprint=fingerprint;return cached}
+    if(cached){sourceBytes-=cached.bytes;sourceCache.delete(normalized)}
+    let document;try{document=JSON.parse(text)}catch{}
+    const row={text,document,fingerprint,bytes:text===undefined?0:Buffer.byteLength(text)*4}
+    if(row.bytes<=16*1024*1024 && (fingerprint===undefined || await fileResources.version(normalized)===fingerprint)){
+      while(sourceCache.size && (sourceBytes+row.bytes>32*1024*1024 || sourceCache.size>=64)){const key=sourceCache.keys().next().value;sourceBytes-=sourceCache.get(key).bytes;sourceCache.delete(key)}
+      sourceCache.set(normalized,row);sourceBytes+=row.bytes
+    }
+    return row
+  }
   async function readPreset(presetPath) {
-    const normalized = normalizeResourcePath(presetPath, 'preset')
-    const text = await fileResources.readText(normalized)
+    const normalized = await normalizePath(presetPath, 'preset')
+    const row=await source(normalized),{text,document}=row
     if (text === undefined) return undefined
+    if(row.inspected)return structuredClone(row.inspected)
     const inspected = inspectPreset(text, normalized)
     const conversion = previewPresetConversion(text, normalized)
-    return Object.assign({
+    let compatibility = null
+    if (inspected.valid) compatibility = inspectPresetCompatibility(document, inspected)
+    row.inspected=Object.assign({
+      revision: createHash('sha256').update(text).digest('hex'),
       path: normalized,
+      compatibility,
       previewPath: fileResources.absolute(normalized),
       dshPreset: conversion && conversion.dshPreset || null,
       conversionStatus: conversion && conversion.status || 'unrecognized',
       conversionDiagnostics: conversion && conversion.diagnostics || []
     }, inspected)
+    return structuredClone(row.inspected)
   }
   async function readPresetDocument(presetPath) {
-    const normalized = normalizeResourcePath(presetPath, 'preset')
-    const text = await fileResources.readText(normalized)
-    if (text === undefined) return undefined
-    try { return JSON.parse(text) } catch { return undefined }
+    const normalized = await normalizePath(presetPath, 'preset')
+    return structuredClone((await source(normalized)).document)
   }
   function runtimeRegexScriptsOf(preset, document) {
     const nativeScripts = nativeRegexScriptsOf(document)
@@ -59,15 +83,16 @@ export function createPresetLibrary({ resources: fileResources, state: profileDa
     })
   }
   async function previewPreset(presetPath, orderGroupIndex) {
-    const normalized = normalizeResourcePath(presetPath, 'preset')
+    const normalized = await normalizePath(presetPath, 'preset')
     const text = await fileResources.readText(normalized)
     if (text === undefined) return undefined
     return Object.assign({ path: normalized }, previewPresetConversion(text, normalized, { orderGroupIndex }))
   }
   const presetEditor = createPresetEditor({
-    normalizePath: normalizeResourcePath,
+    normalizePath: fileResources.canonicalPath || normalizeResourcePath,
+    withLock: fileResources.withEditLock,
     readText: async function (path) { return await fileResources.readText(path) },
-    writeText: async function (path, text) { return await fileResources.writeWorking(path, text) },
+    writeText: async function (path, text, expectedText) { return await fileResources.writeWorking(path, text, {expectedText}) },
     inspectRegexScripts: runtimeRegexScriptsOf
   })
   const runtimePresets = createRuntimePresetModule({
@@ -75,6 +100,7 @@ export function createPresetLibrary({ resources: fileResources, state: profileDa
     readPreset,
     readPresetDocument,
     runtimeRegexScripts: runtimeRegexScriptsOf,
+    decorateSnapshot,
     readState: async function () { return await readJson('runtime-presets.json') },
     updateState: async function (updater) { return await profileData.updateJson('runtime-presets.json', updater) },
     now: Date.now
@@ -134,6 +160,9 @@ export function createPresetLibrary({ resources: fileResources, state: profileDa
     const path = str(chat.runtimePresetPath) || str(chat.runtimePresetSnapshot && chat.runtimePresetSnapshot.presetPath)
     if (path === '') return false
     const snapshot = chat.runtimePresetSnapshot && typeof chat.runtimePresetSnapshot === 'object' ? chat.runtimePresetSnapshot : {}
+    // Full preset snapshots already own their opening configuration, including disabled
+    // entries and native adapters. Only the older, selected-entry format needs conversion.
+    if (snapshot.snapshotFormat === 'dsh-full-preset-v1' || snapshot.compatibilityPresetDocument || snapshot.compatibilityPreset) return false
     const selectedKeys = Array.from(new Set((snapshot.sources || []).map(function (source) { return str(source && source.entryKey) }).filter(Boolean)))
     let plan = null
     const existingPlans = await bypassPlans.list()
@@ -204,6 +233,7 @@ export function createPresetLibrary({ resources: fileResources, state: profileDa
         regexCount: extractableRegexScripts.length,
         enabledRegexCount: extractableRegexScripts.filter(function (script) { return script.enabled !== false }).length,
         warning: preset.warning,
+        compatibility: preset.compatibility ? { counts: preset.compatibility.counts, nativeFeatures: preset.compatibility.nativeFeatures } : null,
         error: preset.error
       })
     }
@@ -213,10 +243,19 @@ export function createPresetLibrary({ resources: fileResources, state: profileDa
     const prepared = prepareTextImport(payload, '预设文件为空')
     const inspected = inspectPreset(prepared.text, prepared.name)
     if (!inspected.valid) throw new Error(inspected.error)
+    const document = JSON.parse(prepared.text)
+    const nativeScripts = nativeRegexScriptsOf(document)
+    const importWarnings = regexImportWarnings(nativeScripts.length ? nativeScripts : regexScriptsOf(document))
     const presetPath = await fileResources.importText('preset', prepared)
-    return await readPreset(presetPath)
+    return {...await readPreset(presetPath), importWarnings,variableReview:inspectImportedVariables(document,'预设')}
   }
 
+  // Native consumers need raw documents, not conversion previews or compiled regexes.
+  async function nativeCatalog() {
+    const presets=[]
+    for(const path of await fileResources.list('preset')){const document=await readPresetDocument(path);if(Array.isArray(document?.prompts))presets.push({path,valid:true,recognized:true,document})}
+    return {presets}
+  }
   async function catalog() {
     const presets = await listPresets()
     const state = await runtimePresets.state()
@@ -239,7 +278,7 @@ export function createPresetLibrary({ resources: fileResources, state: profileDa
     return Object.assign({}, inspected, { extractableRegexScripts: runtimeRegexScriptsOf(inspected, await readPresetDocument(inspected.path)) })
   }
   async function exportPreset(path) {
-    const presetPath = normalizeResourcePath(path, 'preset')
+    const presetPath = await normalizePath(path, 'preset')
     const text = await fileResources.readText(presetPath)
     if (text === undefined) throw new Error('预设不存在: ' + presetPath)
     return { name: presetPath.split('/').pop() || 'preset.json', text }
@@ -248,18 +287,35 @@ export function createPresetLibrary({ resources: fileResources, state: profileDa
     await presetEditor.updateEntry(path, key, patch)
     return await readPreset(path)
   }
+  async function moveEntry(path, key, phase, beforeKey, revision) {
+    await presetEditor.moveEntry(path, key, phase, beforeKey, revision)
+    return await detail(path)
+  }
   async function updateRegex(path, key, patch) {
-    const normalized = normalizeResourcePath(path, 'preset')
+    const normalized = await normalizePath(path, 'preset')
     await presetEditor.updateRegex(normalized, key, patch)
     const next = await readPreset(normalized)
     return Object.assign({}, next, { extractableRegexScripts: runtimeRegexScriptsOf(next, await readPresetDocument(normalized)) })
+  }
+  async function snapshotDocument(path,document) {
+    const text=JSON.stringify(document), inspected=inspectPreset(text,path), conversion=previewPresetConversion(text,path);
+    if(!inspected.valid||!inspected.recognized)throw new Error('该文件不是可用预设');
+    const preset={...inspected,dshPreset:conversion?.dshPreset||null,compatibility:inspectPresetCompatibility(document,inspected)};
+    return createRuntimePresetModule({listPaths:async()=>[path],readPreset:async()=>preset,readPresetDocument:async()=>document,runtimeRegexScripts:runtimeRegexScriptsOf,readState:async()=>({}),updateState:async fn=>fn({}),decorateSnapshot}).fullSnapshot(path);
+  }
+  async function replaceDocument(path,document,expected) {
+    const normalized=normalizeResourcePath(path,'preset');
+    const original=await fileResources.readText(normalized), previous=original===undefined?undefined:JSON.parse(original);
+    if(expected!==undefined&&JSON.stringify(previous)!==JSON.stringify(expected))throw new Error('预设文件已被其他操作修改，请刷新');
+    const inspected=inspectPreset(JSON.stringify(document),normalized);if(!inspected.valid||!inspected.recognized)throw new Error('无效预设');
+    await fileResources.writeWorking(normalized,JSON.stringify(document,null,2),{expectedText:original});return readPreset(normalized);
   }
   async function migrate() {
     await migrateLegacyPresetPlans()
     await migrateActivePresetSelection()
   }
-  return Object.freeze({ read: readPreset, readDocument: readPresetDocument, detail,
-    catalog, select, import: importPreset, export: exportPreset, preview: previewPreset,
-    updateEntry, updateRegex, migrate, migrateChat: migrateLegacyChatPreset,
+  return Object.freeze({ read: readPreset, readDocument: readPresetDocument, detail, snapshotDocument, replaceDocument,
+    catalog, nativeCatalog, select, import: importPreset, export: exportPreset, preview: previewPreset,
+    updateEntry, updateRegex, moveEntry, migrate, migrateChat: migrateLegacyChatPreset,
     editor: presetEditor, runtime: runtimePresets, plans: bypassPlans })
 }

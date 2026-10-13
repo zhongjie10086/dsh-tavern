@@ -77,6 +77,7 @@ function nativeEntry(entry) {
     material: entry.type === 'material' ? entry.material : null,
     source: {
       identifier: entry.identifier,
+      sourcePromptIndex: entry.sourceIndex,
       marker: entry.marker,
       injectionPosition: entry.injectionPosition,
       injectionDepth: entry.injectionDepth,
@@ -138,7 +139,8 @@ export function previewPresetConversion(text, filename = '', options = {}) {
       role: roleOf(prompt.role),
       content,
       marker: prompt.marker === true,
-      sourceIndex,
+      enabled: prompt.enabled !== false,
+      sourceIndex: object.prompts.indexOf(prompt),
       injectionPosition: numberOrNull(prompt.injection_position),
       injectionDepth: numberOrNull(prompt.injection_depth),
       injectionOrder: numberOrNull(prompt.injection_order),
@@ -174,7 +176,7 @@ export function previewPresetConversion(text, filename = '', options = {}) {
   }
 
   const selectedItems = selectedGroup === undefined
-    ? records.map(function (record) { return { identifier: record.identifier, enabled: promptDefinitions[record.sourceIndex].enabled !== false } })
+    ? records.map(function (record) { return { identifier: record.identifier, enabled: record.enabled } })
     : selectedGroup.order
   const used = new Set()
   const sourceRows = []
@@ -266,7 +268,28 @@ export function previewPresetConversion(text, filename = '', options = {}) {
     else unordered.push(row)
   }
 
+  // Explicit Tavern ordering overrides only placement; original ST fields remain intact.
+  const layout = object.dsh_tavern?.promptLayout
+  if (layout && typeof layout === 'object') {
+    const candidates = [...phases.front, ...phases.middle, ...phases.back]
+    const moved = new Set()
+    const arranged = { front: [], middle: [], back: [] }
+    for (const phase of ['front', 'middle', 'back']) {
+      for (const item of Array.isArray(layout[phase]) ? layout[phase] : []) {
+        const matches=candidates.filter(row=>row.identifier===item?.identifier)
+        const row = candidates.find(row => row.sourceIndex === item?.sourceIndex && row.identifier === item?.identifier) || (matches.length===1?matches[0]:null)
+        if (!row || moved.has(row)) continue
+        moved.add(row); row.targetPhase = phase; arranged[phase].push(row)
+      }
+    }
+    for (const phase of ['front', 'middle', 'back']) {
+      arranged[phase].push(...phases[phase].filter(row => !moved.has(row)))
+      phases[phase] = arranged[phase]
+    }
+  }
+
   const diagnostics = []
+  if (promptDefinitions.length !== object.prompts.length) diagnostics.push(diagnostic('warning', 'INVALID_PROMPTS_IGNORED', '已忽略非对象 prompt 条目；预览保留有效条目的原始位置，原文件未修改。'))
   const macroEntries = phases.front.concat(phases.middle, phases.back).filter(function (entry) { return entry.enabled && entry.macros.count > 0 })
   if (macroEntries.length > 0) {
     const macroCount = macroEntries.reduce(function (total, entry) { return total + entry.macros.count }, 0)

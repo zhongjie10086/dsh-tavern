@@ -1,4 +1,5 @@
 import { inspectCardExtensions } from './card-extension-reading.js'
+import { regexImportWarnings } from './regex-safety.js'
 
 const TEXT_FIELDS = Object.freeze([
   'name', 'description', 'personality', 'scenario', 'first_mes', 'mes_example',
@@ -387,8 +388,9 @@ export function createCardPreparation(options = {}) {
     if (request === null || typeof request !== 'object') throw new Error('缺少人物卡准备请求')
     if (request.kind === 'import') {
       const raw = importedObject(request.payload)
+      const importWarnings = regexImportWarnings(inspectCardExtensions(raw).regexScripts)
       if (isStandaloneWorldBook(raw)) throw new Error('检测到世界书，请从右侧“世界书库”导入。')
-      return makeWorkspace(raw, { id: nextId(), importedAt: now(), revisionHistory: [] })
+      return makeWorkspace(raw, { id: nextId(), importedAt: now(), revisionHistory: [], importWarnings })
     }
     if (request.kind === 'draft') {
       const draft = request.draft !== null && typeof request.draft === 'object' ? request.draft : {}
@@ -534,6 +536,9 @@ export function createCardPreparation(options = {}) {
     editable.character_book = clone(card.character_book || null)
     if (request.as === 'editable') return editable
     if (request.as === 'view') return Object.assign({ id: card.id }, editable)
+    // ST plugins read arbitrary author extension fields, not the extension inspector.
+    // This is a read projection; automatic writes remain in the per-chat overlay.
+    if (request.as === 'sillytavern-context') return Object.assign({}, clone(rawData(rawOf(request.card))), { id: card.id }, editable)
     if (request.as === 'detail') {
       return Object.assign({ id: card.id }, editable, { extensions: inspectCardExtensions(request.card) })
     }

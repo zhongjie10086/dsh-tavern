@@ -19,6 +19,16 @@ export function assertPluginJson(value, label = '插件数据') {
   visit(value)
 }
 
+// This key belongs only to live chat views, including when a caller nests a
+// whole copied message inside plugin data. Other JSON APIs keep their contract.
+function assertNoCopyMarker(value) {
+  if (!value || typeof value !== 'object') return
+  for (const [key, child] of Object.entries(value)) {
+    if (key === '__dshTavernChatCopyGeneration') throw new Error('插件数据包含聊天临时副本保留字段，未保存')
+    assertNoCopyMarker(child)
+  }
+}
+
 export function validateChatPluginRequest(request) {
   if (!request || typeof request !== 'object' || typeof request.chatId !== 'string' || !request.chatId
     || !Number.isSafeInteger(request.lifecycleRevision) || request.lifecycleRevision < 0 || !Array.isArray(request.messages)) throw new Error('插件存档请求不合法')
@@ -29,11 +39,13 @@ export function validateChatPluginRequest(request) {
       || Object.keys(row).some(key => !['message_id', 'stateRevision', 'data'].includes(key))) throw new Error('插件消息存档编号无效或重复')
     seen.add(row.message_id)
     assertPluginJson(row.data)
+    assertNoCopyMarker(row.data)
     if (Object.keys(row.data).some(key => reserved.has(key))) throw new Error('saveChat 只保存插件数据，不支持修改正文、身份或消息版本')
   }
   if (request.metadata !== undefined) {
     if (!request.metadata || Object.keys(request.metadata).some(key => !['stateRevision', 'data'].includes(key))) throw new Error('聊天元数据请求不合法')
     assertPluginJson(request.metadata.data, '聊天元数据')
+    assertNoCopyMarker(request.metadata.data)
   }
   const revisions = [...request.messages, ...(request.metadata ? [request.metadata] : [])].map(row => row.stateRevision)
   if (revisions.some(value => !Number.isSafeInteger(value) || value < 1)) throw new Error('插件存档缺少已保存的读取版本，请刷新后重试')

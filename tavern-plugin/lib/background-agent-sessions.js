@@ -50,12 +50,93 @@ export function createBackgroundAgentSessions(options, task) {
   const setupAgent = typeof options.setupAgent === 'function' ? options.setupAgent : null
   const agentPreset = str(options.agentPreset)
   const makeId = typeof options.id === 'function' ? options.id : function () { return 'background-' + randomUUID() }
+  const abandonedSessions = new Set()
   const activeSessions = new Set()
   const requestContexts = new Map()
   const requestSessions = new Map()
+  const requestStates = new Map()
   const residentHandles = new Map()
   const residentSessionByParent = new Map()
   const queues = new Map()
+
+  // Cancellation finishes the request before an uncooperative provider becomes
+  // idle. Keep that handle quarantined; native retirement may only run at idle.
+  async function idleNow(agent) {
+    const idle = Promise.resolve().then(() => agent.whenIdle())
+    let immediate
+    const ready = await Promise.race([
+      idle.then(() => true),
+      new Promise(resolve => { immediate = setImmediate(() => resolve(false)) })
+    ])
+    clearImmediate(immediate)
+    return { ready, idle }
+  }
+
+  function retirementStatus(sessionId) {
+    const resident = residentHandles.get(str(sessionId))
+    if (!resident?.retirement) return null
+    const { status, error } = resident.retirement
+    return { status, ...(error ? { error: str(error.message), code: str(error.code) } : {}) }
+  }
+
+  async function finishRetirement(id, resident, persistent, taskName) {
+    if (resident.retirement?.finishing) return resident.retirement.finishing
+    const pending = resident.retirement = { status: 'persisting', persistent, taskName }
+    pending.finishing = (async () => {
+      try {
+        if (persistent && taskName !== 'image') await options.retirement?.retire(id, resident.parentSessionId, { session: resident.handle.agent.session })
+        await options.flushSession?.(resident.handle.agent.session)
+        await resident.handle.dispose()
+        residentHandles.delete(id)
+        if (residentSessionByParent.get(resident.key) === id) residentSessionByParent.delete(resident.key)
+        requestContexts.delete(id); requestSessions.delete(id)
+      } catch (error) {
+        resident.retirement = { status: 'blocked', error, persistent, taskName }
+        console.warn('dsh-tavern: 后台会话退役状态保存失败，保留所有权，可重试', id, error)
+        throw error
+      }
+    })()
+    return pending.finishing
+  }
+
+  async function retryRetirement(sessionId) {
+    const id = str(sessionId), resident = residentHandles.get(id)
+    if (!resident?.retirement) return null
+    const { ready } = await idleNow(resident.handle.agent)
+    if (!ready) return retirementStatus(id)
+    if (resident.retirement.finishing) { await resident.retirement.finishing; return retirementStatus(id) }
+    await finishRetirement(id, resident, resident.retirement.persistent, resident.retirement.taskName)
+    return null
+  }
+
+  async function quarantine(id, resident, persistent, taskName, idle, requestError) {
+    let failure
+    try {
+      // A running native adapter refuses the notice, but can retain the old
+      // authority in the bounded index. No flush or dispose runs before idle.
+      if (persistent && taskName !== 'image') await options.retirement?.retire(id, resident.parentSessionId, { session: resident.handle.agent.session })
+    } catch (error) { failure = error }
+    residentHandles.set(id, resident)
+    if (residentSessionByParent.get(resident.key) === id) residentSessionByParent.delete(resident.key)
+    const pending = resident.retirement = { status: 'pending-idle', error: failure, persistent, taskName }
+    const detail = { status: pending.status, sessionId: id, ...(failure ? { error: str(failure.message), code: str(failure.code) } : {}) }
+    if (requestError) requestError.backgroundRetirement = detail
+    console.warn('dsh-tavern: 后台请求已取消，隔离清理等待内核空闲', detail)
+    // This continuation is deliberately outside the per-parent request queue.
+    // Its failure remains queryable and retryable through the owned handle.
+    idle.then(() => {
+      pending.finishing = finishRetirement(id, resident, persistent, taskName)
+      return pending.finishing
+    }).catch(error => {
+      if (resident.retirement === pending) resident.retirement = { status: 'blocked', error, persistent, taskName }
+      console.warn('dsh-tavern: 后台延迟退役失败，保留所有权，可重试', id, error)
+    })
+    if (failure) {
+      let durable = false
+      try { durable = Boolean(await options.retirement?.isRetired(id)) } catch {}
+      if (!durable) { failure.backgroundRetirement = detail; failure.cancelledRequest = requestError; throw failure }
+    }
+  }
 
   function residentKey(input) {
     return JSON.stringify([str(input.sessionId), input.task === 'image' ? 'image' : 'background'])
@@ -85,12 +166,12 @@ export function createBackgroundAgentSessions(options, task) {
   async function execute(input) {
     const parent = agents.get(input.sessionId)
     if (parent === undefined || parent.session === undefined) throw new Error('无法创建后台 Agent：前台会话不可用')
-    const runtimeInput = Object.assign({}, input)
+    const runtimeInput = Object.assign({}, input, { selection: { ...input.selection } })
     if (options.resolveBackgroundTasks && input.task !== 'image') {
       runtimeInput.backgroundTasksSnapshot = await options.resolveBackgroundTasks(input)
     }
     if (options.resolveWebSearch && input.task !== 'image' && input.task !== 'phone') {
-      runtimeInput.webSearchEnabled = await options.resolveWebSearch()
+      runtimeInput.webSearchEnabled = await options.resolveWebSearch(input)
     }
     const persistent = input.persistent === true
     const requestedSessionId = str(persistent && typeof input.resolvePersistentSessionId === 'function'
@@ -100,6 +181,8 @@ export function createBackgroundAgentSessions(options, task) {
       && await options.needsNewBackgroundSession(input.sessionId)
     const residentSessionId = needsSession && requestedSessionId === '' ? '' : str(residentSessionByParent.get(key))
     let traceSessionId = requestedSessionId || (persistent ? residentSessionId : '') || makeId()
+    const abandoned = abandonedSessions.has(traceSessionId) || Boolean(await options.retirement?.isRetired(traceSessionId))
+    if (abandoned) traceSessionId = makeId()
     const descriptor = descriptorFor(input, persistent)
     const parentDepth = Number(parent.session.header && parent.session.header.delegationDepth)
     const requestedMaxTokens = Number(input.maxTokens)
@@ -112,6 +195,22 @@ export function createBackgroundAgentSessions(options, task) {
       ...(maxTokens === undefined ? {} : { maxTokens }),
       ...(input.selection.reasoningEffort === undefined ? {} : { reasoningEffort: input.selection.reasoningEffort })
     }
+    const previousId=persistent?residentSessionByParent.get(key):undefined
+    if(previousId && previousId!==traceSessionId){
+      const previous=residentHandles.get(previousId)
+      if(activeSessions.has(previousId))throw new Error('旧后台任务仍在运行，不能替换')
+      if(previous){
+        if(abandonedSessions.has(previousId)){
+          const {ready}=await idleNow(previous.handle.agent)
+          if(!ready)throw new Error('旧后台会话隔离清理尚未完成，请重试')
+          await finishRetirement(previousId,previous,true,input.task)
+        } else {
+          await previous.handle.dispose()
+        }
+      }
+      residentHandles.delete(previousId);residentSessionByParent.delete(key)
+      requestContexts.delete(previousId);requestSessions.delete(previousId)
+    }
     let resident = persistent ? residentHandles.get(traceSessionId) : undefined
     if (resident !== undefined && resident.key !== key) {
       throw new Error('同一个常驻后台 Agent 不能绑定到不同前台会话或任务类型')
@@ -121,7 +220,7 @@ export function createBackgroundAgentSessions(options, task) {
     if (handle === undefined) {
       state = { input: runtimeInput, ctx: null }
       try {
-        if (requestedSessionId !== '') {
+        if (!abandoned && requestedSessionId !== '') {
           if (typeof agents.resume !== 'function') throw new Error('当前 DSH 不支持恢复持久后台 Agent')
           try {
             handle = await agents.resume({
@@ -185,6 +284,7 @@ export function createBackgroundAgentSessions(options, task) {
     state.input = runtimeInput
     state.refreshConfiguredTools?.()
     activeSessions.add(traceSessionId)
+    requestStates.set(traceSessionId, state)
     requestSessions.set(traceSessionId, handle.agent.session)
     requestContexts.set(traceSessionId, {
       scope: 'background',
@@ -192,11 +292,26 @@ export function createBackgroundAgentSessions(options, task) {
       task: str(input.task) || 'background',
       turn: Math.max(0, Number(input.turn) || 0)
     })
+    let requestError
     try {
       return await task.execute({ agent: handle.agent, state, traceSessionId, persistent }, input)
+    } catch (error) {
+      requestError = error
+      throw error
     } finally {
       activeSessions.delete(traceSessionId)
-      if (!persistent) {
+      requestStates.delete(traceSessionId)
+      if (state.abandoned) {
+        abandonedSessions.add(traceSessionId)
+        const retiring = resident || { handle, state, parentSessionId: str(input.sessionId), key }
+        const { ready, idle } = await idleNow(handle.agent)
+        if (!ready) await quarantine(traceSessionId, retiring, persistent, input.task, idle, requestError)
+        else {
+          // Even a failed nonpersistent cleanup remains owned and retryable.
+          residentHandles.set(traceSessionId, retiring)
+          await finishRetirement(traceSessionId, retiring, persistent, input.task)
+        }
+      } else if (!persistent) {
         requestContexts.delete(traceSessionId)
         requestSessions.delete(traceSessionId)
         await handle.dispose()
@@ -260,27 +375,40 @@ export function createBackgroundAgentSessions(options, task) {
   }
 
   async function dispose() {
-    const residents = Array.from(residentHandles.values())
-    residentHandles.clear()
-    residentSessionByParent.clear()
-    activeSessions.clear()
-    requestContexts.clear()
-    requestSessions.clear()
-    const settled = await Promise.allSettled(residents.map(function (resident) { return resident.handle.dispose() }))
+    const settled = await Promise.allSettled(Array.from(residentHandles, async ([id, resident]) => {
+      if (resident.retirement) return retryRetirement(id)
+      try { await resident.handle.dispose() }
+      finally {
+        // Ordinary shutdown retains its original ownership-release contract.
+        // Only an unfinished retirement above keeps the handle for retry.
+        residentHandles.delete(id)
+        if (residentSessionByParent.get(resident.key) === id) residentSessionByParent.delete(resident.key)
+        activeSessions.delete(id); requestContexts.delete(id); requestSessions.delete(id); requestStates.delete(id)
+      }
+    }))
     const failures = settled.filter(function (result) { return result.status === 'rejected' }).map(function (result) { return result.reason })
     if (failures.length > 0) throw new AggregateError(failures, '常驻后台 Agent 释放失败')
   }
 
-  function cancel(parentSessionId) {
+  function cancel(parentSessionId,{includeSidecars=false}={}) {
     let count = 0
     for (const sessionId of activeSessions) {
       const context = requestContexts.get(sessionId)
-      if (context?.parentSessionId !== parentSessionId || ['image', 'phone'].includes(context.task)) continue
+      if (context?.parentSessionId !== parentSessionId || !includeSidecars&&['image', 'phone'].includes(context.task)) continue
       const agent = residentHandles.get(sessionId)?.handle?.agent || agents.get(sessionId)
-      if (typeof agent?.cancel === 'function') { agent.cancel({ kind: 'user' }); count++ }
+      const progress = requestStates.get(sessionId)?.progress
+      if (progress) { progress.cancel(); count++ }
+      else if (typeof agent?.cancel === 'function') { agent.cancel({ kind: 'user' }); count++ }
     }
     return count
   }
 
-  return Object.freeze({ run, owns, requestContext, requestSession, compact, cancel, dispose })
+  function progress(parentSessionId) {
+    for (const id of activeSessions) if (requestContexts.get(id)?.parentSessionId === parentSessionId && !['image', 'phone'].includes(requestContexts.get(id)?.task)) {
+      const snapshot = requestStates.get(id)?.progress?.snapshot()
+      if (snapshot) return { ...snapshot, task: requestContexts.get(id).task }
+    }
+    return null
+  }
+  return Object.freeze({ progress, run, owns, requestContext, requestSession, compact, cancel, dispose, retirementStatus, retryRetirement })
 }

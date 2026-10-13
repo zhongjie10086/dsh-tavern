@@ -1,3 +1,4 @@
+import {createRollingDiagnosticStorage} from './rolling-diagnostics.js'
 import { createHash } from 'node:crypto'
 import { redactDiagnostic } from './mvu-diagnostics.js'
 
@@ -25,6 +26,7 @@ function redactApiError(error, args) {
 }
 
 export function createTavernApiDiagnostics(storage) {
+  storage = createRollingDiagnosticStorage(storage)
   const buffers = new Map(), tails = new Map(), droppedBuffers = new Map()
   let timer
   function bounded(rows) {
@@ -52,16 +54,27 @@ export function createTavernApiDiagnostics(storage) {
     const all = [...(buffers.get(id) || []), row]
     const kept = bounded(all)
     droppedBuffers.set(id, (droppedBuffers.get(id) || 0) + all.length - kept.length)
-    buffers.set(id, kept)
-    if (!timer) {
+    buffers.delete(id);buffers.set(id, kept)
+    // Successful traffic retains useful recent context without a write timer.
+    // Bound the process-local session buffers as well as each session's rows.
+    while(buffers.size>64){
+      const oldest=buffers.keys().next().value,records=buffers.get(oldest)
+      if(records.some(record=>record.status!=='success'))void flush(oldest).catch(()=>{})
+      else{buffers.delete(oldest);droppedBuffers.delete(oldest)}
+    }
+    if (row.status!=='success'&&!timer) {
       timer = setTimeout(() => {
         timer = undefined
-        for (const sessionId of buffers.keys()) void flush(sessionId).catch(() => {})
+        for (const [sessionId,records] of buffers)if(records.some(record=>record.status!=='success'))void flush(sessionId).catch(() => {})
       }, 500)
       timer.unref?.()
     }
   }
   return {
+    recordResourceSave(sessionId, summary) {
+      if (!sessionId) return
+      record(sessionId, { at: Date.now(), method: 'resource-save', ...summary })
+    },
     async observe(method, args, run) {
       const sessionId = typeof args?.sessionId === 'string' ? args.sessionId : ''
       if (!tracked.test(method) || !sessionId) return run()

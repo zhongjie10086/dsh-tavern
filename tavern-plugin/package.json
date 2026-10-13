@@ -5,14 +5,18 @@
   "type": "module",
   "main": "lib/index.js",
   "dependencies": {
+    "@chevrotain/regexp-to-ast": "11.2.0",
     "@deepseek-ai/dsh-subagent": ">=0.1.0-rc.7",
-    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.7",
+    "@deepseek-ai/dsh-tools": "0.1.5-rc.2",
     "@deepseek-ai/dsh-typert-protocol": ">=0.1.2-rc.1 <0.2.0",
     "chevrotain": "^11.2.0",
     "marked": "16.3.0",
     "yaml": "2.9.0",
     "acorn": "8.15.0",
-    "@deepseek-ai/dsh-agent": ">=0.1.2-rc.1 <0.2.0"
+    "@deepseek-ai/dsh-agent": ">=0.1.2-rc.1 <0.2.0",
+    "@deepseek-ai/dsh-skill-filesystem": ">=0.1.2-rc.1 <0.2.0",
+    "playwright-core": "1.62.1",
+    "sql.js": "1.14.1"
   },
   "exports": {
     ".": "./lib/index.js",

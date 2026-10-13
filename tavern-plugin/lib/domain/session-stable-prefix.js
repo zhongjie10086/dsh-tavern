@@ -1,4 +1,5 @@
-import { sessionEvents } from './session-events.js'
+import { appendTavernEvent } from './session-message-source.js'
+import { sessionEvents, appendSessionEvent } from './session-events.js'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createDurableFilePromotion } from '../durable-file-promotion.js'
@@ -45,6 +46,7 @@ function sourceSections(text) {
   const boundaries = [
     { marker: '【用户已确认的长期偏好】', name: 'tavern:user-preference' },
     { marker: '【故事设定 · 人物卡】', name: 'tavern:character-card' },
+    { marker: '【人物卡系统提示】', name: 'tavern:card-system-prompt' },
     { marker: '【常驻世界书】', name: 'tavern:constant-worldbook' }
   ]
   const starts = boundaries.map(function (boundary) {
@@ -66,14 +68,17 @@ function sourceSections(text) {
 /** Read the immutable snapshot from original events, even after its Surface node was compacted. */
 export function readSessionStablePrefix(session) {
   if (!session) return null
-  let legacy = null
+  let legacy = null, fixed = null
   for (const event of sessionEvents(session)) {
     const record = messageRecord(event)
     if (!record) continue
-    if (typeof record.message.source.fixedSystemText === 'string') return record
+    if (typeof record.message.source.fixedSystemText === 'string') {
+      if (!fixed || Number(record.message.source.cardContextRevision || 0) > Number(fixed.message.source.cardContextRevision || 0)) fixed = record
+      continue
+    }
     legacy ||= record
   }
-  return legacy
+  return fixed || legacy
 }
 
 function legacyEventText(session) {
@@ -97,8 +102,14 @@ function fixedContextMessage(session, text) {
 }
 
 /** Persist fixed system text in native snapshot metadata; empty content cannot become summary material. */
-export async function ensureSessionStablePrefix(session, text, storage) {
+export async function ensureSessionStablePrefix(session, text, storage, revision = 0) {
   const existing = readSessionStablePrefix(session)
+  if (existing && revision > Number(existing.message.source.cardContextRevision || 0) && str(text).trim()) {
+    const message = fixedContextMessage(session, str(text).trim())
+    message.id += ':revision-' + revision
+    message.source.cardContextRevision = revision
+    return messageRecord(appendSessionEvent(session, 'user/message', message, { surfaceOp: 'append' }))
+  }
   if (existing) {
     const activeLegacy = sessionEvents(session).find(event => messageRecord(event)?.message.content.length && session.surface?.nodes.includes(event.seq))
     const needsSnapshot = typeof existing.message.source.fixedSystemText !== 'string'
@@ -107,8 +118,8 @@ export async function ensureSessionStablePrefix(session, text, storage) {
       // Freeze that same evaluated snapshot once when migrating, never reevaluate per turn.
       const context = needsSnapshot && /<%[\s\S]*?%>/.test(existing.text) && str(text).trim() ? str(text).trim() : existing.text
       const message = { ...fixedContextMessage(session, context), id: 'tavern-session-prefix:' + session.id + ':system-migration' }
-      const event = session.append('user/message', message, activeLegacy ? {
-        surfaceOp: { op: 'replace', start: activeLegacy.seq, end: activeLegacy.seq }, sourceEventSeqs: [activeLegacy.seq]
+      const event = appendTavernEvent(session, 'user/message', message, activeLegacy ? {
+        surfaceOp: { op: 'replace', startSeq: activeLegacy.seq, endSeq: activeLegacy.seq }, sourceEventSeqs: [activeLegacy.seq]
       } : { surfaceOp: 'append' })
       return messageRecord(event)
     }
@@ -118,10 +129,11 @@ export async function ensureSessionStablePrefix(session, text, storage) {
   if (pending.has(session)) return pending.get(session)
   const operation = (async function () {
     const saved = storage ? await storage.read(session.id) : null
-    const context = legacyEventText(session) || str(saved && saved.text).trim() || str(text).trim()
+    const context = (revision > 0 ? str(text).trim() : '') || legacyEventText(session) || str(saved && saved.text).trim() || str(text).trim()
     if (context === '') return null
     const message = fixedContextMessage(session, context)
-    const event = session.append('user/message', message, { surfaceOp: 'append' })
+    if (revision > 0) message.source.cardContextRevision = revision
+    const event = appendTavernEvent(session, 'user/message', message, { surfaceOp: 'append' })
     return messageRecord(event)
   })()
   pending.set(session, operation)

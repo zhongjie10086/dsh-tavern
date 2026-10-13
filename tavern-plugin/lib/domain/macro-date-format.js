@@ -1,0 +1,9 @@
+// Common Moment-compatible display tokens without introducing a second date library.
+export function macroDateFormat(date,format,locale='en-US') {
+  const pad=(n,size=2)=>String(n).padStart(size,'0'),part=options=>date.toLocaleString(locale,options),hour=date.getHours(),day=date.getDate(),offset=-date.getTimezoneOffset();
+  const zone=(offset<0?'-':'+')+pad(Math.floor(Math.abs(offset)/60))+':'+pad(Math.abs(offset)%60);
+  const tokens={YYYY:String(date.getFullYear()),YY:pad(date.getFullYear()%100),M:String(date.getMonth()+1),MM:pad(date.getMonth()+1),MMM:part({month:'short'}),MMMM:part({month:'long'}),D:String(day),DD:pad(day),Do:day+((day%100>=11&&day%100<=13)?'th':({1:'st',2:'nd',3:'rd'}[day%10]||'th')),d:String(date.getDay()),dd:part({weekday:'short'}).slice(0,2),ddd:part({weekday:'short'}),dddd:part({weekday:'long'}),H:String(hour),HH:pad(hour),h:String(hour%12||12),hh:pad(hour%12||12),k:String(hour||24),kk:pad(hour||24),m:String(date.getMinutes()),mm:pad(date.getMinutes()),s:String(date.getSeconds()),ss:pad(date.getSeconds()),SSS:pad(date.getMilliseconds(),3),S:String(Math.floor(date.getMilliseconds()/100)),SS:pad(Math.floor(date.getMilliseconds()/10)),A:hour<12?'AM':'PM',a:hour<12?'am':'pm',Z:zone,ZZ:zone.replace(':',''),X:String(Math.floor(date.getTime()/1000)),x:String(date.getTime()),Q:String(Math.floor(date.getMonth()/3)+1),L:part({year:'numeric',month:'2-digit',day:'2-digit'}),LL:part({year:'numeric',month:'long',day:'numeric'}),LT:part({hour:'numeric',minute:'2-digit'}),LTS:part({hour:'numeric',minute:'2-digit',second:'2-digit'})};
+  tokens.LLL=tokens.LL+' '+tokens.LT;tokens.LLLL=tokens.dddd+', '+tokens.LLL;
+  const pattern=new RegExp('\\[[^\\]]*\\]|'+Object.keys(tokens).sort((a,b)=>b.length-a.length).join('|'),'g');
+  return String(format||'YYYY-MM-DDTHH:mm:ssZ').replace(pattern,key=>key.startsWith('[')?key.slice(1,-1):tokens[key]);
+}

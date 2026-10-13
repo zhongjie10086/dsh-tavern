@@ -2,10 +2,10 @@ function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
 }
 
-export function coordinationEventId(snapshot) {
+export function coordinationEventId(snapshot, durableVersion) {
   const activity = snapshot && snapshot.activity || {}
   const task = snapshot && snapshot.task || {}
-  return [
+  const summaryId = [
     str(snapshot && snapshot.runtimeGeneration),
     JSON.stringify([str(snapshot && snapshot.cardPath), str(snapshot && snapshot.cardName)]),
     snapshot && snapshot.liveSession === true ? '1' : '0',
@@ -19,6 +19,10 @@ export function coordinationEventId(snapshot) {
     str(task.status),
     Number(task.version) || 0
   ].join(':')
+  // The coordination projection deliberately omits chat variables. Its summary
+  // can remain unchanged after a durable chat write; retain the existing storage
+  // version identity so that write still wakes authoritative browser readers.
+  return durableVersion === undefined ? summaryId : JSON.stringify([summaryId, durableVersion])
 }
 
 /** Project durable Tavern view changes into typed wake signals. */
@@ -45,15 +49,15 @@ export function createCoordinationEventPublisher(options = {}) {
     }
     record.loading = true
     try {
-      const version = checkVersion && typeof options.readVersion === 'function' ? await options.readVersion(record.id) : undefined
+      const version = typeof options.readVersion === 'function' ? await options.readVersion(record.id) : undefined
       if (checkVersion && record.hasVersion && Object.is(version, record.lastVersion)) return
       const snapshot = await options.load(record.id)
       if (record.watchers === 0 || snapshot === null || snapshot === undefined) return
-      if (checkVersion && typeof options.readVersion === 'function') {
+      if (typeof options.readVersion === 'function') {
         record.lastVersion = version
         record.hasVersion = true
       }
-      const eventId = coordinationEventId(snapshot)
+      const eventId = coordinationEventId(snapshot, version)
       if (eventId === record.lastId) return
       record.lastId = eventId
       // The snapshot is already loaded to derive the version. Deliver it with the
@@ -90,6 +94,7 @@ export function createCoordinationEventPublisher(options = {}) {
         stopInterval(record.timer)
         record.timer = null
       }
+      if (record.watchers === 0 && records.get(record.id) === record) records.delete(record.id)
     }
   }
 
@@ -103,5 +108,5 @@ export function createCoordinationEventPublisher(options = {}) {
     await Promise.all(Array.from(records.values()).map(function (record) { return refresh(record, false) }))
   }
 
-  return Object.freeze({ watch, publish, publishAll })
+  return Object.freeze({ watch, publish, publishAll, get retainedSessions() { return records.size } })
 }

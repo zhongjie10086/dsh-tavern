@@ -5,6 +5,15 @@ export const CHAT_IMPORT_MAX_MESSAGES = 2000
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const copy = value => structuredClone(value)
 
+export function chatImportTimestamp(value) {
+  if (typeof value === 'number') return Number.isFinite(new Date(value).getTime()) ? value : null
+  if (typeof value !== 'string' || !value.trim()) return null
+  const normalized=value.trim().replace(/年|月/g,'-').replace(/日\s*/,'T').replace(/时|分/g,':').replace(/秒$/,'')
+  const localized=normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})T(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/)
+  const result=localized ? new Date(+localized[1],+localized[2]-1,+localized[3],+localized[4],+localized[5],+(localized[6]||0)).getTime() : Date.parse(normalized)
+  return Number.isFinite(result)?result:null
+}
+
 /** Parse untrusted ST exports as data; never retain unselected swipes or reasoning. */
 export function parseChatHistory(text) {
   if (typeof text !== 'string' || Buffer.byteLength(text) > CHAT_IMPORT_MAX_BYTES) throw new Error('聊天文件最大支持 8 MB')
@@ -40,7 +49,7 @@ export function parseChatHistory(text) {
     if (valid) { previous = copy(raw); previousLine = line } else missing++
     messages.push({ role: row.is_user ? 'user' : 'assistant', text: row.mes,
       name: typeof row.name === 'string' ? row.name : '',
-      timestamp: typeof row.send_date === 'string' ? row.send_date : '',
+      timestamp: typeof row.send_date === 'string' || typeof row.send_date === 'number' ? row.send_date : '',
       sourceLine: line, sourceSwipe: swipe,
       ...(previous === undefined ? {} : { variables: copy(previous) }),
       stateSourceLine: previousLine, stateInherited: !valid })
@@ -48,6 +57,8 @@ export function parseChatHistory(text) {
   }
   if (!messages.length) throw new Error('文件中没有可导入的聊天消息')
   if (excluded) warnings.push(`已跳过 ${excluded} 条系统提示消息`)
+  const unknownDates=messages.filter(message=>message.timestamp!==''&&chatImportTimestamp(message.timestamp)===null).length
+  if(unknownDates)warnings.push(`${unknownDates} 条消息日期无法解析，将使用导入时间并保留原始日期`)
   if (messages.some((message, index) => index > 0 && messages[index - 1].role === message.role)) warnings.push('连续同角色消息将按原顺序合并为一条，使用合并末尾的状态，以保持原生轮次结构')
   const names = new Set(messages.filter(m => m.role === 'assistant' && m.name).map(m => m.name))
   if (names.size > 1) throw new Error('暂不支持多角色群聊记录')

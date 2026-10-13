@@ -27,3 +27,5 @@ description: "为 Tavern 卡片工作台创建或修改可复用 Skill；用户�
 ## 完成标准
 
 保存后报告 Skill 名称、用途和是否覆盖旧版本。新 Skill 应立即进入当前卡片 Agent 的目录；无需重启，也不自动执行。
+
+创建直接指导剧情正文的文风技能时，向 tavern_save_skill 传入 purpose: writing；卡片编辑工作流程使用 purpose: card。写作技能受新局默认值与每局开关控制，不能用卡片工具技能替代。

@@ -9,6 +9,20 @@ const PENDING_MARKER = '.pending-'
 const WRITE_LOCK_SUFFIX = '.write-lock'
 const WRITE_LOCK_STALE_MS = 60_000
 
+export async function renameWithRetry(from, target, options = {}) {
+  const renameFile = options.rename ?? rename
+  const sleep = options.sleep ?? (delay => new Promise(resolve => setTimeout(resolve, delay)))
+  const delays = (options.platform ?? process.platform) === 'win32' ? WINDOWS_RENAME_RETRY_DELAYS_MS : RENAME_RETRY_DELAYS_MS
+  for (let attempt = 0; ; attempt++) {
+    try { await renameFile(from, target); return } catch (error) {
+      if (!TRANSIENT_RENAME_ERRORS.has(error?.code)) throw error
+      const delay = delays[attempt]
+      if (delay === undefined) { error.dshTavernRenameRetriesExhausted = true; throw error }
+      await sleep(delay)
+    }
+  }
+}
+
 function bytes(value) {
   if (Buffer.isBuffer(value)) return value
   if (value instanceof Uint8Array) return Buffer.from(value)
@@ -44,9 +58,8 @@ export function createDurableFilePromotion(options = {}) {
   async function staleWriteLock(lockPath, owner) {
     const validOwner = owner !== null && typeof owner === 'object' && Number.isSafeInteger(Number(owner.pid)) && Number(owner.pid) > 0
     if (owner !== null && !validOwner) return true
-    if (owner && owner.writerId === writerId) return true
     const pid = Number(owner && owner.pid)
-    if (Number.isSafeInteger(pid) && pid > 0 && !processIsAlive(pid)) return true
+    if (Number.isSafeInteger(pid) && pid > 0) return !processIsAlive(pid)
     let createdAt = Number(owner && owner.createdAt)
     if (!Number.isFinite(createdAt) || createdAt <= 0) {
       try { createdAt = Number((await stat(lockPath)).mtimeMs) } catch { return false }
@@ -54,17 +67,40 @@ export function createDurableFilePromotion(options = {}) {
     return Date.now() - createdAt > writeLockStaleMs
   }
 
-  async function withWriteLock(target, operation) {
+  async function withWriteLock(target, operation, waitMs = 0) {
     await mkdir(path.dirname(target), { recursive: true })
     const lockPath = target + WRITE_LOCK_SUFFIX
     let handle
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let openRetries = 0
+    const deadline = Date.now() + waitMs
+    for (;;) {
       try { handle = await open(lockPath, 'wx'); break } catch (error) {
+        // Windows may report delete-pending as EPERM instead of EEXIST.
+        // Retry exclusive creation; never infer that the lock is ours.
+        if (platform === 'win32' && TRANSIENT_RENAME_ERRORS.has(error?.code)) {
+          const delay = renameRetryDelays[openRetries++]
+          if (delay === undefined) throw error
+          await sleep(delay); continue
+        }
         if (error?.code !== 'EEXIST') throw error
         let owner = null
         try { owner = JSON.parse(await readFile(lockPath, 'utf8')) } catch {}
-        const stale = await staleWriteLock(lockPath, owner)
-        if (attempt === 0 && stale) { await removeWriteLock(lockPath); continue }
+        if (await staleWriteLock(lockPath, owner)) {
+          // Serialize stale-lock recovery too: a second reaper must not unlink
+          // the live lock acquired after the first reaper finishes.
+          let reclaimed = false
+          try {
+            await withWriteLock(target + '.reclaim', async () => {
+              let latest = null
+              try { latest = JSON.parse(await readFile(lockPath, 'utf8')) } catch (error) {
+                if (error?.code === 'ENOENT') { reclaimed = true; return }
+              }
+              if (await staleWriteLock(lockPath, latest)) { await removeWriteLock(lockPath); reclaimed = true }
+            })
+          } catch (error) { if (error?.code !== 'DSH_TAVERN_WRITE_CONFLICT') throw error }
+          if (reclaimed) continue
+        }
+        if (Date.now() < deadline) { await sleep(15); continue }
         const conflict = new Error(`另一个 Tavern 写入进程正在更新同一文件，拒绝并发覆盖：${target}`)
         conflict.code = 'DSH_TAVERN_WRITE_CONFLICT'
         conflict.owner = owner
@@ -126,14 +162,7 @@ export function createDurableFilePromotion(options = {}) {
   }
 
   async function replaceTarget(temporary, target) {
-    for (let attempt = 0; ; attempt += 1) {
-      try { await renameFile(temporary, target); return } catch (error) {
-        const delay = renameRetryDelays[attempt]
-        if (!TRANSIENT_RENAME_ERRORS.has(error?.code)) throw error
-        if (delay === undefined) { error.dshTavernRenameRetriesExhausted = true; throw error }
-        await sleep(delay)
-      }
-    }
+    return renameWithRetry(temporary, target, { rename: renameFile, sleep, platform })
   }
 
   async function cleanupPending(target, exceptPath) {
@@ -160,7 +189,7 @@ export function createDurableFilePromotion(options = {}) {
     const staging = `${pending}.staging-${randomUUID()}`
     let handle
     try {
-      handle = await open(staging, 'wx')
+      handle = await open(staging, 'wx', options.mode ?? 0o666)
       await handle.writeFile(bytes(value))
       await handle.sync()
       await handle.close(); handle = null
@@ -188,6 +217,10 @@ export function createDurableFilePromotion(options = {}) {
   }
 
   return Object.freeze({
+    async withLock(target, operation, { waitMs = 0 } = {}) {
+      const absolute = path.resolve(target)
+      return enqueue(absolute, () => withWriteLock(absolute, operation, waitMs))
+    },
     async version(target) {
       const absolute = path.resolve(target)
       const snapshots = await pendingSnapshots(absolute)
@@ -204,11 +237,19 @@ export function createDurableFilePromotion(options = {}) {
       } catch (error) { if (error?.code === 'ENOENT') return ''; throw error }
     },
     async read(target) { return readTarget(path.resolve(target)) },
+    // Content-addressed objects cannot have a newer value at the same path.
+    // Their caller verifies the digest. Only an unpublished/missing target needs
+    // the slower pending-snapshot recovery path; mutable files keep read().
+    async readImmutable(target) {
+      const absolute=path.resolve(target)
+      try { return await readFile(absolute) }
+      catch(error) { if(error?.code!=='ENOENT')throw error;return readTarget(absolute) }
+    },
     async write(target, value) {
       const absolute = path.resolve(target)
       return enqueue(absolute, () => withWriteLock(absolute, () => writeTarget(absolute, value)))
     },
-    async update(target, updater) {
+    async update(target, updater, { waitMs = 0 } = {}) {
       if (typeof updater !== 'function') throw new Error('Durable File Promotion 缺少 updater')
       const absolute = path.resolve(target)
       return enqueue(absolute, () => withWriteLock(absolute, async function () {
@@ -217,7 +258,7 @@ export function createDurableFilePromotion(options = {}) {
         if (next === undefined) return current
         await writeTarget(absolute, next)
         return bytes(next)
-      }))
+      }, waitMs))
     },
     async remove(target) {
       const absolute = path.resolve(target)

@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from 'node:util'
+
 function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
 }
@@ -70,6 +72,7 @@ export function projectTavernHelperWorldbook(view) {
 const POSITIONS = ['before_character_definition', 'after_character_definition', 'before_author_note', 'after_author_note', 'at_depth', 'before_example_messages', 'after_example_messages', 'outlet']
 
 function enumValue(value, values, label) {
+  if ((typeof value==='number'||typeof value==='string'&&/^\d+$/.test(value)) && Number.isSafeInteger(Number(value)) && Number(value)>=0 && Number(value)<values.length) return Number(value)
   const index = values.indexOf(value)
   if (index < 0) throw new Error('未知世界书' + label + ': ' + str(value))
   return index
@@ -77,6 +80,7 @@ function enumValue(value, values, label) {
 
 function finite(value, label, nullable = false, minimum = 0) {
   if (nullable && value === null) return null
+  if(typeof value==='string'&&value.trim()!=='')value=Number(value)
   if (typeof value !== 'number' || !Number.isFinite(value) || value < minimum) throw new Error('无效世界书' + label)
   return value
 }
@@ -87,6 +91,7 @@ function keys(value) {
 }
 
 function mergedEntry(base, value) {
+  if(value.position!==undefined && (typeof value.position==='number'||typeof value.position==='string'))value={...value,position:{type:value.position}}
   const result = Object.assign({}, base, value)
   for (const name of ['strategy', 'position', 'recursion', 'effect']) {
     result[name] = Object.assign({}, base[name], value[name])
@@ -95,18 +100,23 @@ function mergedEntry(base, value) {
   return result
 }
 
+function enabledValue(value) {
+  if (value === true || value === 'true') return true
+  if (value === false || value === 'false') return false
+  throw new Error('世界书启用状态必须是布尔值')
+}
+
 function entryPatch(entry) {
   const strategy = entry.strategy, position = entry.position
   enumValue(strategy.type, ['constant', 'selective', 'vectorized'], '激活策略')
-  const probability = finite(entry.probability, '概率')
-  if (probability > 100) throw new Error('世界书概率不能超过 100')
+  const probability = Math.max(0,Math.min(100,finite(entry.probability, '概率',false,-Infinity)))
   const extra = clone(entry.extra || {})
   delete extra.dsh_tavern_ref
   const legacy = { displayIndex: extra.displayIndex ?? 0, caseSensitive: extra.caseSensitive ?? null, matchWholeWords: extra.matchWholeWords ?? null, group: str(extra.group) }
   for (const key of Object.keys(legacy)) delete extra[key]
   return {
     ...legacy,
-    comment: str(entry.name), content: str(entry.content), enabled: entry.enabled === true,
+    comment: str(entry.name), content: str(entry.content), enabled: enabledValue(entry.enabled),
     constant: strategy.type === 'constant', selective: strategy.type === 'selective', vectorized: strategy.type === 'vectorized',
     primaryKeys: keys(strategy.keys), secondaryKeys: keys(strategy.keys_secondary.keys),
     selectiveLogic: enumValue(strategy.keys_secondary.logic, LOGIC, '关键词逻辑'),
@@ -116,7 +126,7 @@ function entryPatch(entry) {
     probability, probabilityEnabled: true,
     excludeRecursion: entry.recursion.prevent_incoming === true,
     preventRecursion: entry.recursion.prevent_outgoing === true,
-    delayUntilRecursion: finite(entry.recursion.delay_until, '递归延迟', true),
+    delayUntilRecursion: finite(entry.recursion.delay_until, '递归延迟', true) || null,
     sticky: finite(entry.effect.sticky, '黏性', true), cooldown: finite(entry.effect.cooldown, '冷却', true), delay: finite(entry.effect.delay, '延迟', true),
     helperExtra: extra
   }
@@ -135,7 +145,7 @@ export function replaceTavernHelperWorldbookOperations(view, requested) {
   const operations = []
   for (const value of requested) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('世界书条目必须是对象')
-    const uid = value.uid === undefined ? nextUid++ : value.uid
+    const uid = value.uid === undefined ? nextUid++ : typeof value.uid==='string'&&/^\d+$/.test(value.uid)?Number(value.uid):value.uid
     if (!Number.isSafeInteger(uid) || uid < 0 || seen.has(String(uid))) throw new Error('世界书条目编号无效或重复')
     seen.add(String(uid))
     const before = byUid.get(String(uid))
@@ -155,4 +165,43 @@ export function replaceTavernHelperWorldbookOperations(view, requested) {
   }
   for (const entry of source) if (!seen.has(String(entry.uid))) operations.push({ op: 'delete', ref: entry.extra.dsh_tavern_ref })
   return operations
+}
+
+/** Rebase independent script edits by UID; never overwrite a changed entry. */
+export function mergeTavernHelperWorldbookEntries(current, requested, expected) {
+  if (!Array.isArray(requested) || !Array.isArray(expected)) throw new Error('世界书条目必须是数组')
+  const normalize = entries=>entries.map(entry=>entry&&typeof entry.uid==='string'&&/^\d+$/.test(entry.uid)?{...entry,uid:Number(entry.uid)}:entry)
+  current=normalize(current);requested=normalize(requested);expected=normalize(expected)
+  const index = (entries, allowNew = false) => {
+    const result = new Map()
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('世界书条目必须是对象')
+      if (allowNew && entry.uid === undefined) continue
+      if (!Number.isSafeInteger(entry.uid) || entry.uid < 0 || result.has(entry.uid)) throw new Error('世界书条目编号无效或重复')
+      result.set(entry.uid, entry)
+    }
+    return result
+  }
+  const base = index(expected), latest = index(current), desired = index(requested, true)
+  const defaults = projectEntry({comment: '', order: 100, position: 0, depth: 4})
+  const same = (a, b) => a === undefined || b === undefined ? a === b
+    : isDeepStrictEqual(entryPatch(mergedEntry(defaults, a)), entryPatch(mergedEntry(defaults, b)))
+  const edits = new Map(), additions = []
+  const conflict = uid => {throw new Error('世界书已被其他操作修改：条目 ' + uid + ' 存在并发冲突，请重新读取后重试')}
+  for (const [uid, before] of base) {
+    const patch = desired.get(uid), after = patch && mergedEntry(before, patch), now = latest.get(uid)
+    if (same(before, after)) continue
+    if (!same(now, before) && !same(now, after)) conflict(uid)
+    edits.set(uid, after)
+  }
+  for (const entry of requested) {
+    if (entry.uid !== undefined && base.has(entry.uid)) continue
+    // Validate new entries before any changes can be persisted.
+    entryPatch(mergedEntry(defaults, entry))
+    if (entry.uid !== undefined && latest.has(entry.uid)) {
+      if (!same(latest.get(entry.uid), entry)) conflict(entry.uid)
+    } else additions.push(clone(entry))
+  }
+  return current.filter(entry => !edits.has(entry.uid) || edits.get(entry.uid) !== undefined)
+    .map(entry => clone(edits.has(entry.uid) ? edits.get(entry.uid) : entry)).concat(additions)
 }

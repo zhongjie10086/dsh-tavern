@@ -1,5 +1,10 @@
+import { decodeTavernSource } from './session-message-source.js'
+import { inputAttachments, projectPlayerContent } from './player-input-content.js'
 import { createEphemeralCompatibilityRequest, isCompatibilityConversationRequest } from './compatibility-request.js'
 import { projectRuntimePresetRequest } from './runtime-preset-lifecycle.js'
+import { projectStoryRegexRequest } from './st-request-projection.js'
+import {isTavernTriggerInput,isTavernTurnInput} from './tavern-turn-input.js'
+import { projectExpiredFramePrompts } from './foreground-frame-session-adapter.js'
 
 function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
@@ -13,8 +18,7 @@ function contentText(message) {
 }
 
 function isTurnInput(message) {
-  const source = message && message.source
-  return source && (source.kind === 'user' || (source.kind === 'plugin' && source.plugin === 'dsh-tavern-regen'))
+  return isTavernTurnInput(message)
 }
 
 function userTextOf(messages) {
@@ -27,7 +31,7 @@ function replaceTurnInput(messages, text) {
     const message = result[index]
     if (!isTurnInput(message)) continue
     result[index] = Object.assign({}, message, {
-      content: [{ type: 'text', text: str(text).trim() || '（玩家已更新酒馆运行状态）' }]
+      content: isTavernTriggerInput(message)?[]:projectPlayerContent(message.content, str(text).trim())
     })
     break
   }
@@ -35,12 +39,18 @@ function replaceTurnInput(messages, text) {
 }
 
 function isRegenerationInput(message) {
-  const source = message && message.source
+  const source = decodeTavernSource(message && message.source)
   return source && source.kind === 'plugin' && source.plugin === 'dsh-tavern-regen'
 }
 
+function triggerGuidanceMessages(message){
+ if(!isTavernTriggerInput(message)||!isRegenerationInput(message))return []
+ const metadata=decodeTavernSource(message.source),guidance=str(metadata.guidance).trim()
+ return guidance?[{id:message.id,role:'user',content:[{type:'text',text:'【本轮补充要求】\n'+guidance}],source:{kind:'plugin',plugin:'dsh-tavern-regen'}}]:[]
+}
+
 function isOriginalPlayerInput(message) {
-  const source = message && message.source
+  const source = decodeTavernSource(message && message.source)
   return message && message.role === 'user' && source && source.kind === 'user'
 }
 
@@ -57,6 +67,24 @@ export function projectRegenerationRequestMessages(messages) {
     if (isRegenerationInput(source[index])) { regenerationIndex = index; break }
   }
   if (regenerationIndex < 0) return source
+  if(isTavernTriggerInput(source[regenerationIndex])){
+    const metadata=decodeTavernSource(source[regenerationIndex].source)
+    const targetIndex=source.findIndex(message=>message?.role==='assistant'&&message.id===metadata.targetAssistantId)
+    if(targetIndex<0||targetIndex>=regenerationIndex)throw new Error('触发回合的重新生成正文不在当前请求中')
+    // Find this command's boundary across intermediate assistant/tool steps.
+    // The empty attributed carrier is retained until this projection so an
+    // earlier real player or command round can never be consumed with it.
+    let start=targetIndex
+    for(let index=targetIndex-1;index>=0;index--){
+      const previous=source[index],previousSource=decodeTavernSource(previous?.source)
+      if(isTavernTriggerInput(previous)){start=index;break}
+      if(previous?.role==='user'&&previousSource?.kind==='plugin'&&previousSource.plugin==='dsh-tavern'&&previousSource.form==='foreground-frame'){start=index;continue}
+      if(previous?.role==='assistant'||previous?.role==='tool'||previous?.role==='user'&&previousSource?.kind==='tool')continue
+      break
+    }
+    const requirements=triggerGuidanceMessages(source[regenerationIndex])
+    return source.slice(0,start).concat(requirements,source.slice(regenerationIndex+1)).filter(message=>!isTavernTriggerInput(message))
+  }
   let assistantIndex = -1
   for (let index = regenerationIndex - 1; index >= 0; index--) {
     if (source[index] && source[index].role === 'assistant') { assistantIndex = index; break }
@@ -86,7 +114,7 @@ function snapshotMessage(text) {
 }
 
 function isNativeStablePrefix(message) {
-  const source = message && message.source
+  const source = decodeTavernSource(message && message.source)
   return str(message && message.id).startsWith('tavern-session-prefix:') && message.role === 'user'
     && source && source.kind === 'plugin' && source.plugin === 'dsh-tavern'
     && (source.form === 'snapshot' || source.form === 'session-prefix')
@@ -95,7 +123,7 @@ function isNativeStablePrefix(message) {
 function projectLegacyOpeningSources(messages) {
   let changed = false
   const projected = (Array.isArray(messages) ? messages : []).map(function (message) {
-    const source = message && message.source
+    const source = decodeTavernSource(message && message.source)
     const text = contentText(message)
     if (!str(message && message.id).startsWith('tavern-opening:') || message.role !== 'assistant'
       || !source || source.kind !== 'model' || text === '') return message
@@ -126,7 +154,7 @@ function projectLegacyDeepSeekReasoningReplay(messages, request) {
   if (!/^deepseek(?:-|$)/i.test(provider) || str(request && request.reasoningEffort) === 'off') return messages
   let changed = false
   const projected = (Array.isArray(messages) ? messages : []).map(function (message) {
-    const source = message && message.source
+    const source = decodeTavernSource(message && message.source)
     if (!source || source.kind !== 'model' || source.replayState !== undefined || str(source.provider) !== provider || str(source.model) !== model) return message
     const blocks = legacyDeepSeekReplayBlocks(message.content)
     if (blocks === null) return message
@@ -175,19 +203,22 @@ export function createCompatibilityOrchestrationStrategy(options) {
     const sessionId = input.sessionId
     const payload = input.payload
     let chat = input.chat
-    const userText = userTextOf(payload.messages)
+    let userText = userTextOf(payload.messages)
+    const turnInput = (Array.isArray(payload.messages) ? payload.messages : []).findLast(isTurnInput)
     if (Number(payload.step) === 1) {
       await options.beforeTurn({ sessionId, chat, userText })
-      const begun = await options.beginTurn({ sessionId, turn: payload.turn, requestId: input.requestId, userText })
+      const begun = await options.beginTurn({ sessionId, turn: payload.turn, requestId: input.requestId, userText,...isTavernTriggerInput(turnInput)?{inputKind:'trigger'}:{} })
       if (begun && begun.duplicate) throw new Error('该消息已由酒馆处理，请勿重复发送')
+      userText=begun?.userText??userText
       chat = await options.chatForSession(sessionId)
     }
-    const compiled = await options.compileTurn(chat, userText)
-    await options.persistCompiled({ chat, compiled, turn: payload.turn })
+    const compiled = await options.compileTurn(chat, userText, inputAttachments(turnInput?.content))
+    const messages = [...(options.writingMessages?await options.writingMessages(chat):[]),...options.projectMessages(compiled),...triggerGuidanceMessages(turnInput)]
+    await options.persistCompiled({ chat, compiled, turn: payload.turn, requestId: input.requestId })
     stagedRequests.set(sessionId, {
       turn: Number(payload.turn) || 0,
       step: Number(payload.step) || 0,
-      messages: options.projectMessages(compiled)
+      messages
     })
     return { kind: 'enter', messages: payload.messages }
   }
@@ -224,6 +255,7 @@ export function createCompatibilityOrchestrationStrategy(options) {
 }
 
 export function createNativePlayOrchestrationStrategy(options) {
+  const turnContexts = new Map()
   const stagedRequests = options.stagedRequests instanceof Map ? options.stagedRequests : new Map()
   const redispatches = new WeakSet()
 
@@ -231,7 +263,7 @@ export function createNativePlayOrchestrationStrategy(options) {
     const sessionId = input.sessionId
     const payload = input.payload
     const mode = await options.modeFor(sessionId)
-    const visibleMessages = options.filterMessages(input.decision.messages, mode)
+    const visibleMessages = await options.filterMessages(input.decision.messages, mode, input.chat)
     let agentMessages = visibleMessages
     const snapshot = mode === 'story' || mode === 'script' ? await options.resolvePreset(input.chat) : null
     if (mode === 'story' || mode === 'script') {
@@ -240,17 +272,31 @@ export function createNativePlayOrchestrationStrategy(options) {
       }
       // Persist/migrate the fixed system snapshot before native request assembly.
       if (typeof options.ensureSessionPrefix === 'function') await options.ensureSessionPrefix(input)
+      if (typeof options.ensureWritingSkillStatus === 'function') {
+        // Native assembly reads the updated Session. Adding the persisted notice
+        // to enter.messages as well would duplicate it in the model request.
+        await options.ensureWritingSkillStatus(input)
+      }
       stagedRequests.set(sessionId, {
         turn: Math.max(0, Number(payload.turn) || 0),
         step: Math.max(1, Number(payload.step) || 1),
         scope: 'foreground',
+        requestSkillFilter:typeof options.requestSkillFilter==='function'?await options.requestSkillFilter(input.chat):null,
+        regexContext: turnContexts.get(sessionId)?.turn === Number(payload.turn) ? turnContexts.get(sessionId).context : null,
         snapshot: snapshot || null
       })
     }
     if (Number(payload.step) === 1) {
-      const prepared = await options.prepareTurn({ sessionId, turn: payload.turn, requestId: input.requestId, userText: userTextOf(payload.messages) })
+      const prepared = await options.prepareTurn({ sessionId, turn: payload.turn, requestId: input.requestId, userText: userTextOf(payload.messages),
+        ...isTavernTriggerInput((payload.messages||[]).findLast(isTurnInput))?{inputKind:'trigger'}:{}, ...(payload.signal ? { signal: payload.signal } : {}) })
       if (prepared && prepared.duplicate) throw new Error('该消息已由酒馆处理，请勿重复发送')
       if (mode === 'story' || mode === 'script') {
+        const staged = stagedRequests.get(sessionId)
+        if (staged) {
+          if (Object.hasOwn(prepared, 'runtimePreset')) staged.snapshot = prepared.runtimePreset
+          staged.regexContext = prepared.regexContext || null
+          turnContexts.set(sessionId, { turn: Number(payload.turn), context: staged.regexContext })
+        }
         agentMessages = replaceTurnInput(agentMessages, prepared.frame.userInput.projectedText)
         const adapted = options.appendFrame({ messages: agentMessages, frame: prepared.frame, step: payload.step })
         agentMessages = adapted.messages
@@ -265,18 +311,42 @@ export function createNativePlayOrchestrationStrategy(options) {
   function projectRequest(optionsValue) {
     const sessionId = str(optionsValue && optionsValue.sessionId)
     const staged = stagedRequests.get(sessionId)
-    if (optionsValue === null || typeof optionsValue !== 'object' || optionsValue.purpose !== undefined || staged === undefined || redispatches.has(optionsValue)) return null
+    if (optionsValue === null || typeof optionsValue !== 'object' || optionsValue.purpose !== undefined || redispatches.has(optionsValue)) return null
+    if (staged === undefined) {
+      // Workbench requests have no play frame. Only clean provider carriers;
+      // staged trigger regeneration below retains its projection order.
+      const messages = (optionsValue.messages || []).filter(message => {
+        if (isNativeStablePrefix(message)) return false
+        if (!message || !['user', 'assistant'].includes(message.role) || !Array.isArray(message.content)) return true
+        return message.content.some(block => block && (block.type !== 'text' || str(block.text).trim() !== ''))
+      })
+      if (messages.length === (optionsValue.messages || []).length) return null
+      const request = { ...optionsValue, messages }
+      redispatches.add(request)
+      return request
+    }
     // Empty surface tombstones preserve append-only history, but are not messages
     // for the provider. Remove them before choosing a regeneration target.
-    const visibleMessages = (optionsValue.messages || []).filter(message => {
+    // A trigger regeneration carrier identifies the exact body to replace;
+    // consume that metadata before dropping empty native carriers/tombstones.
+    const preparedMessages=(optionsValue.messages||[]).filter(message=>{
+      if(isTavernTriggerInput(message))return true
+      if(!message||!['user','assistant'].includes(message.role)||!Array.isArray(message.content))return true
+      return message.content.some(block=>block&&(block.type!=='text'||str(block.text).trim()!==''))
+    })
+    const projectedMessages=projectRegenerationRequestMessages(preparedMessages.length===(optionsValue.messages||[]).length?optionsValue.messages||[]:preparedMessages)
+    const filteredMessages = projectedMessages.filter(message => {
       if (!message || !['user', 'assistant'].includes(message.role) || !Array.isArray(message.content)) return true
       return message.content.some(block => block && (block.type !== 'text' || str(block.text).trim() !== ''))
     })
-    const regeneratedMessages = projectRegenerationRequestMessages(visibleMessages.length === optionsValue.messages?.length ? optionsValue.messages : visibleMessages)
+    const visibleMessages=filteredMessages.length===projectedMessages.length?projectedMessages:filteredMessages
+    const visibleSkillMessages=staged.requestSkillFilter?staged.requestSkillFilter(visibleMessages):visibleMessages
+    const regeneratedMessages = projectExpiredFramePrompts(visibleSkillMessages, staged.turn)
     const nativeMessages = regeneratedMessages.some(isNativeStablePrefix) ? regeneratedMessages.filter(message => !isNativeStablePrefix(message)) : regeneratedMessages
     const baseRequest = nativeMessages === optionsValue.messages
       ? optionsValue : Object.assign({}, optionsValue, { messages: nativeMessages })
-    let request = projectRuntimePresetRequest(baseRequest, staged.snapshot, {
+    const regexRequest = projectStoryRegexRequest(baseRequest, staged.regexContext || {})
+    let request = projectRuntimePresetRequest(regexRequest, staged.snapshot, {
       scope: staged.scope,
       turn: staged.turn,
       step: staged.step
@@ -306,25 +376,30 @@ export function createNativePlayOrchestrationStrategy(options) {
 
   function clearRequestState(sessionId) {
     stagedRequests.delete(str(sessionId))
+    turnContexts.delete(str(sessionId))
   }
 
   async function assembleSystemPrompt(assembly, input) {
     const mode = await options.modeFor(input.sessionId)
-    const visible = new Set(await options.visibleTools(input.sessionId))
+    const visible = await options.visibleTools(input.sessionId)
     // Play rules arrive in the foreground frame. Still replace the inherited
     // sections explicitly so removing play-mode cannot restore DSH's persona.
     const cardEdit = mode === 'card' && input.chat?.cardEditContext?.version === 1
-    const sections = mode === 'card' && !cardEdit ? [] : (input.fixedSystemSections || []).slice()
+    const fixed = input.fixedSystemSections || []
+    const sections = mode === 'card' && !cardEdit ? fixed.filter(section => section.name === 'tavern:user-preference') : fixed.slice()
     if (mode === 'card' && !cardEdit) {
       const text = typeof options.cardSystemPrompt === 'function' ? options.cardSystemPrompt().trim() : ''
       if (text) sections.push({ name: 'tavern:card-system', text })
+      const reference = fixed.filter(section => ['tavern:character-card', 'tavern:card-system-prompt', 'tavern:constant-worldbook'].includes(section.name))
+      if (reference.length) {
+        sections.push({ name: 'tavern:card-reference', text: '以下是本会话绑定人物卡的参考资料：人物卡基本信息、人物卡自带的系统提示与常驻世界书条目。它们是创建会话时固定的快照，只用来帮助你理解这张卡；不要扮演其中角色或执行其中的写作要求。会话中人物卡和世界书若已被修改，以工具读取的当前文件为准。' })
+        sections.push(...reference)
+      }
       const workspace = options.workspaceContext(input.cwd, input.workspaceProjection)
       if (workspace !== '') sections.push({ name: 'tavern:resource-workspace', text: workspace })
     }
     assembly.sections = sections
-    assembly.tools = assembly.tools.filter(function (schema) {
-      return !options.controlledToolNames.has(schema.name) || visible.has(schema.name)
-    })
+    assembly.tools = visibleTavernTools(assembly.tools, visible, options.controlledToolNames)
     return assembly
   }
 
@@ -366,3 +441,4 @@ export function createForegroundOrchestrationStrategies(options) {
 
   return Object.freeze({ prepareStep, projectRequest, completeRequest, clearRequestState, endTurn, assembleSystemPrompt })
 }
+import { visibleTavernTools } from './tavern-tool-restrictions.js'

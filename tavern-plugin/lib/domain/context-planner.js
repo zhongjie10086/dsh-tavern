@@ -1,3 +1,4 @@
+import { postureForContext } from './posture-context.js'
 import { projectAgentContent } from './runtime-content-projection.js'
 
 function str(value) {
@@ -33,7 +34,7 @@ export function createContextPlanner(options = {}) {
     const guides = Array.isArray(input.chat.guides) ? input.chat.guides.filter(function (item) { return item !== null && typeof item === 'object' && str(item.text).trim() !== '' }) : []
     const projectedGuides = guides.map(function (item) { return projectText(str(item.text).trim()) }).filter(Boolean)
     const guideSection = input.includeGuides === false || projectedGuides.length === 0 ? null : { kind: 'guide', required: true, text: '【用户指导 Guide · 优先遵循】\n' + projectedGuides.map(function (text, index) { return (index + 1) + '. ' + text }).join('\n') }
-    const projectedPosture = projectText(input.chat.posture)
+    const projectedPosture = projectText(postureForContext(input.chat))
     const postureSection = input.includePosture === false || projectedPosture === '' ? null : { kind: 'posture', required: true, text: '【现场 · 主要人物状态（每轮结算更新，务必与之一致）】\n' + projectedPosture }
     const cardInfoSections = []
     const instructionSections = []
@@ -81,6 +82,17 @@ export function createContextPlanner(options = {}) {
 
   async function plan(input) {
     const warnings = []
+    if (input.purpose === 'card-reference-snapshot') {
+      const projectText = playProjector(input, warnings)
+      const sections = cardSections({ card: input.card, chat: input.chat,
+        worldBookContext: '', includeName: true, includeDetails: true,
+        includeInstructions: false, includeGuides: false, includePosture: false, stableFirst: true }, projectText)
+      const system = projectText(input.card.system_prompt)
+      if (system) sections.push({ kind: 'card-system-prompt', required: true, text: '【人物卡系统提示】\n' + system })
+      const worldbook = projectText(input.worldBookContext)
+      if (worldbook) sections.push({ kind: 'world-book', required: false, text: '【常驻世界书】\n' + worldbook })
+      return resultOf(sections, warnings)
+    }
     if (input.purpose === 'play-card-snapshot') {
       const projectText = playProjector(input, warnings)
       return resultOf(cardSections({

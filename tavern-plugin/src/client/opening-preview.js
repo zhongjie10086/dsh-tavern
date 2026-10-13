@@ -21,8 +21,34 @@ function installOpeningPreviewBridge(token, preview) {
       parent.postMessage(Object.assign({ type, token, requestId }, payload), '*');
     });
   }
-  window.generateRaw = function (config) {
-    return request('dsh-tavern-helper-call', { method: 'generateTavernHelperRaw', args: { config: copy(config) } }).then(function (result) { return result.text; });
+  window.triggerSlash = function (line) {
+    const command = String(line || '');
+    return request('dsh-tavern-helper-call', { method: 'triggerTavernSlash', args: { line: command } }).then(function (result) {
+      if (/^\s*\/echo\b/i.test(command)) window.toastr?.info?.(result.pipe);
+      return result.pipe || '';
+    }).catch(function (error) {
+      if (typeof document !== 'undefined' && document.body) {
+        document.querySelector('[data-dsh-opening-error]')?.remove();
+        const notice = document.createElement('div');
+        notice.setAttribute('data-dsh-opening-error', ''); notice.setAttribute('role', 'alert');
+        notice.style.cssText = 'position:fixed;bottom:16px;left:16px;right:16px;z-index:2147483647;padding:16px;background:Canvas;color:CanvasText;border:1px solid currentColor;border-radius:8px;font:14px/1.6 system-ui';
+        const message = document.createElement('p'); message.textContent = '开局未完成：' + error.message;
+        const retry = document.createElement('button'); retry.type = 'button'; retry.textContent = '重试开局';
+        retry.onclick = function () { notice.remove(); window.triggerSlash(command).catch(function () {}); };
+        notice.append(message, retry); document.body.append(notice);
+      }
+      throw error;
+    });
+  };
+  window.executeSlashCommandsWithOptions = async source => ({ pipe: await window.triggerSlash(source), isError: false });
+  window.iframe_events ||= Object.freeze({MESSAGE_IFRAME_RENDER_STARTED:'message_iframe_render_started',MESSAGE_IFRAME_RENDER_ENDED:'message_iframe_render_ended',GENERATION_STARTED:'js_generation_started',STREAM_TOKEN_RECEIVED_FULLY:'js_stream_token_received_fully',STREAM_TOKEN_RECEIVED_INCREMENTALLY:'js_stream_token_received_incrementally',GENERATION_ENDED:'js_generation_ended'});
+  window.generateRaw = async function (config) {
+    const payload=copy(config||{}),streaming=payload.should_stream===true&&typeof window.eventEmit==='function',types=window.iframe_events;
+    const id=String(payload.generation_id||window.crypto?.randomUUID?.()||('preview-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2)));
+    if(streaming){payload.generation_id=id;await window.eventEmit(types.GENERATION_STARTED,id);}
+    const result=await request('dsh-tavern-helper-call', { method: 'generateTavernHelperRaw', args: { config: payload } });
+    if(streaming){await window.eventEmit(types.STREAM_TOKEN_RECEIVED_FULLY,result.text,id);await window.eventEmit(types.STREAM_TOKEN_RECEIVED_INCREMENTALLY,result.text,id);await window.eventEmit(types.GENERATION_ENDED,result.text,id);}
+    return result.text;
   };
   window.getCharWorldbookNames = function () { return { primary: worldbook ? worldbook.name : null, additional: [] }; };
   window.getWorldbook = async function (name) {
@@ -42,13 +68,20 @@ function installOpeningPreviewBridge(token, preview) {
     worldbook = copy(result.worldbook);
     return copy(worldbook.entries);
   };
-  window.TavernHelper = Object.assign({}, original && original.helper, { generateRaw: window.generateRaw, getCharWorldbookNames: window.getCharWorldbookNames,
+  window.TavernHelper = Object.assign({}, original && original.helper, { triggerSlash: window.triggerSlash, executeSlashCommandsWithOptions: window.executeSlashCommandsWithOptions, iframe_events:window.iframe_events,tavern_events:window.tavern_events,generateRaw: window.generateRaw, getCharWorldbookNames: window.getCharWorldbookNames,
     getWorldbook: window.getWorldbook, updateWorldbookWith: window.updateWorldbookWith });
   const chat = [{ is_user: false, name: preview.characterName || '', mes: swipes[selected], swipe_id: selected, swipes: swipes.slice() }];
   let savedIndex = selected;
+  const swipe = { to: async function (_chatId, direction, options = {}) {
+    if (options.forceMesId !== undefined && Number(options.forceMesId) !== 0) throw new Error('只能切换开场消息');
+    const index = options.forceSwipeId !== undefined ? Number(options.forceSwipeId)
+      : direction === 'left' ? selected - 1 : direction === 'right' ? selected + 1 : NaN;
+    return window.setChatMessages([{ message_id: 0, swipe_id: index }]);
+  } };
+  if (!window.toastr) window.toastr = { info: console.info, success: console.info, warning: console.warn, error: console.error };
   window.SillyTavern = Object.assign({}, original && original.host, {
-    chat,
-    getContext: function () { return Object.assign({}, original && original.host.getContext(), { chat, extensionSettings: original ? original.host.getContext().extensionSettings : {} }); },
+    chat, swipe,
+    getContext: function () { return Object.assign({}, original && original.host.getContext(), { chat, swipe, extensionSettings: original ? original.host.getContext().extensionSettings : {} }); },
     saveChat: async function () {
       const message = chat[0];
       const index = Number(message && message.swipe_id);
@@ -63,10 +96,6 @@ function installOpeningPreviewBridge(token, preview) {
       await window.setChatMessages([{ message_id: 0, swipe_id: savedIndex }]);
     }
   });
-  if (original) {
-    window.getTavernHelperVersion = function () { return "4.8.19"; };
-    window.TavernHelper.getTavernHelperVersion = window.getTavernHelperVersion;
-  }
   window.getCurrentMessageId = window.getLastMessageId = function () { return 0; };
   window.getChatMessages = function (id, options) {
     if (original) return original.getChatMessages(id, options);
@@ -138,10 +167,18 @@ function installSessionOpeningBridge(token, descriptor) {
     pending.delete(data.requestId); clearTimeout(task.timer);
     if (data.ok) task.resolve(data.result); else task.reject(new Error(data.error || '开始旅程失败'));
   });
+  const swipe = { to: async function (_chatId, direction, options = {}) {
+    if (options.forceMesId !== undefined && Number(options.forceMesId) !== 0) throw new Error('只能切换开场消息');
+    const index = options.forceSwipeId !== undefined ? Number(options.forceSwipeId)
+      : direction === 'left' ? chat[0].swipe_id - 1 : direction === 'right' ? chat[0].swipe_id + 1 : NaN;
+    if (!Number.isInteger(index) || !descriptor.openingIds[index]) throw new Error('人物卡开场白不存在');
+    return window.setChatMessage(swipes[index], 0, { swipe_id: index });
+  } };
+  if (!window.toastr) window.toastr = { info: console.info, success: console.info, warning: console.warn, error: console.error };
   window.SillyTavern = Object.assign({}, window.SillyTavern, {
     extensionSettings: descriptor.extensionSettings || {},
     TavernHelper: window.TavernHelper,
-    chat,
+    chat, swipe,
     getContext: function () { return window.SillyTavern; },
     saveChat: async function () {
       const row = chat[0], index = row && row.swipe_id;
@@ -163,4 +200,34 @@ function installSessionOpeningBridge(token, descriptor) {
     return window.SillyTavern.reloadCurrentChat();
   };
 
+}
+// One preparation owns one submission. A failed initial send retains the created
+// Session and its compiled command, so every entry retries that same Session.
+function createOpeningSubmission() {
+  let pending = null, created = null, command = null, send = null, completed = false;
+  return function submit(options) {
+    if (pending) return pending;
+    if (completed) return Promise.resolve(created);
+    pending = Promise.resolve().then(async function () {
+      if (!created) {
+        command = await options.prepare();
+        options.begin?.();
+        created = await options.create(command);
+        send = options.send;
+      } else options.begin?.();
+      await send(created, command);
+      completed = true;
+      return created;
+    }).catch(function (error) { options.failed?.(error, created); throw error; })
+      .finally(function () { pending = null; options.finish?.(); });
+    return pending;
+  };
+}
+
+function openingResponseChoices(response) {
+  const openings = Array.isArray(response.openings) ? response.openings : [];
+  if (response.openingDataVersion !== 2 || !response.openingShared) return openings;
+  return openings.map(function (opening) {
+    return opening.openingPreview ? Object.assign({}, opening, { openingPreview: Object.assign({}, response.openingShared, opening.openingPreview) }) : opening;
+  });
 }

@@ -1,9 +1,12 @@
 import { recordUpdateDiagnostic } from './update-diagnostics.mjs'
 import { spawnSync } from 'node:child_process'
-import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, copyFileSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { INSTALL_HOSTS, SOURCE_ROOT, RELEASE_FILE, RUNTIME_HOST, runtimeEnvironment, commandExists, sleep } from './launcher-environment.mjs'
+import { INSTALL_HOSTS, SOURCE_ROOT, RUNTIME_HOST, runtimeEnvironment, commandExists, sleep } from './launcher-environment.mjs'
+import { promoteUpdateStatus } from '../tavern-plugin/lib/update-status.js'
+import { processBirth } from '../tavern-plugin/lib/process-identity.js'
+import { readLocalBuild } from '../tavern-plugin/lib/local-build.js'
 
 // Own update execution and durable terminal outcomes, including installed-but-needs-restart.
 export function encodeWindowsPowerShellScript(source) {
@@ -24,6 +27,7 @@ export function parseUpdateOptions(args) {
   let statusFile = ''
   let delay = 0
   let targetCommit = ''
+  let attemptId = ''
   for (let index = 0; index < args.length; index += 1) {
     const value = args[index]
     if (value === '--host') host = args[++index]
@@ -34,21 +38,20 @@ export function parseUpdateOptions(args) {
     else if (value.startsWith('--delay=')) delay = Number(value.slice('--delay='.length))
     else if (value === '--target-commit') targetCommit = args[++index]
     else if (value.startsWith('--target-commit=')) targetCommit = value.slice('--target-commit='.length)
+    else if (value === '--attempt-id') attemptId = args[++index]
     else throw new Error(`无法识别的更新参数：${value}`)
   }
   if (!INSTALL_HOSTS.has(host)) throw new Error(`不支持的安装宿主：${host}`)
   if (statusFile !== '' && !path.isAbsolute(statusFile)) throw new Error('更新状态文件必须使用绝对路径')
   if (!Number.isInteger(delay) || delay < 0 || delay > 5000) throw new Error('更新延迟必须是 0 到 5000 毫秒的整数')
   if (targetCommit !== '' && !/^[0-9a-f]{40}$/i.test(targetCommit)) throw new Error('目标提交号无效')
-  return { host, statusFile, delay, targetCommit }
+  if (attemptId !== '' && !/^[a-z0-9-]{36}$/i.test(attemptId)) throw new Error('更新任务编号无效')
+  return { host, statusFile, delay, targetCommit, ...(attemptId ? { attemptId } : {}) }
 }
 
-function writeUpdateStatus(file, value) {
+export async function writeUpdateStatus(file, value, attemptId) {
   if (file === '') return
-  mkdirSync(path.dirname(file), { recursive: true })
-  const temporary = `${file}.tmp-${process.pid}`
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
-  renameSync(temporary, file)
+  await promoteUpdateStatus(file, { ...value, ...(attemptId ? { attemptId } : {}) }, { attemptId })
   recordUpdateDiagnostic(path.dirname(file), { event: 'installer.status', ...value })
 }
 
@@ -57,14 +60,30 @@ export async function updateApplication(options = { host: RUNTIME_HOST, statusFi
   const log = typeof options.log === 'function' ? options.log : console.log
   const startedAt = Date.now()
   const targetCommit = String(options.targetCommit || '')
-  writeUpdateStatus(options.statusFile, {
+  // Z89: the upstream installer would replace a local repair build with
+  // upstream main. Refuse before touching anything; nothing needs repair.
+  const localBuild = await readLocalBuild(sourceRoot)
+  if (localBuild) {
+    await writeUpdateStatus(options.statusFile, {
+      phase: 'failed', localBuild: true, host: options.host, failedAt: startedAt, error: localBuild.notice,
+      ...(targetCommit ? { targetCommit } : {}),
+    }, options.attemptId)
+    throw new Error(localBuild.notice)
+  }
+  await writeUpdateStatus(options.statusFile, {
     phase: 'running', host: options.host, startedAt, pid: process.pid,
+    processIdentity: processBirth(process.pid)?.id,
     ...(targetCommit ? { targetCommit } : {}),
-  })
+  }, options.attemptId)
   let temporary = ''
   let outputFile = ''
   try {
     if (options.delay > 0) await sleep(options.delay)
+    if(existsSync(path.join(sourceRoot,'.git'))){
+      const status=spawnSync('git',['-c','safe.directory='+sourceRoot.replaceAll('\\','/'),'--no-optional-locks','-C',sourceRoot,'status','--porcelain=v1','--untracked-files=normal'],{encoding:'utf8',windowsHide:true})
+      if(status.error||status.status!==0)throw Error('无法核对当前 Git 安装目录，未覆盖本地文件')
+      if(status.stdout.trim())throw Error('当前安装目录有未提交的本地改动，请处理后再更新')
+    }
     log('正在更新 DSH Tavern……')
     const program = resolveUpdateProgram(options.host, process.platform, sourceRoot)
     const installer = program.script
@@ -88,7 +107,8 @@ export async function updateApplication(options = { host: RUNTIME_HOST, statusFi
         env: {
           ...runtimeEnvironment(),
           DSH_TAVERN_HOST: options.host,
-          DSH_TAVERN_SOURCE_ROOT: SOURCE_ROOT,
+          DSH_TAVERN_SOURCE_ROOT: sourceRoot,
+          DSH_TAVERN_APP_DIR: sourceRoot,
           ...(options.targetCommit ? { DSH_TAVERN_TARGET_COMMIT: options.targetCommit } : {}),
           ...(capture ? { DSH_TAVERN_NO_OPEN: '1' } : {}),
         },
@@ -108,10 +128,10 @@ export async function updateApplication(options = { host: RUNTIME_HOST, statusFi
     temporary = ''
     if (outputFile !== '' && existsSync(outputFile)) unlinkSync(outputFile)
     outputFile = ''
-    writeUpdateStatus(options.statusFile, {
+    await writeUpdateStatus(options.statusFile, {
       phase: 'completed', host: options.host, completedAt: Date.now(), requiresRestart: options.host === 'desktop',
       ...(targetCommit ? { targetCommit } : {}),
-    })
+    }, options.attemptId)
   } catch (error) {
     let failure = error
     if (temporary !== '' && existsSync(temporary)) {
@@ -122,21 +142,10 @@ export async function updateApplication(options = { host: RUNTIME_HOST, statusFi
     if (outputFile !== '' && existsSync(outputFile)) {
       try { unlinkSync(outputFile) } catch {}
     }
-    let installedCommit = ''
-    try {
-      installedCommit = String(JSON.parse(readFileSync(path.join(sourceRoot, RELEASE_FILE), 'utf8').replace(/^\uFEFF/, ''))?.commit || '')
-    } catch {}
-    if (targetCommit && installedCommit.toLowerCase() === targetCommit.toLowerCase()) {
-      writeUpdateStatus(options.statusFile, {
-        phase: 'installed-restart-required', host: options.host, installedAt: Date.now(), targetCommit,
-        error: '程序文件已更新，但自动启动或就绪检查未完成。请手动重启 DSH Tavern。',
-      })
-      return
-    }
-    writeUpdateStatus(options.statusFile, {
-      phase: 'failed', host: options.host, failedAt: Date.now(), error: String(failure?.message || failure),
+    await writeUpdateStatus(options.statusFile, {
+      phase: 'failed', repairRequired: true, host: options.host, failedAt: Date.now(), error: String(failure?.message || failure),
       ...(targetCommit ? { targetCommit } : {}),
-    })
+    }, options.attemptId)
     throw failure
   }
 }
@@ -172,7 +181,7 @@ export function resolveUpdateProgram(host, platform = process.platform, sourceRo
     if (command === '') {
       const hostPrefix = host === 'desktop' ? "$env:DSH_TAVERN_HOST='desktop'; " : ''
       throw new Error(
-        `找不到 Windows PowerShell 或 PowerShell 7。请在当前 PowerShell 中运行：${hostPrefix}irm https://cdn.jsdelivr.net/gh/flizzywine/dsh-tavern@main/install.ps1 | iex`,
+        `找不到 Windows PowerShell 或 PowerShell 7。请在当前 PowerShell 中运行：${hostPrefix}irm https://cdn.jsdelivr.net/gh/zhongjie10086/dsh-tavern@release-r15-clean/install.ps1 | iex`,
       )
     }
     return { script, command, args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script] }

@@ -1,3 +1,6 @@
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
+import { prependSystemInstruction } from './domain/system-append.js'
+import { createBackgroundProgress } from './domain/background-progress.js'
 import { rewindBackgroundSurface } from './domain/background-surface.js'
 import { sessionEvents } from './domain/session-events.js'
 import { randomUUID } from 'node:crypto'
@@ -35,7 +38,7 @@ function backgroundPrompt(messages, turnContext, task, taskProtocol, input = {})
       : (message && message.role === 'assistant' ? '正文' : '用户')
     return '[' + role + ']\n' + messageText(message)
   }).filter(function (text) { return text.trim() !== '' }).join('\n\n')
-  const taskName = task === 'image' ? '场景生图' : task === 'settlement' ? '状态结算' : task === 'phone' ? '手机私聊' : '候选生成'
+  const taskName = task === 'image' ? '场景生图' : task === 'settlement' ? '状态结算' : task === 'phone' ? '手机私聊' : task === 'character-design' ? '人物设计' : '候选生成'
   sections.push('【最近剧情与本次任务】\n任务类型：' + taskName + '\n' + recent)
   const protocol = str(taskProtocol).trim()
   if (protocol !== '') sections.push('【DSH 后台任务协议（最终指令）】\n' + protocol)
@@ -94,6 +97,7 @@ export function createBackgroundAgentTask(options) {
     return item && item.tool && typeof item.tool.name === 'string' && typeof item.execute === 'function'
   }) : []
   const sharedByName = new Map(sharedBackgroundTools.map(function (item) { return [item.tool.name, item] }))
+  const sharedAllowed = (item, input) => item && (typeof item.allowed !== 'function' || item.allowed(input) === true)
   const stableBackgroundTools = []
   const stableNames = new Set()
   const configuredBackgroundTools = Array.isArray(options.backgroundTools) ? options.backgroundTools : []
@@ -124,6 +128,25 @@ export function createBackgroundAgentTask(options) {
     return async function (childCtx) {
       if (setupAgent !== null) await setupAgent(childCtx)
       state.ctx = childCtx
+      // The kernel snapshots this task's route at assembly, preserving the
+      // resident Session while keeping in-flight requests on their old model.
+      installModelSelection(childCtx, {
+        get current() { return state.input.selection },
+        assembled: undefined
+      })
+      childCtx.on('agent/request', async function (_payload, next) {
+        const input = state.input || {}
+        const resolved = await next()
+        // rc.2 seeds later requests from the persisted header. Replace that
+        // stale task budget here; policies installed by setupAgent/the host
+        // wrap this scoped hook and may still impose a lower current limit.
+        const { maxTokens: _previousMaxTokens, ...request } = resolved
+        const requested = Number(input.maxTokens)
+        const maxTokens = Number.isSafeInteger(requested) && requested > 0 ? requested : maximumBackgroundTokens(input.selection)
+        if (maxTokens !== undefined) request.maxTokens = maxTokens
+        return request
+      })
+      childCtx.on('agent/assistant-stream', ({ frame }) => state.progress?.frame(frame))
       childCtx.on('agent/pre-step', async function ({ agent, turn, step }, next) {
         const decision = await next()
         if (!descriptorAppended && decision.kind === 'enter') {
@@ -148,24 +171,43 @@ export function createBackgroundAgentTask(options) {
         name: 'deployment:persona',
         order: 0,
         complete: true,
-        text: state.input.task === 'image' ? readSceneImageSystemInstruction() : backgroundPersona
+        // DSH restores complete sections after the assembly waterfall, so the
+        // additional instruction must be part of this authoritative text.
+        text: () => {
+          const assembly = { sections: [{ name: 'deployment:persona', text: state.input.task === 'image' ? readSceneImageSystemInstruction() : backgroundPersona }] }
+          return prependSystemInstruction(assembly, options.systemAppend?.()).sections.map(section => section.text).join('\n\n')
+        }
       })
       childCtx.systemPrompt.suppressRuntimeContext()
       if (state.input.task === 'image') {
         childCtx.tools.register({
           ...CHARACTER_DESIGN_READ_TOOL,
           output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
-          async execute(args) {
+          async execute(args, execution) {
             if (!state.imageReadTask) return JSON.stringify({ ok: false, error: '当前没有正在执行的绘图任务。' })
-            return state.imageReadTask(args)
+            return state.imageReadTask(args, execution)
           }
         })
       }
-      childCtx.tools.restrict({ allow: state.input.task === 'image' || state.input.task === 'phone' ? [] : ['skill', 'web_search'] })
+      let releaseRestriction, restrictionKey, restrictionScope
+      function refreshRestriction() {
+        const allow = state.input.task === 'image' || state.input.task === 'phone' ? [] : ['skill', ...(state.input.webSearchEnabled === true ? ['web_search'] : [])]
+        const key = allow.join(',')
+        const scope = typeof childCtx.tools.view === 'function' || typeof childCtx.tools.schemas === 'function' ? state.agentScope : undefined
+        if (key === restrictionKey && scope === restrictionScope) return
+        releaseRestriction?.()
+        const inherited = childCtx.tools.view?.(scope)?.restrictableNames
+        const registered = inherited ? Array.from(inherited) : childCtx.tools.schemas?.(scope).map(tool => tool.name)
+        releaseRestriction = childCtx.tools.restrict({ allow: registered ? allow.filter(name => registered.includes(name)) : allow })
+        restrictionKey = key
+        restrictionScope = scope
+      }
+      refreshRestriction()
       childCtx.on('system-prompt/assemble', async function (_assembly, _context, next) {
         const assembly = await next()
         const sections = [...(assembly.sections || []), ...sessionStablePrefixSections(_context?.agent?.session)]
         assembly.sections = state.currentWorldbook === undefined ? sections : withCurrentWorldbook(sections, state.currentWorldbook)
+        prependSystemInstruction(assembly, options.systemAppend?.())
         if (state.input.task === 'phone') {
           assembly.sections = (assembly.sections || []).filter(function (section) {
             return !section || typeof section.name !== 'string' || !section.name.startsWith('tool:')
@@ -179,14 +221,17 @@ export function createBackgroundAgentTask(options) {
         return assembly
       })
       state.refreshConfiguredTools = function () {
+        refreshRestriction()
         if (state.input.task === 'image') return
-        const key = JSON.stringify(state.input.backgroundTasksSnapshot || null)
+        const key = JSON.stringify([state.input.task, state.input.backgroundTasksSnapshot || null])
         if (state.configuredToolsKey === key) return
         for (const dispose of state.stableToolDisposers || []) dispose()
         state.configuredToolsKey = key
         state.stableToolDisposers = stableBackgroundTools.filter(function (tool) {
+          const shared = sharedByName.get(tool.name)
+          if (shared && !sharedAllowed(shared, state.input)) return false
           const tasks = state.input.backgroundTasksSnapshot
-          if (tool.name === 'ledger_submit') return false // Retired, including legacy task snapshots.
+          if (tool.name === 'ledger_submit') return tasks?.ledger === true
           if (!tasks) return true
           if (tool.name === 'mvu_submit_update') return tasks.variables === true
           if (tool.name === 'posture_submit') return tasks.posture === true
@@ -237,9 +282,16 @@ export function createBackgroundAgentTask(options) {
       ? createCharacterDesignStage({ temperature: input.characterDesignTemperature })
       : null
     state.characterDesignStage = characterDesignStage
-    if (input.task === 'image') state.imageReadTask = async args => {
+    if (input.task === 'image') state.imageReadTask = async (args, execution) => {
       if (input.stopToolsWhen?.()) return JSON.stringify({ ok: false, error: '画面方案已提交，请结束本轮。' })
-      return str(await input.onToolCall({ name: CHARACTER_DESIGN_READ_TOOL.name, arguments: args }))
+      if (++toolCallCount > maxToolCalls) {
+        execution?.concludeTurn?.()
+        return JSON.stringify({ ok: false, retryable: false, message: '当前任务的工具调用次数已达上限，请结束本轮。' })
+      }
+      input.signal?.throwIfAborted()
+      const result = str(await input.onToolCall({ name: CHARACTER_DESIGN_READ_TOOL.name, arguments: args }))
+      if (toolCallCount >= maxToolCalls) execution?.concludeTurn?.()
+      return result
     }
     const maxToolCalls = Number.isInteger(input.maxToolCalls) && input.maxToolCalls > 0 ? input.maxToolCalls : 8
     let toolCallCount = 0
@@ -249,7 +301,8 @@ export function createBackgroundAgentTask(options) {
       state.activeToolTask = {
         async execute(tool, args, execution) {
           const shared = sharedByName.get(tool.name)
-          const current = allowed.get(tool.name) || (shared && shared.tool)
+          const permittedShared = sharedAllowed(shared, input)
+          const current = shared ? (permittedShared ? shared.tool : undefined) : allowed.get(tool.name)
           if (current === undefined) {
             return JSON.stringify({
               ok: false,
@@ -260,13 +313,13 @@ export function createBackgroundAgentTask(options) {
           if (typeof input.stopToolsWhen === 'function' && input.stopToolsWhen()) {
             return JSON.stringify({ ok: false, retryable: false, message: '当前任务已经提交完成，请结束本轮。' })
           }
-          if (current.countsTowardLimit !== false) {
-            toolCallCount++
-            if (toolCallCount > maxToolCalls) {
-              return JSON.stringify({ ok: false, retryable: false, message: input.toolLimitMessage || '当前任务的工具调用次数已达上限，请结束本轮。' })
-            }
+          toolCallCount++
+          if (toolCallCount > maxToolCalls) {
+            execution?.concludeTurn?.()
+            return JSON.stringify({ ok: false, retryable: false, message: input.toolLimitMessage || '当前任务的工具调用次数已达上限，请结束本轮。' })
           }
           const invoke = async function () {
+            input.signal?.throwIfAborted()
             return shared
               ? str(await shared.execute({ input, args, execution }))
               : str(await input.onToolCall({ name: tool.name, arguments: args }))
@@ -274,7 +327,7 @@ export function createBackgroundAgentTask(options) {
           const result = characterDesignStage
             ? str(await characterDesignStage.execute(tool.name, invoke))
             : await invoke()
-          if (typeof input.stopToolsWhen === 'function' && input.stopToolsWhen()) execution?.concludeTurn?.()
+          if (toolCallCount >= maxToolCalls || (typeof input.stopToolsWhen === 'function' && input.stopToolsWhen())) execution?.concludeTurn?.()
           return result
         }
       }
@@ -299,17 +352,17 @@ export function createBackgroundAgentTask(options) {
             render: function (_args, value) { return [{ type: 'text', text: value }] }
           },
           async execute(args, execution) {
-            if (tool.countsTowardLimit !== false) {
-              toolCallCount++
-              if (toolCallCount > maxToolCalls) {
-                return JSON.stringify({ message: input.toolLimitMessage || '已达到剧本查询上限，请停止查询，基于已有材料开始推理并输出最终候选。' })
-              }
+            toolCallCount++
+            if (toolCallCount > maxToolCalls) {
+              execution?.concludeTurn?.()
+              return JSON.stringify({ ok: false, retryable: false, message: input.toolLimitMessage || '已达到剧本查询上限，请停止查询，基于已有材料开始推理并输出最终候选。' })
             }
             const call = input.task === 'image' ? imageToolCall(tool.name, args, execution, sessionEvents(session), eventStart) : { name: tool.name, arguments: args }
-            const invoke = async function () { return str(await input.onToolCall(call)) }
+            const invoke = async function () { input.signal?.throwIfAborted(); return str(await input.onToolCall(call)) }
             const result = characterDesignStage
               ? str(await characterDesignStage.execute(tool.name, invoke))
               : await invoke()
+            if (toolCallCount >= maxToolCalls) execution?.concludeTurn?.()
             if (typeof input.stopToolsWhen === 'function') {
               const complete = input.stopToolsWhen()
               if (complete) execution?.concludeTurn?.()
@@ -327,10 +380,19 @@ export function createBackgroundAgentTask(options) {
 
   async function execute({ agent, state, traceSessionId, persistent }, input) {
     const runtimeInput = state.input
-    try { rewindBackgroundSurface(agent.session, input.rewindTo) }
-    catch (error) { console.warn('dsh-tavern: 后台历史回退未完成，继续当前任务:', str(error?.message || error)) }
+    try {
+      input.signal?.throwIfAborted()
+      rewindBackgroundSurface(agent.session, input.rewindTo)
+      // Assembly precedes agent/pre-step. Resolve the preset ancestors using
+      // the leased Agent before followup can assemble the first request.
+      state.agentScope = agent
+      state.refreshConfiguredTools?.()
+    } catch (error) { throw traceError(error, traceSessionId, input.task) }
+    const progress = createBackgroundProgress({ idleMs: options.modelIdleTimeoutMs, onCancel: () => { state.abandoned = true; agent.cancel?.({ kind: 'user' }) } })
+    state.progress = progress
+    runtimeInput.signal = input.signal ? AbortSignal.any([input.signal, progress.signal]) : progress.signal
     const removeTaskTools = installTaskTools(state, runtimeInput, agent.session)
-    const cancel = function () { agent.cancel?.({ kind: 'user' }) }
+    const cancel = () => progress.cancel()
     input.signal?.addEventListener('abort', cancel, { once: true })
 
     try {
@@ -342,9 +404,10 @@ export function createBackgroundAgentTask(options) {
       }
       {
         const existing = readSessionStablePrefix(agent.session)
-        const background = existing ? existing.text : typeof options.resolveStablePrefix === 'function'
+        const revision = typeof options.resolveStablePrefixRevision === 'function' ? await options.resolveStablePrefixRevision(input) : 0
+        const background = existing && revision <= Number(existing.message.source.cardContextRevision || 0) ? existing.text : typeof options.resolveStablePrefix === 'function'
           ? await options.resolveStablePrefix(input) : input.backgroundContext
-        const prefix = await ensureSessionStablePrefix(agent.session, background, options.stablePrefixStorage)
+        const prefix = await ensureSessionStablePrefix(agent.session, background, options.stablePrefixStorage, revision)
         if (prefix && prefix.event !== existing?.event && typeof options.flushSession === 'function') await options.flushSession(agent.session)
       }
       state.currentWorldbook = typeof options.resolveCurrentWorldbook === 'function'
@@ -356,8 +419,8 @@ export function createBackgroundAgentTask(options) {
         content: [{ type: 'text', text: backgroundPrompt(input.messages, input.turnContext, input.task, input.system, input) }],
         source: { kind: 'plugin', plugin: 'dsh-tavern' }
       })
-      await agent.whenIdle()
-      input.signal?.throwIfAborted()
+      await progress.wait(agent.whenIdle())
+      runtimeInput.signal.throwIfAborted()
       const rawResult = finalMessage(sessionEvents(agent.session), eventStart)
       if (rawResult === null) {
         const underlying = terminalError(sessionEvents(agent.session), eventStart)
@@ -374,6 +437,8 @@ export function createBackgroundAgentTask(options) {
     } catch (error) {
       throw traceError(error, traceSessionId, input.task)
     } finally {
+      progress.dispose()
+      state.progress = null
       input.signal?.removeEventListener('abort', cancel)
       await removeTaskTools()
     }

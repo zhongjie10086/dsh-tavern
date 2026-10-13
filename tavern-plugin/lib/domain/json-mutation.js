@@ -1,3 +1,4 @@
+import {isDeepStrictEqual} from 'node:util'
 function object(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
@@ -22,6 +23,17 @@ function assertPath(path) {
 function diffValue(before, after, path, changes) {
   if (Object.is(before, after)) return
   if (Array.isArray(before) && Array.isArray(after)) {
+    // Archives slide by dropping their oldest rows. Verify the whole overlap before
+    // emitting splices; IDs are only an inexpensive candidate selector.
+    if(before.length>1 && after.length>1 && before[0]?.id!==after[0]?.id && typeof after[0]?.id==='string'){
+      const offset=before.findIndex(row=>row?.id===after[0].id)
+      const overlap=offset>0?Math.min(before.length-offset,after.length):0
+      if(overlap>0 && isDeepStrictEqual(before.slice(offset,offset+overlap),after.slice(0,overlap))){
+        changes.push({op:'splice',path:clone(path),index:0,deleteCount:offset,items:[]})
+        changes.push({op:'splice',path:clone(path),index:overlap,deleteCount:before.length-offset-overlap,items:clone(after.slice(overlap))})
+        return
+      }
+    }
     const common = Math.min(before.length, after.length)
     for (let index = 0; index < common; index++) diffValue(before[index], after[index], path.concat(index), changes)
     if (after.length > before.length) {
@@ -79,7 +91,7 @@ function setValue(root, path, value) {
   if (path.length === 0) return clone(value)
   const parent = parentAt(root, path)
   if (parent === null || typeof parent !== 'object') throw new Error('JSON mutation 无法设置路径: ' + pathLabel(path))
-  parent[path[path.length - 1]] = clone(value)
+  Object.defineProperty(parent, path[path.length - 1], { value: clone(value), enumerable: true, writable: true, configurable: true })
   return root
 }
 
@@ -112,6 +124,36 @@ export function applyJsonChanges(input, changes) {
   for (const change of changes) {
     if (change === null || typeof change !== 'object') throw new Error('JSON mutation change 不合法')
     assertPath(change.path)
+    if (change.op === 'set') result = setValue(result, change.path, change.value)
+    else if (change.op === 'delete') result = deleteValue(result, change.path)
+    else if (change.op === 'splice') result = spliceValue(result, change)
+    else throw new Error('未知 JSON mutation op: ' + String(change.op))
+  }
+  return result
+}
+
+/** Copy only ancestors of modified paths; immutable untouched branches stay shared. */
+export function applyJsonChangesShared(input, changes) {
+  let result = input
+  const copied = new WeakSet()
+  const own = value => {
+    if (!value || typeof value !== 'object') throw new Error('JSON mutation 无法复制非对象路径')
+    if (copied.has(value)) return value
+    const next = Array.isArray(value) ? value.slice() : { ...value }
+    copied.add(next); return next
+  }
+  for (const change of changes) {
+    assertPath(change.path)
+    if (change.path.length === 0 && change.op === 'set') { result = clone(change.value); continue }
+    result = own(result)
+    let cursor = result
+    const depth = change.op === 'splice' ? change.path.length : change.path.length - 1
+    for (let i = 0; i < depth; i++) {
+      const key = change.path[i]
+      if (!Object.hasOwn(cursor, key)) throw new Error('JSON mutation 找不到路径: ' + pathLabel(change.path))
+      Object.defineProperty(cursor, key, {value:own(cursor[key]),enumerable:true,writable:true,configurable:true})
+      cursor = cursor[key]
+    }
     if (change.op === 'set') result = setValue(result, change.path, change.value)
     else if (change.op === 'delete') result = deleteValue(result, change.path)
     else if (change.op === 'splice') result = spliceValue(result, change)

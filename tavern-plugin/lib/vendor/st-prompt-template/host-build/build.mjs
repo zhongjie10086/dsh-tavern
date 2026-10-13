@@ -20,16 +20,23 @@ export async function buildTemplatePlugin({ dependencyRoot, outputPath }) {
     experiments: { outputModule: true },
     resolve: { extensions: ['.ts', '.js'], modules: [resolve(dependencyRoot, 'node_modules'), 'node_modules'] },
     module: { rules: [
+      { test: /code-editor\.ts$/, enforce: 'pre', use: {loader: resolve(here, 'editor-exports-loader.cjs')} },
       { test: /\.ts$/, exclude: /node_modules/, use: { loader: require.resolve('babel-loader'), options: { configFile: false, babelrc: false, presets: [require.resolve('@babel/preset-typescript')] } } },
       { test: /\.css$/, use: [require.resolve('style-loader'), require.resolve('css-loader')] }
     ] },
     plugins: [
+      new webpack.NormalModuleReplacementPlugin(/portable-sha256\.js$/, resource => {
+        if (resource.context === resolve(here, '../../../domain')) resource.request = resolve(here, '../../../domain/portable-sha256-browser.js')
+      }),
+      new webpack.NormalModuleReplacementPlugin(/regex-budget\.js$/, resource => {
+        if (resource.context === resolve(here, '../../../domain')) resource.request = resolve(here, '../../../domain/regex-budget-browser.js')
+      }),
       new webpack.NormalModuleReplacementPlugin(/^\.\.\//, resource => {
         if (!resource.context.startsWith(root)) return
         const target = resolve(resource.context, resource.request)
-        if (relative(root, target).startsWith('../')) resource.request = resolve(here, 'host.js')
+        if (relative(root, target).replaceAll('\\', '/').startsWith('../')) resource.request = resolve(here, 'host.js')
       }),
-      new MonacoPlugin({ monacoEditorPath: resolve(dependencyRoot, 'node_modules/monaco-editor'), languages: ['javascript'], customLanguages: [], filename: '[name].worker.js' })
+      new MonacoPlugin({ monacoEditorPath: resolve(dependencyRoot, 'node_modules/monaco-editor'), languages: ['javascript', 'typescript'], customLanguages: [], filename: '[name].worker.js' })
     ],
     optimization: { minimize: true }, performance: { hints: false }
   }

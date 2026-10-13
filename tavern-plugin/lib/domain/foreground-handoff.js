@@ -38,10 +38,14 @@ export function createForegroundHandoff(options = {}) {
     return await turns.prepare(input)
   }
 
-  function later(work, label) {
+  function later(work, label, input) {
     defer(function () {
-      Promise.resolve().then(work).catch(function (error) {
+      Promise.resolve().then(work).then(async function () {
+        await options.onSuccess?.(input, label)
+      }).catch(async function (error) {
         logger.error('dsh-tavern: ' + label + '失败', error && error.message || error)
+        try { await options.onError?.(input, label, error) }
+        catch (reportError) { logger.error('dsh-tavern: 后台失败提示未能送达', reportError?.message || reportError) }
       })
     })
   }
@@ -59,14 +63,17 @@ export function createForegroundHandoff(options = {}) {
         if (activity.role === 'settlement' && (activity.phase === 'pending' || activity.phase === 'running')) {
           await queueBackground(chat.id)
         }
-      }, '启动后台结算')
+      }, '启动后台结算', input)
       return true
     }
     later(async function () {
       const target = { sessionId: input.sessionId, turn: input.turn }
+      const chat = await store.chatForSession(input.sessionId)
+      if (chat?.nativeCommits?.[String(input.turn)]) return
       await turns.discard(target)
       if (cleanupFailedTurn !== null) await cleanupFailedTurn(target)
-    }, '清理未完成前台回合')
+      if (['aborted', 'interrupted'].includes(reason)) await options.onInterrupted?.(input, chat)
+    }, '清理未完成前台回合', input)
     return true
   }
 

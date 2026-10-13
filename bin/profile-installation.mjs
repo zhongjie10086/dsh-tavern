@@ -1,22 +1,20 @@
+import { prepareDesktopPackageManager } from './desktop-package-manager.mjs'
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { stopService } from './service-lifecycle.mjs'
 import { installCliRuntime, migrateCliHome } from './cli-runtime.mjs'
-import { assertCompatibleDshVersion, dshCompatibilityNotice } from './dsh-compatibility.mjs'
+import { ensureBrowserRuntime } from './browser-runtime.mjs'
+import { extractDshVersion, assertCompatibleDshVersion, dshCompatibilityNotice } from './dsh-compatibility.mjs'
 import { installPluginDependencies } from './plugin-dependencies.mjs'
 import { migrateLegacyTavernData, resolveTavernDataRoot } from '../tavern-plugin/lib/domain/tavern-data.js'
 import { ensureUserExtensions } from '../tavern-plugin/lib/domain/user-extensions.js'
 import { beginProfileConfigurationUpdate, loadProfileManifest, mergeProfileManifest, prepareProfilePatch, syncProfileDependencyPatches } from './profile-configuration.mjs'
 import { ensureSidebarDefaults } from './launcher-settings.mjs'
-import { INSTALL_HOSTS, SOURCE_ROOT, DSH_ROOT, LEGACY_DSH_ROOT, CLI_RUNTIME_ROOT, RUNTIME_HOST, PROFILE_DIR, LOG_DIR, SCRIPT_PATH, PROFILE, RELEASE_FILE, DEFAULT_COMMIT_URL, REQUIRED_SOURCE_FILES, findDshCommand, requireCommand, run, runDsh } from './launcher-environment.mjs'
+import { INSTALL_HOSTS, SOURCE_ROOT, DSH_ROOT, LEGACY_DSH_ROOT, CLI_RUNTIME_ROOT, RUNTIME_HOST, PROFILE_DIR, LOG_DIR, SCRIPT_PATH, PROFILE, RELEASE_FILE, DEFAULT_COMMIT_URL, REQUIRED_SOURCE_FILES, findDshCommand, requireCommand, run, runDsh, runtimeEnvironment } from './launcher-environment.mjs'
 
 // Own installation transaction and legacy-source discovery. Desktop never installs a CLI shim.
-export function extractDshVersion(output) {
-  const match = String(output || '').match(/\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/)
-  if (!match) throw new Error('无法识别当前 DSH 版本。')
-  return match[1]
-}
+export { extractDshVersion } from './dsh-compatibility.mjs'
 
 export function parseInstallHost(args = []) {
   let host = RUNTIME_HOST
@@ -212,11 +210,16 @@ export async function recordInstalledRelease(options = {}) {
 }
 
 export async function installProfile(host = RUNTIME_HOST) {
+  const packageManager = await prepareDesktopPackageManager({ host, home: DSH_ROOT, onProgress: console.log })
+  if (packageManager) {
+    const key = Object.keys(process.env).find(key => key.toLowerCase() === 'path') || 'PATH'
+    process.env[key] = packageManager.bin + path.delimiter + (process.env[key] || '')
+  }
   requireCommand('node', '请安装 Node.js 22.19 或更高版本')
   requireCommand('pnpm', '请运行 npm install -g pnpm')
   verifySource()
   if (host === 'cli' && existsSync(path.join(LOG_DIR, 'tavern.pid.json'))) await stopService()
-  if (host === 'cli' && migrateCliHome({ source: LEGACY_DSH_ROOT, target: DSH_ROOT })) {
+  if (host === 'cli' && migrateCliHome({ source: LEGACY_DSH_ROOT, target: DSH_ROOT, sourceRoot: SOURCE_ROOT })) {
     console.log(`已复制旧 CLI 配置与游戏数据到 ${DSH_ROOT}；原数据保持不变。`)
   }
   const runtime = host === 'cli' ? installCliRuntime({ root: CLI_RUNTIME_ROOT, run }) : null
@@ -252,27 +255,19 @@ export async function installProfile(host = RUNTIME_HOST) {
     for (const backup of Object.values(transaction.backups)) {
       if (backup !== null) console.log(`已备份原配置：${backup}`)
     }
-    try {
+    await finishProfileInstallation({ transaction, runtime, complete: async () => {
       const workspaceText = readFileSync(path.join(SOURCE_ROOT, 'pnpm-workspace.yaml'), 'utf8')
       copyFileSync(path.join(SOURCE_ROOT, 'pnpm-workspace.yaml'), path.join(PROFILE_DIR, 'pnpm-workspace.yaml'))
       syncProfileDependencyPatches({ sourceRoot: SOURCE_ROOT, profileDir: PROFILE_DIR, workspaceText })
       run('pnpm', ['install'], { cwd: PROFILE_DIR })
+      if(host!=='android')ensureBrowserRuntime({sourceRoot:SOURCE_ROOT,env:runtimeEnvironment()})
       runDsh(dsh, ['--profile', PROFILE, '--dump-config'], { host })
-      ensureSidebarDefaults()
-      transaction.commit()
-    } catch (error) {
-      await transaction.rollback()
-      throw error
-    }
-    if (host === 'cli') installCommand()
-    try {
-      await recordInstalledRelease()
-    } catch (error) {
-      console.warn(`未能记录安装提交号，不影响本次安装：${String(error?.message || error)}`)
-    }
-
-    writeFileSync(path.join(SOURCE_ROOT, '.dsh-tavern-local.json'), JSON.stringify({ host, dshHome: DSH_ROOT }) + '\n')
-    runtime?.commit()
+      await ensureSidebarDefaults()
+      if (host === 'cli' && process.env.DSH_TAVERN_SKIP_COMMAND_INSTALL !== '1') installCommand()
+      writeFileSync(path.join(SOURCE_ROOT, '.dsh-tavern-local.json'), JSON.stringify({ host, dshHome: DSH_ROOT }) + '\n')
+    } })
+    try { await recordInstalledRelease() }
+    catch (error) { console.warn('未能记录安装提交号，不影响本次安装：' + String(error?.message || error)) }
     console.log('DSH Tavern 已安装。')
     console.log(host === 'cli' ? `已安装独立 DSH ${dshVersion}：${CLI_RUNTIME_ROOT}；不使用全局 DSH。` : `已复用当前 DSH ${dshVersion} 的本地依赖；未升级或降级宿主。`)
     if (host === 'desktop') {
@@ -289,4 +284,14 @@ export async function installProfile(host = RUNTIME_HOST) {
     runtime?.rollback()
     throw error
   }
+}
+
+// Keep the manifest rollback available until every required installation step succeeds.
+export async function finishProfileInstallation({ transaction, runtime, complete, warn = console.warn }) {
+  try { await complete() }
+  catch (error) { await transaction.rollback(); throw error }
+  transaction.commit()
+  // Runtime commit settles first; a backup cleanup failure must not undo a valid pair.
+  try { runtime?.commit() }
+  catch (error) { warn('安装已完成，旧运行时备份清理失败并保留：' + String(error?.message || error)) }
 }

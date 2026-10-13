@@ -1,13 +1,26 @@
 import { spawn, spawnSync } from 'node:child_process'
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import net from 'node:net'
 import { resolveDshCliEntry } from './plugin-dependencies.mjs'
 import path from 'node:path'
+import { newServiceControl, requestServiceStop } from './service-control.mjs'
+import { createDurableFilePromotion } from '../tavern-plugin/lib/durable-file-promotion.js'
 import { migrateSessionPrefixEvents } from './session-prefix-migration.mjs'
+import { upgradeNativeTavernSessions } from './native-session-upgrade.mjs'
 import { ensureSidebarDefaults } from './launcher-settings.mjs'
-import { PROFILE_DIR, PID_FILE, PROFILE, SOURCE_ROOT, CLI_PORT, CLI_HOST, LOG_DIR, LOG_FILE, DSH_ROOT, FRONTEND_BOOTSTRAP_FILE, FRONTEND_BOOTSTRAP_VERSION, commandExists, runtimeEnvironment, RUNTIME_HOST, findDshCommand, resolveDshInvocation, sleep } from './launcher-environment.mjs'
+import { startupTimeoutMs, waitForServiceStartup } from './service-startup.mjs'
+import { PROFILE_DIR, PID_FILE, SERVICE_FILE, PROFILE, SOURCE_ROOT, CLI_PORT, CLI_HOST, LOG_DIR, LOG_FILE, DSH_ROOT, FRONTEND_BOOTSTRAP_FILE, FRONTEND_BOOTSTRAP_VERSION, commandExists, runtimeEnvironment, RUNTIME_HOST, findDshCommand, resolveDshInvocation, sleep } from './launcher-environment.mjs'
 
 // Own process identity, readiness, shutdown, and validated browser access.
+const lifecycleLocks = createDurableFilePromotion()
+const serviceFiles = createDurableFilePromotion({ mode: 0o600 })
+export function serviceEnvironment(environment = runtimeEnvironment()) {
+  const previous = String(environment.NODE_OPTIONS || '').replace(/(?:^|\s)--max[-_]old[-_]space[-_]size(?:=|\s+)\d+/g, '').trim()
+  let heapMiB=8192
+  const config=path.join(environment.DSH_HOME||DSH_ROOT,'profile-data','tavern','data','capacity-settings.json')
+  if(existsSync(config))try{const value=JSON.parse(readFileSync(config,'utf8'))?.process?.nodeHeapMiB;if(Number.isSafeInteger(value)&&value>0)heapMiB=value}catch(error){console.warn('dsh-tavern: 容量配置无法读取，使用默认堆上限',String(error.message||error))}
+  return {...environment, NODE_OPTIONS:[previous, '--max-old-space-size='+heapMiB].filter(Boolean).join(' ')}
+}
 export function webUrlFromLogChunk(source) {
   const matches = [...String(source || '').matchAll(/^dsh web: (https?:\/\/\S+)$/gm)]
   return matches.length > 0 ? matches[matches.length - 1][1] : ''
@@ -47,25 +60,44 @@ export function browserOpenCommand(url, platform = process.platform) {
   return { command: 'xdg-open', args: [url] }
 }
 
-function openBrowserTarget(url) {
+async function openBrowserTarget(url) {
   const target = browserOpenCommand(url)
-  const child = spawn(target.command, target.args, { detached: true, stdio: 'ignore', windowsHide: true })
-  child.on('error', function () {})
-  child.unref()
+  await new Promise((resolve, reject) => {
+    const child = spawn(target.command, target.args, { detached: true, stdio: 'ignore', windowsHide: true })
+    const timer = setTimeout(() => {
+      child.unref()
+      fail('等待系统响应超时，未能确认打开结果')
+    }, 5000)
+    const fail = detail => {
+      clearTimeout(timer)
+      reject(new Error(`无法自动打开浏览器（${detail}）。请复制上方完整地址，在浏览器中手动打开。`))
+    }
+    child.once('error', error => fail(error.code || '启动失败'))
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer)
+      if (code === 0) resolve()
+      else fail(signal || `退出码 ${code}`)
+    })
+  })
 }
 
 export function needsFrontendBootstrap(record, requiredVersion = FRONTEND_BOOTSTRAP_VERSION) {
   return !record || Number(record.version) < requiredVersion
 }
 
-export function bootstrapFrontendOnce(state) {
+export async function bootstrapFrontendOnce(state) {
   if (!state?.webUrl) return false
   if (process.env.DSH_TAVERN_NO_OPEN === '1') return false
   let record = null
   try { record = JSON.parse(readFileSync(FRONTEND_BOOTSTRAP_FILE, 'utf8')) } catch {}
   if (!needsFrontendBootstrap(record)) return false
   const target = restartBrowserTarget(state.port, state.runtimeGeneration, state.webUrl)
-  openBrowserTarget(target)
+  try {
+    await openBrowserTarget(target)
+  } catch (error) {
+    console.warn(error.message)
+    return false
+  }
   mkdirSync(LOG_DIR, { recursive: true })
   writeFileSync(FRONTEND_BOOTSTRAP_FILE, `${JSON.stringify({ version: FRONTEND_BOOTSTRAP_VERSION, completedAt: new Date().toISOString() }, null, 2)}\n`)
   console.log(`已一次性打开新版前端：${target}`)
@@ -78,22 +110,39 @@ function verifyProfile() {
   }
 }
 
-function readPidRecord() {
-  if (!existsSync(PID_FILE)) return null
+async function readPidRecord() {
   try {
-    const record = JSON.parse(readFileSync(PID_FILE, 'utf8'))
+    const bytes = await serviceFiles.read(PID_FILE)
+    if (bytes === undefined) return null
+    const record = JSON.parse(bytes.toString('utf8'))
     return Number.isInteger(record.pid) && record.pid > 0 ? record : null
   } catch {
     return null
   }
 }
 
-function writePidRecord(pid, port, logOffset) {
-  writeFileSync(PID_FILE, `${JSON.stringify({ pid, port, logOffset, profile: PROFILE, source: SOURCE_ROOT, startedAt: new Date().toISOString() }, null, 2)}\n`)
+async function writePidRecord(pid, port, logOffset, control) {
+  await serviceFiles.write(PID_FILE, `${JSON.stringify({ pid, port, logOffset, profile: PROFILE, source: SOURCE_ROOT, startedAt: new Date().toISOString(), ...(control ? { control } : {}) }, null, 2)}\n`)
 }
 
-function removePidRecord() {
-  if (existsSync(PID_FILE)) unlinkSync(PID_FILE)
+async function removePidRecord(expectedPid) {
+  if ((await readPidRecord())?.pid === expectedPid) await serviceFiles.remove(PID_FILE)
+}
+
+function validPort(value) { return Number.isSafeInteger(value) && value >= 1 && value <= 65535 }
+
+async function savedServicePort() {
+  const bytes = await serviceFiles.read(SERVICE_FILE)
+  if (bytes === undefined) return null
+  let record
+  try { record = JSON.parse(bytes.toString('utf8')) } catch { throw new Error('服务端口记录损坏：' + SERVICE_FILE) }
+  if (record.version !== 1) throw new Error('不支持的服务端口记录版本：' + record.version)
+  if (!validPort(record.port)) throw new Error('服务端口记录无效：' + SERVICE_FILE)
+  return record.port
+}
+
+async function rememberServicePort(port) {
+  await serviceFiles.write(SERVICE_FILE, JSON.stringify({ version: 1, port }) + '\n')
 }
 
 function isProcessAlive(pid) {
@@ -130,14 +179,18 @@ export async function isServiceReady(port, request = fetch, host = process.env.D
 }
 
 async function serviceState() {
-  const port = CLI_PORT
-  const record = readPidRecord()
+  const record = await readPidRecord()
+  let saved = await savedServicePort()
+  if (saved === null && validPort(record?.port)) { saved = record.port; await rememberServicePort(saved) }
   const pidAlive = Boolean(record && isProcessAlive(record.pid))
-  const portOpen = await isPortOpen(port)
+  const port = pidAlive && validPort(record.port) ? record.port : String(process.env.DSH_TAVERN_PORT || '').trim() ? CLI_PORT : saved ?? CLI_PORT
+  const occupiedPorts = []
+  for (const known of new Set([port, saved, record?.port].filter(validPort))) if (await isPortOpen(known)) occupiedPorts.push(known)
+  const portOpen = occupiedPorts.includes(port)
   const ready = portOpen && await isServiceReady(port)
-  if (record && !pidAlive) removePidRecord()
+  if (record && !pidAlive) await removePidRecord(record.pid)
   const legacyRecord = !pidAlive && portOpen ? findLegacyService(port) : null
-  return { port, record: pidAlive ? record : legacyRecord, portOpen, ready }
+  return { port, record: pidAlive ? record : legacyRecord, portOpen, ready, occupiedPorts }
 }
 
 function findLegacyService(port) {
@@ -195,28 +248,35 @@ export async function openService() {
   const url = await currentServiceWebUrl(state)
   printServiceWebUrl(url)
   if (!url) { process.exitCode = 1; return }
-  openBrowserTarget(url)
+  await openBrowserTarget(url)
 }
 
-export async function stopService() {
+export async function stopService({ force = false } = {}) {
   verifyProfile()
+  return lifecycleLocks.withLock(path.join(LOG_DIR, 'tavern.start'), () => stopServiceLocked(force), { waitMs: 35_000 })
+}
+
+async function stopServiceLocked(force) {
   const state = await serviceState()
   if (!state.record) {
-    if (state.portOpen) {
-      throw new Error(`端口 ${state.port} 已被未识别的进程占用，拒绝停止。`)
+    if (state.occupiedPorts.length) {
+      throw new Error(`端口 ${state.occupiedPorts.join(', ')} 已被未识别的进程占用，拒绝停止。`)
     }
     console.log('DSH Tavern 已停止。')
     return
   }
 
   if (process.platform === 'win32') {
-    const result = spawnSync('taskkill', ['/PID', String(state.record.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
-    if (result.status !== 0 && isProcessAlive(state.record.pid)) {
-      throw new Error(`无法停止 DSH Tavern 进程：PID ${state.record.pid}。`)
+    if (!force) await requestServiceStop(state.record)
+    else {
+      const result = spawnSync('taskkill', ['/PID', String(state.record.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+      if (result.status !== 0 && isProcessAlive(state.record.pid)) {
+        throw new Error(`无法停止 DSH Tavern 进程：PID ${state.record.pid}。`)
+      }
     }
   } else {
     try {
-      process.kill(state.record.pid, 'SIGTERM')
+      process.kill(state.record.pid, force ? 'SIGKILL' : 'SIGTERM')
     } catch (error) {
       if (error?.code !== 'ESRCH') throw error
     }
@@ -224,18 +284,22 @@ export async function stopService() {
 
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (!(await isPortOpen(state.port)) && !isProcessAlive(state.record.pid)) {
-      removePidRecord()
+      await rememberServicePort(state.port)
+      await removePidRecord(state.record.pid)
       console.log('DSH Tavern 已停止。')
       return
     }
     await sleep(100)
   }
-  throw new Error(`服务未能在 10 秒内停止；没有强制结束进程，请手动检查 PID ${state.record.pid}。`)
+  throw new Error(`服务未能在 10 秒内停止；${force ? '已请求强制结束' : '没有强制结束进程'}，请手动检查 PID ${state.record.pid}。`)
 }
 
 export async function startService() {
   verifyProfile()
-  ensureSidebarDefaults()
+  return lifecycleLocks.withLock(path.join(LOG_DIR, 'tavern.start'), startServiceLocked, { waitMs: 35_000 })
+}
+
+async function startServiceLocked() {
   const state = await serviceState()
   if (state.record && state.ready) {
     console.log(`DSH Tavern 已经在运行：PID ${state.record.pid}。`)
@@ -246,25 +310,31 @@ export async function startService() {
   if (state.record) {
     throw new Error(`已有 DSH Tavern 进程正在启动：PID ${state.record.pid}。`)
   }
-  if (state.portOpen) {
-    throw new Error(`端口 ${state.port} 已被其他进程占用，拒绝启动。`)
+  if (state.occupiedPorts.length) {
+    throw new Error(`端口 ${state.occupiedPorts.join(', ')} 已被其他进程占用，拒绝启动。`)
   }
+
+  await ensureSidebarDefaults()
 
   const prefixRepairs = await migrateSessionPrefixEvents({
     sessionsRoot: path.join(DSH_ROOT, 'profile-data', PROFILE, 'sessions'),
     backupRoot: path.join(DSH_ROOT, 'backups', 'tavern-stable-prefix-v1'),
+    quarantineRoot: path.join(DSH_ROOT, 'recovery', 'session-prefix'),
   })
   if (prefixRepairs.length) console.log(`已兼容修复 ${prefixRepairs.length} 份旧会话的固定背景事件，原文件已备份。`)
 
   const runtimeHost = RUNTIME_HOST
   const dsh = findDshCommand(runtimeHost)
+  const nativeUpgrade = await upgradeNativeTavernSessions({ root: path.join(DSH_ROOT, 'profile-data', PROFILE), dshEntry: () => resolveDshCliEntry({ dsh }) })
+  if (nativeUpgrade.upgraded) console.log('已升级 ' + nativeUpgrade.upgraded + ' 份旧会话至 DSH v3，原存档备份：' + nativeUpgrade.backup)
   const invocation = resolveDshInvocation(
     dsh,
-    ['--profile', PROFILE, '--host', CLI_HOST, '--port', String(CLI_PORT), '--no-open'],
+    ['--profile', PROFILE, '--host', CLI_HOST, '--port', String(state.port), '--no-open'],
     runtimeHost,
   )
-  if (process.platform === 'win32') {
-    invocation.args = [resolveDshCliEntry({ dsh }), ...invocation.args]
+  const control = process.platform === 'win32' ? newServiceControl() : undefined
+  if (control) {
+    invocation.args = ['--import', new URL('./service-control.mjs', import.meta.url).href, resolveDshCliEntry({ dsh }), ...invocation.args]
     invocation.command = process.execPath
   }
   mkdirSync(LOG_DIR, { recursive: true })
@@ -276,7 +346,7 @@ export async function startService() {
       cwd: SOURCE_ROOT,
       // Track the actual Node service, not a cmd shim that can exit separately.
       detached: true,
-      env: runtimeEnvironment(),
+      env: { ...serviceEnvironment(), ...(control ? { DSH_TAVERN_SERVICE_CONTROL: JSON.stringify(control) } : {}) },
       shell: false,
       windowsHide: true,
       stdio: ['ignore', logDescriptor, logDescriptor],
@@ -289,29 +359,33 @@ export async function startService() {
     closeSync(logDescriptor)
   }
   child.unref()
-  writePidRecord(child.pid, state.port, logOffset)
+  await writePidRecord(child.pid, state.port, logOffset, control)
 
-  for (let attempt = 0; attempt < 150; attempt += 1) {
-    if (await isPortOpen(state.port) && await isServiceReady(state.port)) {
-      let webUrl = ''
-      for (let logAttempt = 0; logAttempt < 50 && webUrl === ''; logAttempt += 1) {
-        const logChunk = readFileSync(LOG_FILE).subarray(logOffset).toString('utf8')
-        webUrl = webUrlFromLogChunk(logChunk)
-        if (webUrl === '') await sleep(100)
-      }
-      webUrl = await currentServiceWebUrl({ port: state.port, record: { logOffset } })
-      console.log(`DSH Tavern 已启动：PID ${child.pid}`)
-      printServiceWebUrl(webUrl)
-      console.log(`日志：${LOG_FILE}`)
-      return { port: state.port, runtimeGeneration: `${child.pid}-${Date.now()}`, webUrl }
-    }
-    if (!isProcessAlive(child.pid)) {
-      removePidRecord()
-      const log = existsSync(LOG_FILE) ? readFileSync(LOG_FILE, 'utf8').trim().split('\n').slice(-30).join('\n') : ''
-      throw new Error(`DSH Tavern 启动失败。${log ? `\n最近日志：\n${log}` : ''}`)
-    }
-    await sleep(200)
+  const exited = () => child.exitCode !== null || child.signalCode !== null || !isProcessAlive(child.pid)
+  async function startupFailed() {
+    await removePidRecord(child.pid)
+    const log = existsSync(LOG_FILE) ? readFileSync(LOG_FILE, 'utf8').trim().split('\n').slice(-30).join('\n') : ''
+    return new Error(`DSH Tavern 启动失败。${log ? `\n最近日志：\n${log}` : ''}`)
   }
-
-  throw new Error(`DSH Tavern 启动超时，日志：${LOG_FILE}`)
+  // A Windows cold start can exceed 30 s; an exited process still fails at once. (upstream 10750ba1)
+  const timeoutMs = startupTimeoutMs(RUNTIME_HOST)
+  try {
+    await waitForServiceStartup({
+      timeoutMs,
+      alive: () => !exited(),
+      onSlow: () => console.log(`DSH Tavern 仍在初始化（首次启动较慢），最多等待 ${timeoutMs / 1000} 秒……`),
+      ready: async () => Boolean(webUrlFromLogChunk(readFileSync(LOG_FILE).subarray(logOffset).toString('utf8')))
+        && await isPortOpen(state.port) && await isServiceReady(state.port)
+    })
+  } catch (error) {
+    if (exited()) throw await startupFailed()
+    throw new Error(`${error.message}，日志：${LOG_FILE}`, { cause: error })
+  }
+  const webUrl = await currentServiceWebUrl({ port: state.port, record: { logOffset } })
+  if (exited()) throw await startupFailed()
+  await rememberServicePort(state.port)
+  console.log(`DSH Tavern 已启动：PID ${child.pid}`)
+  printServiceWebUrl(webUrl)
+  console.log(`日志：${LOG_FILE}`)
+  return { port: state.port, runtimeGeneration: `${child.pid}-${Date.now()}`, webUrl }
 }

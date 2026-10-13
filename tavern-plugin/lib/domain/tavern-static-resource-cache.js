@@ -1,7 +1,11 @@
 import { projectTavernHostScript } from './tavern-host-script-projection.js'
+import {createRemoteCacheBudget} from './remote-cache-budget.js'
+import {retentionFile,applyRetentionFiles} from './retention-policy.js'
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, stat, unlink, utimes, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { validateOutboundUrl, safeOutboundFetch, readBoundedResponse } from './outbound-network-policy.js'
+import {parse} from 'acorn'
 
 const DEFAULT_MAX_ENTRY_BYTES = 64 * 1024 * 1024
 const DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024
@@ -15,11 +19,11 @@ function cacheKey(url) {
   return createHash('sha256').update(url, 'utf8').digest('hex')
 }
 
-export function normalizeCacheableResourceUrl(value) {
+export function normalizeCacheableResourceUrl(value, policy = {}) {
   let parsed
   try { parsed = new URL(str(value)) } catch { throw new Error('静态资源 URL 无效') }
-  if (parsed.protocol !== 'https:') throw new Error('只缓存 HTTPS 静态资源')
   if (parsed.username !== '' || parsed.password !== '') throw new Error('静态资源 URL 不能包含凭据')
+  validateOutboundUrl(parsed.href,policy)
   parsed.hash = ''
   return parsed.href
 }
@@ -39,49 +43,68 @@ function fallbackMediaType(url) {
   })[extension] || 'application/octet-stream'
 }
 
-function localResourceUrl(url) {
-  return '/api/dsh-tavern/static-assets?url=' + encodeURIComponent(url)
+function localResourceUrl(url,scriptId='') {
+  return '/api/dsh-tavern/static-assets?url=' + encodeURIComponent(url) + (scriptId ? '&scriptId=' + encodeURIComponent(scriptId) : '')
 }
 
 function absoluteCacheUrl(specifier, baseUrl) {
   return localResourceUrl(new URL(specifier, baseUrl).href)
 }
 
-export function rewriteCachedModuleImports(source, baseUrl) {
-  const rewrite = function (_match, prefix, quote, specifier) {
-    if (!specifier.startsWith('/') && !/^https:\/\//i.test(specifier)) return _match
-    const absolute = new URL(specifier, baseUrl).href
-    return prefix + quote + localResourceUrl(absolute) + quote
+export function rewriteCachedModuleImports(source, baseUrl, scriptId='') {
+  const projected=projectTavernHostScript(str(source)),edits=[]
+  let ast
+  // Preserve unsupported syntax for the browser's own diagnostic. Rewriting
+  // apparent imports inside ordinary strings/comments can corrupt valid code.
+  try{ast=parse(projected,{ecmaVersion:'latest',sourceType:'module',allowReturnOutsideFunction:true})}catch{}
+  const urlLike=value=>typeof value==='string'&&/^(?:\.{1,2}\/|\/|https?:\/\/)/i.test(value)
+  const literal=node=>node?.type==='Literal'?node.value:node?.type==='TemplateLiteral'&&!node.expressions.length?node.quasis[0].value.cooked:undefined
+  function rewrite(node){const value=literal(node);if(urlLike(value))edits.push({start:node.start,end:node.end,text:JSON.stringify(localResourceUrl(new URL(value,baseUrl).href,scriptId))})}
+  const nodes=ast?[ast]:[]
+  while(nodes.length){const node=nodes.pop()
+    if(node.type==='ImportDeclaration'||node.type==='ExportAllDeclaration'||node.type==='ExportNamedDeclaration'&&node.source)rewrite(node.source)
+    if(node.type==='ImportExpression'){
+      if(literal(node.source)!==undefined)rewrite(node.source)
+      else edits.push({start:node.source.start,end:node.source.start,text:'globalThis.__dshTavernResolveModuleSpecifier(('},{start:node.source.end,end:node.source.end,text:'),'+JSON.stringify(baseUrl)+')'})
+    }
+    if(node.type==='MemberExpression'&&!node.computed&&node.object.type==='MetaProperty'&&node.object.meta.name==='import'&&node.property.name==='url')edits.push({start:node.start,end:node.end,text:JSON.stringify(baseUrl)})
+    for(const value of Object.values(node)){if(Array.isArray(value)){for(const child of value)if(child?.type)nodes.push(child)}else if(value?.type)nodes.push(value)}
   }
-  return projectTavernHostScript(str(source))
-    .replace(/(\bfrom\s*|\bimport\s*)(["'])(\/[^"']+|https:\/\/[^"']+)\2/g, rewrite)
-    .replace(/(\bimport\s*\(\s*)(["'])(\/[^"']+|https:\/\/[^"']+)\2/g, rewrite)
+  let rewritten=projected
+  for(const edit of edits.sort((a,b)=>b.start-a.start||b.end-a.end))rewritten=rewritten.slice(0,edit.start)+edit.text+rewritten.slice(edit.end)
+  return rewritten + (scriptId ? '\n//# sourceURL=dsh-tavern-script:' + encodeURIComponent(scriptId) + '\n' : '')
 }
 
 function rewriteStylesheetUrls(source, baseUrl) {
-  const urls = str(source).replace(/(url\(\s*)(["']?)([^"')\s]+)\2(\s*\))/gi, function (_match, prefix, quote, specifier, suffix) {
-    if (/^(?:data:|blob:|#|var\()/i.test(specifier) || /^https?:/i.test(specifier) && !/^https:/i.test(specifier)) return _match
+  const urls = str(source).replace(/(url\(\s*)(?:(["'])(.*?)\2|([^"')]+?))(\s*\))/gi, function (_match, prefix, quote, quoted, bare, suffix) {
+    const specifier=(quoted??bare).trim();quote ||= ''
+    if (/^(?:data:|blob:|#|var\()/i.test(specifier)) return _match
     return prefix + quote + absoluteCacheUrl(specifier, baseUrl) + quote + suffix
   })
   return urls.replace(/(@import\s+)(["'])([^"']+)\2/gi, function (_match, prefix, quote, specifier) {
-    if (/^(?:data:|blob:|#)/i.test(specifier) || /^https?:/i.test(specifier) && !/^https:/i.test(specifier)) return _match
+    if (/^(?:data:|blob:|#)/i.test(specifier)) return _match
     return prefix + quote + absoluteCacheUrl(specifier, baseUrl) + quote
   })
 }
 
 function rewriteHtmlResourceAttributes(source, baseUrl) {
+  function project(specifier){
+    if(!specifier||/^(?:[a-z][\w+.-]*:(?!\/\/)|#|\/api\/dsh-tavern\/)/i.test(specifier))return specifier
+    const decoded=specifier.replace(/&(?:amp|#38|#x26);/gi,'&')
+    return absoluteCacheUrl(decoded,baseUrl)
+  }
   const rewritten = str(source)
-    .replace(/(\b(?:src|poster)\s*=\s*)(["'])(\/[^"']+|https:\/\/[^"']+)\2/gi, function (_match, prefix, quote, specifier) {
-      return prefix + quote + absoluteCacheUrl(specifier, baseUrl) + quote
+    .replace(/(\s(?:src|poster)\s*=\s*)(["'])([^"']*)\2/gi, function (_match, prefix, quote, specifier) {
+      return prefix + quote + project(specifier) + quote
     })
-    .replace(/(<link\b[^>]*\bhref\s*=\s*)(["'])(\/[^"']+|https:\/\/[^"']+)\2/gi, function (_match, prefix, quote, specifier) {
-      return prefix + quote + absoluteCacheUrl(specifier, baseUrl) + quote
+    .replace(/(<link\b[^>]*\shref\s*=\s*)(["'])([^"']*)\2/gi, function (_match, prefix, quote, specifier) {
+      return prefix + quote + project(specifier) + quote
     })
-    .replace(/(\s(?:src|poster)\s*=\s*)(\/[^\s"'`<>]+|https:\/\/[^\s"'`<>]+)/gi, function (_match, prefix, specifier) {
-      return prefix + '"' + absoluteCacheUrl(specifier, baseUrl) + '"'
+    .replace(/(\s(?:src|poster)\s*=\s*)([^\s"'`<>]+)/gi, function (_match, prefix, specifier) {
+      return prefix + '"' + project(specifier) + '"'
     })
-    .replace(/(<link\b[^>]*\shref\s*=\s*)(\/[^\s"'`<>]+|https:\/\/[^\s"'`<>]+)/gi, function (_match, prefix, specifier) {
-      return prefix + '"' + absoluteCacheUrl(specifier, baseUrl) + '"'
+    .replace(/(<link\b[^>]*\shref\s*=\s*)([^\s"'`<>]+)/gi, function (_match, prefix, specifier) {
+      return prefix + '"' + project(specifier) + '"'
     })
   return rewritten.replace(/<(?:video|audio|source)\b[^>]*>/gi, function (tag) {
     return tag.replace(/(\ssrc\s*=\s*)(["'])(\/api\/dsh-tavern\/static-assets\?url=([^"']+))\2/gi, function (_match, prefix, quote, proxy, url) {
@@ -101,6 +124,11 @@ function rewriteHtmlStyles(source, baseUrl) {
 }
 
 function rewriteHtmlDocumentResources(source, baseUrl) {
+  // Some published card pages wrap the entire HTML document in a Markdown
+  // fence. Normalize only that complete wrapper in the served projection;
+  // cached source bytes and their integrity hash remain unchanged.
+  const fenced = str(source).trim().match(/^```(?:html)?\s*\r?\n([\s\S]*?)\r?\n```$/i)
+  if (fenced && /^\s*(?:<!doctype\s+html\b|<html\b)/i.test(fenced[1])) source = fenced[1]
   const scripts = []
   let marker = '__DSH_TAVERN_SCRIPT_'
   while (str(source).includes(marker)) marker = '_' + marker
@@ -115,16 +143,26 @@ function rewriteHtmlDocumentResources(source, baseUrl) {
   })
 }
 
-export function projectCachedResourceBody(asset) {
+export function cachedResourceMediaType(asset) {
   let mediaType = str(asset && asset.mediaType).toLowerCase()
   let extension = ''
   try { extension = path.extname(new URL(asset.finalUrl || asset.url).pathname).toLowerCase() } catch {}
   if (mediaType === 'text/plain' && (extension === '.js' || extension === '.mjs')) mediaType = 'application/javascript'
   if (mediaType === 'text/plain' && extension === '.css') mediaType = 'text/css'
   if (mediaType === 'text/plain' && (extension === '.html' || extension === '.htm')) mediaType = 'text/html'
+  return mediaType
+}
+
+export function assertModuleResourceType(asset) {
+  const type=cachedResourceMediaType(asset)
+  if(!/^(?:(?:text|application)\/(?:javascript|ecmascript)|application\/json)$/.test(type))throw Object.assign(Error('脚本模块返回了不支持的内容类型：'+String(type).slice(0,120)),{status:415,code:'RESOURCE_MODULE_TYPE'})
+}
+
+export function projectCachedResourceBody(asset, {scriptId=''}={}) {
+  const mediaType = cachedResourceMediaType(asset)
   const body = Buffer.isBuffer(asset && asset.body) ? asset.body : Buffer.from(asset && asset.body || '')
   if (mediaType === 'application/javascript' || mediaType === 'text/javascript') {
-    return Buffer.from(rewriteCachedModuleImports(body.toString('utf8'), asset.finalUrl || asset.url), 'utf8')
+    return Buffer.from(rewriteCachedModuleImports(body.toString('utf8'), asset.finalUrl || asset.url,scriptId), 'utf8')
   }
   if (mediaType === 'text/css') {
     return Buffer.from(rewriteStylesheetUrls(body.toString('utf8'), asset.finalUrl || asset.url), 'utf8')
@@ -142,54 +180,53 @@ async function quietlyDelete(file) {
 
 export function createTavernStaticResourceCache(options = {}) {
   const rootDir = path.resolve(str(options.rootDir) || '.dsh-tavern-static-assets')
-  const request = options.fetch || globalThis.fetch
+  const request = (url, init, policy) => safeOutboundFetch(url, init, { ...policy,fetcher: options.fetch, lookup: options.lookup,maxDecodedBytes:maxEntryBytes })
   const maxEntryBytes = Math.max(1, Number(options.maxEntryBytes) || DEFAULT_MAX_ENTRY_BYTES)
   const maxTotalBytes = Math.max(maxEntryBytes, Number(options.maxTotalBytes) || DEFAULT_MAX_TOTAL_BYTES)
   const verifyHostname = typeof options.verifyHostname === 'function' ? options.verifyHostname : async function () {}
   const inflight = new Map()
+  const temporaryFiles = new Set()
+  const budget=options.budget||createRemoteCacheBudget({maxBytes:maxTotalBytes})
 
-  function paths(url) {
-    const key = cacheKey(url)
+  function paths(url,policy={}) {
+    const key = cacheKey(url+(policy.trustedResource?'\ntrusted-resource':''))
     return { key, body: path.join(rootDir, key + '.body'), metadata: path.join(rootDir, key + '.json') }
   }
 
-  async function read(url) {
-    const files = paths(url)
+  async function read(url,policy={}) {
+    normalizeCacheableResourceUrl(url,policy)
+    const files = paths(url,policy)
     try {
       const metadata = JSON.parse(await readFile(files.metadata, 'utf8'))
       if (metadata.version !== CACHE_VERSION || metadata.url !== url) return null
+      normalizeCacheableResourceUrl(metadata.finalUrl || url,policy)
       const body = await readFile(files.body)
       if (body.length !== metadata.bytes || createHash('sha256').update(body).digest('hex') !== metadata.contentHash) return null
       const now = new Date()
-      void Promise.allSettled([utimes(files.body, now, now), utimes(files.metadata, now, now)])
+      await Promise.allSettled([utimes(files.body, now, now), utimes(files.metadata, now, now)])
       return { url, finalUrl: metadata.finalUrl || url, body, mediaType: metadata.mediaType, bytes: body.length, cachedAt: metadata.cachedAt, cache: 'hit' }
     } catch {
       return null
     }
   }
 
-  async function trim() {
-    let entries
-    try { entries = (await readdir(rootDir)).filter(function (name) { return name.endsWith('.body') }) } catch { return }
-    const rows = []
-    let total = 0
-    for (const name of entries) {
-      try {
-        const info = await stat(path.join(rootDir, name))
-        rows.push({ name, size: info.size, mtimeMs: info.mtimeMs })
-        total += info.size
-      } catch {}
-    }
-    rows.sort(function (left, right) { return left.mtimeMs - right.mtimeMs })
-    for (const row of rows) {
-      if (total <= maxTotalBytes) break
-      const key = row.name.slice(0, -'.body'.length)
-      await Promise.all([quietlyDelete(path.join(rootDir, row.name)), quietlyDelete(path.join(rootDir, key + '.json'))])
-      total -= row.size
-    }
-  }
+  budget.register('static-assets',{
+    async entries(){
+      let names;try{names=await readdir(rootDir)}catch(error){if(error.code==='ENOENT')return [];throw error}
+      const rows=[]
+      const hashes=new Set(names.filter(name=>/^[a-f0-9]{64}\.(?:body|json)$/.test(name)).map(name=>name.slice(0,64)))
+      for(const hash of hashes){
+        const body=await retentionFile(rootDir,hash+'.body','remote-cache-lru'),metadata=await retentionFile(rootDir,hash+'.json','remote-cache-lru'),files=[body,metadata].filter(Boolean)
+        if(files.length)rows.push({key:hash+'.body',bytes:files.reduce((sum,file)=>sum+file.bytes,0),lastUsed:Math.max(...files.map(file=>Number(file.stamp.split(':')[1])/1e6)),files})
+      }
+      for(const name of names.filter(name=>/^[a-f0-9]{64}\.(?:body|json)\.\d+\.\d+$/.test(name)&&!temporaryFiles.has(name))){const file=await retentionFile(rootDir,name,'interrupted-cache-download');if(file)rows.push({key:name,bytes:file.bytes,lastUsed:0,files:[file]})}
+      return rows
+    },
+    async remove(row){const result=await applyRetentionFiles(rootDir,row.files,{dryRun:false});return result.skipped.length===0}
+  })
+  const trim=options=>budget.trim(options)
 
-  async function download(url) {
+  async function download(url,policy) {
     if (typeof request !== 'function') throw new Error('当前运行环境不能下载静态资源')
     let currentUrl = url
     let response
@@ -199,23 +236,25 @@ export function createTavernStaticResourceCache(options = {}) {
         headers: { Accept: '*/*', 'User-Agent': 'dsh-tavern-static-cache' },
         redirect: 'manual',
         signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(30000) : undefined
-      })
+      },policy)
       if (!response || ![301, 302, 303, 307, 308].includes(Number(response.status))) break
+      await response.body?.cancel?.()
       const location = str(response.headers && response.headers.get && response.headers.get('location'))
       if (location === '') throw new Error('静态资源重定向缺少目标地址')
-      currentUrl = normalizeCacheableResourceUrl(new URL(location, currentUrl).href)
+      currentUrl = normalizeCacheableResourceUrl(new URL(location, currentUrl).href,policy)
       if (redirectCount === 5) throw new Error('静态资源重定向次数过多')
     }
-    if (!response || response.ok !== true) throw new Error('静态资源下载失败（HTTP ' + str(response && response.status) + '）')
-    const finalUrl = normalizeCacheableResourceUrl(response.url || currentUrl)
+    if (!response || response.ok !== true) throw Object.assign(new Error('静态资源下载失败（HTTP ' + str(response && response.status) + '）'),{status:Number(response?.status)>=400&&Number(response?.status)<=599?Number(response.status):502})
+    const finalUrl = normalizeCacheableResourceUrl(response.url || currentUrl,policy)
     const declaredBytes = Number(response.headers && response.headers.get && response.headers.get('content-length')) || 0
     if (declaredBytes > maxEntryBytes) throw new Error('静态资源超过单文件缓存上限')
-    const body = Buffer.from(await response.arrayBuffer())
+    const body = await readBoundedResponse(response, maxEntryBytes, '静态资源')
     if (body.length > maxEntryBytes) throw new Error('静态资源超过单文件缓存上限')
     const mediaType = str(response.headers && response.headers.get && response.headers.get('content-type')).split(';')[0].trim().toLowerCase() || fallbackMediaType(finalUrl)
     if (!supportedMediaType(mediaType)) throw new Error('不支持缓存的静态资源类型: ' + mediaType)
+    if(policy.module)assertModuleResourceType({url,finalUrl,mediaType})
     await mkdir(rootDir, { recursive: true })
-    const files = paths(url)
+    const files = paths(url,policy)
     const suffix = '.' + process.pid + '.' + Date.now()
     const metadata = {
       version: CACHE_VERSION,
@@ -226,27 +265,45 @@ export function createTavernStaticResourceCache(options = {}) {
       contentHash: createHash('sha256').update(body).digest('hex'),
       cachedAt: Date.now()
     }
-    await writeFile(files.body + suffix, body)
-    await writeFile(files.metadata + suffix, JSON.stringify(metadata), 'utf8')
-    await rename(files.body + suffix, files.body)
-    await rename(files.metadata + suffix, files.metadata)
+    const temporaries=[files.body+suffix,files.metadata+suffix]
+    for(const file of temporaries)temporaryFiles.add(path.basename(file))
+    try{
+      await writeFile(temporaries[0], body)
+      await writeFile(temporaries[1], JSON.stringify(metadata), 'utf8')
+      await rename(temporaries[0], files.body)
+      await rename(temporaries[1], files.metadata)
+    }finally{
+      try{await Promise.all(temporaries.map(file=>unlink(file).catch(error=>{if(error.code!=='ENOENT')throw error})))}
+      finally{for(const file of temporaries)temporaryFiles.delete(path.basename(file))}
+    }
     await trim()
     return { url, finalUrl, body, mediaType, bytes: body.length, cachedAt: metadata.cachedAt, cache: 'miss' }
   }
 
-  async function get(value) {
-    const url = normalizeCacheableResourceUrl(value)
-    const cached = await read(url)
-    if (cached) return cached
-    if (inflight.has(url)) return await inflight.get(url)
-    const pending = download(url).finally(function () { inflight.delete(url) })
-    inflight.set(url, pending)
+  async function get(value,policy={}) {
+    const url = normalizeCacheableResourceUrl(value,policy)
+    const cached = await read(url,policy)
+    if (cached) {let valid=true;if(policy.module)try{assertModuleResourceType(cached)}catch{valid=false}if(valid)return cached}
+    const key=paths(url,policy).key
+    if (inflight.has(key)) return await inflight.get(key)
+    const pending = download(url,policy).finally(function () { inflight.delete(key) })
+    inflight.set(key, pending)
     return await pending
   }
 
-  async function warm(urls) {
-    return await Promise.allSettled(Array.from(new Set(urls || [])).map(get))
+  async function warm(urls,policy={}) {
+    return await Promise.allSettled(Array.from(new Set(urls || [])).map(url=>get(url,policy)))
   }
 
-  return Object.freeze({ get, read, warm, rootDir })
+  async function restoreArchive(record) {
+    const policy={trustedResource:record.trustedResource===true},url=normalizeCacheableResourceUrl(record.url,policy),finalUrl=normalizeCacheableResourceUrl(record.finalUrl||url,policy),body=Buffer.from(record.body,'base64')
+    if(body.length!==record.bytes||body.length>maxEntryBytes||createHash('sha256').update(body).digest('hex')!==record.contentHash||!supportedMediaType(record.mediaType))throw Error('搬家包静态缓存校验失败')
+    if(await read(url,policy))return
+    const files=paths(url,policy),suffix='.'+process.pid+'.'+Date.now(),metadata={version:CACHE_VERSION,url,finalUrl,bytes:body.length,contentHash:record.contentHash,mediaType:record.mediaType,cachedAt:record.cachedAt||Date.now()}
+    await mkdir(rootDir,{recursive:true})
+    const temporaries=[files.body+suffix,files.metadata+suffix];for(const file of temporaries)temporaryFiles.add(path.basename(file))
+    try{await writeFile(temporaries[0],body);await writeFile(temporaries[1],JSON.stringify(metadata));await rename(temporaries[0],files.body);await rename(temporaries[1],files.metadata)}
+    finally{for(const file of temporaries){await unlink(file).catch(error=>{if(error.code!=='ENOENT')throw error});temporaryFiles.delete(path.basename(file))}}
+  }
+  return Object.freeze({ get, read, warm, trim, rootDir, restoreArchive })
 }

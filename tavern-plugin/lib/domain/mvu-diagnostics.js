@@ -1,9 +1,10 @@
+import {createRollingDiagnosticStorage} from './rolling-diagnostics.js'
 import { createHash } from 'node:crypto'
 
 const MAX_RECORD_BYTES = 32768
 const MAX_STORE_BYTES = 2 * 1024 * 1024
 const MAX_EXPORT_BYTES = 32 * 1024 * 1024
-const secretKey = /^(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|token|password|secret|client[-_]?secret)$/i
+const secretKey = /^(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|approval[-_]?token|token|password|secret|client[-_]?secret)$/i
 
 export function redactDiagnostic(value, depth = 0) {
   if (depth > 24) return '[depth limit]'
@@ -15,7 +16,7 @@ export function redactDiagnostic(value, depth = 0) {
     .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, '[REDACTED]')
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[REDACTED]@')
     .replace(/([?&](?:token|key|api_key|apiKey|access_token|auth|secret|password)=)[^\s&#"'<>]*/gi, '$1[REDACTED]')
-    .replace(/((?:api[-_]?key|access[-_]?token|password|secret|authorization)["']?\s*[=:]\s*["']?)[^\s,;"'<>]+/gi, '$1[REDACTED]')
+    .replace(/((?:api[-_]?key|access[-_]?token|approval[-_]?token|password|secret|authorization)["']?\s*[=:]\s*["']?)[^\s,;"'<>]+/gi, '$1[REDACTED]')
   if (Array.isArray(value)) return value.map(item => redactDiagnostic(item, depth + 1))
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, secretKey.test(key) ? '[REDACTED]' : redactDiagnostic(item, depth + 1)]))
   return value
@@ -36,8 +37,12 @@ export function sanitizeModuleFailure(value) {
   }
 }
 
+export function boundedRuntimeDiagnostics(value) {
+  const rows=Array.isArray(value)?value:[],control=item=>['card-mvu-deferred-v1','card-mvu-stale-v1','mvu-validation-deferred'].includes(item?.kind)
+  return [...rows.filter(item=>!control(item)),...rows.filter(control)].slice(-50)
+}
 export function sanitizeRuntimeDiagnostics(value) {
-  return redactDiagnostic((Array.isArray(value) ? value : []).slice(-50).map(item => ({
+  return redactDiagnostic(boundedRuntimeDiagnostics(value).map(item => ({
     kind: String(item?.kind || '').slice(0, 40), name: String(item?.name || '').slice(0, 100),
     level: item?.level === 'error' ? 'error' : 'warn',
     ready: item?.ready === true, subscribed: item?.subscribed === true, initializationFailed: item?.initializationFailed === true,
@@ -60,7 +65,7 @@ export function sanitizeMvuLoadDiagnostic(value) {
   if (!value || !phases.includes(value.phase)) return null
   const result = { phase: value.phase }
   if (value.phase === 'initialization-timing') {
-    const stages = new Set(['companion-barrier', 'variable-initialized', 'companion-module', 'worldbook-read', 'prompt-write', 'message-write', 'variable-write', 'script-callback', 'prompt-drain'])
+    const stages = new Set(['dependencies', 'script-source', 'companion-barrier', 'variable-initialized', 'companion-module', 'worldbook-read', 'prompt-write', 'message-write', 'variable-write', 'script-callback', 'prompt-drain'])
     const number = n => Number.isSafeInteger(n) && n >= 0 ? n : 0
     result.timings = { elapsedMs: number(value.timings?.elapsedMs), dropped: number(value.timings?.dropped),
       entries: (Array.isArray(value.timings?.entries) ? value.timings.entries : []).slice(0, 32).filter(row => stages.has(row?.stage)).map(row => ({
@@ -69,7 +74,7 @@ export function sanitizeMvuLoadDiagnostic(value) {
       })) }
   }
 
-  for (const [key, limit] of Object.entries({ loadId: 100, contentType: 120, bodyKind: 40, errorName: 80,
+  for (const [key, limit] of Object.entries({ loadId: 100, scriptId:200, scriptName:200, stage:40, contentType: 120, bodyKind: 40, errorName: 80,
     message: 2000, serverError: 2000, browser: 120, platform: 40, runtimeMode: 20, failureStep: 40 })) {
     if (typeof value[key] === 'string') result[key] = redactMvuLoadError(value[key], limit)
   }
@@ -91,6 +96,7 @@ function bounded(value) {
 
 /** Independent diagnostics: never rewrite chat state or append model-visible messages. */
 export function createMvuDiagnosticStore(storage, { maxRecords = 200 } = {}) {
+  storage = createRollingDiagnosticStorage(storage)
   maxRecords = Math.max(1, Math.min(200, Number(maxRecords) || 200))
   const path = id => 'diagnostics/mvu-' + createHash('sha256').update(String(id)).digest('hex') + '.json'
   return {
@@ -138,7 +144,7 @@ export function diagnosticZip(entries) {
   return Buffer.concat([...local, directory, end])
 }
 
-export async function createMvuDiagnosticExport({ cardDiagnostics, performanceDiagnostics, updateDiagnostics, sessionId, backgroundSessionIds = [], store, sessions, persistence, query, attachments, sceneDiagnostics, compatibilityDiagnostics, apiDiagnostics, displayDiagnostics, environment = {} }) {
+export async function createMvuDiagnosticExport({ sourceDiagnostics, cardDiagnostics, performanceDiagnostics, updateDiagnostics, sessionId, backgroundSessionIds = [], store, sessions, persistence, query, attachments, sceneDiagnostics, compatibilityDiagnostics, apiDiagnostics, displayDiagnostics, environment = {} }) {
   const notes = ['包含对话文本、附件与变量信息，分享前请检查隐私。凭据已尽力脱敏。MVU 记录有容量限制，旧故障不会被追溯补录。']
   notes.push('mvu/diagnostics.json 中 stage=regeneration-target 是正文重新生成的目标定位证据：记录失败分支、消息结构、轮次和会话绑定摘要，不记录正文或指导意见；只对更新后再次操作生效。')
   notes.push('stage=script-runtime 的 moduleFailure 记录模块加载失败原因、最多 8 个脚本引用及同期浏览器可见的失败资源和 HTTP 状态；引用和同期资源不等于完整失败依赖链。跨域资源可能不提供状态；unknown 不代表断网。URL 不含凭据和查询参数，不记录脚本或响应体。仅更新后再次失败才会记录。')
@@ -184,8 +190,20 @@ export async function createMvuDiagnosticExport({ cardDiagnostics, performanceDi
   for (const id of ids) {
     try {
       const live = sessions?.get(id)
-      if (live) await sessions.flush(live)
-      const raw = await persistence?.readRaw(id)
+      if (live && typeof sessions.flush === 'function') await sessions.flush(live)
+      let raw
+      if (typeof persistence?.open === 'function') {
+        // Native v3 exposes validated logical events through a read handle.
+        // Flush writers first; never claim write ownership or change their log.
+        await persistence.flush?.()
+        const handle = await persistence.open(id, 'read')
+        try {
+          const { events } = await handle.read(0)
+          const header = { type: 'session', ...handle.header, inheritedEventCount: handle.inheritedEventCount }
+          raw = { content: [header, ...events].map(row => JSON.stringify(row)).join('\n') + '\n' }
+          notes.push('Session ' + id + ' 由宿主只读接口导出逻辑日志，非原始文件字节；继承事件数：' + handle.inheritedEventCount)
+        } finally { await handle.close() }
+      } else if (typeof persistence?.readRaw === 'function') raw = await persistence.readRaw(id)
       if (!raw) { notes.push('缺失 Session 日志：' + id); continue }
       if (bytes + Buffer.byteLength(raw.content) > logLimit) { notes.push('容量限制，跳过 Session 日志：' + id); continue }
       const content = raw.content.split('\n').map(line => {
@@ -205,6 +223,7 @@ export async function createMvuDiagnosticExport({ cardDiagnostics, performanceDi
       bytes += image.data.length
     } catch { notes.push('附件读取失败：' + id) }
   }
+  if (sourceDiagnostics?.length) entries.push({ path:'session-source-diagnostics.json',content:JSON.stringify(sourceDiagnostics.slice(0,100)) })
   if (cardBytes) entries.push({ path: 'card/context.json', content: cardContent })
   entries.push({ path: 'mvu/diagnostics.json', content: JSON.stringify(redactDiagnostic(await store.read(sessionId))) })
   entries.push({ path: 'mvu/environment.json', content: JSON.stringify(redactDiagnostic(environment), null, 2) })

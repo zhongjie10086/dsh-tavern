@@ -1,10 +1,20 @@
 // Tavern Helper injection state belongs to one chat and follows its checkpoints.
 // DSH applies in_chat prompts to the next native Frame, never to old messages.
-export function mutateScriptPrompts(chat, operation = {}) {
+export const SCRIPT_PROMPT_LIMITS = Object.freeze({count:512,contentBytes:256*1024,totalBytes:8*1024*1024})
+export function assertScriptPromptBudget(prompts,limits=SCRIPT_PROMPT_LIMITS) {
+  if (!Array.isArray(prompts) || prompts.length > limits.count) throw new TypeError('注入提示词最多 '+limits.count+' 条')
+  let total = 0
+  for (const prompt of prompts) {
+    if (!prompt || typeof prompt.content !== 'string' || Buffer.byteLength(prompt.content) > limits.contentBytes || (prompt.id !== undefined && (typeof prompt.id !== 'string' || prompt.id.length > 256))) throw new TypeError('单条注入提示词最多 '+(limits.contentBytes/1024)+' KiB，ID 最多 256 字符')
+    total += Buffer.byteLength(JSON.stringify(prompt))
+    if (total > limits.totalBytes) throw new TypeError('本局注入提示词合计超过 '+(limits.totalBytes/1024**2)+' MiB')
+  }
+}
+export function mutateScriptPrompts(chat, operation = {},limits=SCRIPT_PROMPT_LIMITS) {
   if (operation.kind === 'batch') {
     if (!Array.isArray(operation.operations) || operation.operations.length > 64 || operation.operations.some(item => !item || !['inject', 'remove'].includes(item.kind))) throw new TypeError('无效的提示词批次')
     const draft = { tavernScriptPrompts: chat.tavernScriptPrompts || [] }
-    for (const item of operation.operations) mutateScriptPrompts(draft, item)
+    for (const item of operation.operations) mutateScriptPrompts(draft, item,limits)
     const changed = JSON.stringify(draft.tavernScriptPrompts) !== JSON.stringify(chat.tavernScriptPrompts || [])
     if (changed) chat.tavernScriptPrompts = draft.tavernScriptPrompts
     return changed
@@ -14,12 +24,12 @@ export function mutateScriptPrompts(chat, operation = {}) {
     if (!Array.isArray(operation.ids) || operation.ids.some(id => typeof id !== 'string')) throw new TypeError('提示词 ID 必须是字符串数组')
     for (const id of operation.ids) current.delete(id)
   } else if (operation.kind === 'inject') {
-    if (!Array.isArray(operation.prompts)) throw new TypeError('提示词必须是数组')
+    assertScriptPromptBudget(operation.prompts,limits)
     const normalized = operation.prompts.map(prompt => {
       if (!prompt || typeof prompt.id !== 'string' || !prompt.id || typeof prompt.content !== 'string') throw new TypeError('提示词需要 id 和 content')
-      if (!['in_chat', 'none'].includes(prompt.position)) throw new TypeError('不支持的提示词位置')
+      if (!['in_chat', 'none', 'before_system', 'after_system', 'before_prompt', 'after_prompt'].includes(prompt.position)) throw new TypeError('不支持的提示词位置')
       if (!['system', 'user', 'assistant'].includes(prompt.role)) throw new TypeError('无效的提示词角色')
-      const depth = prompt.position === 'none' && prompt.depth === undefined ? 0 : prompt.depth
+      const depth = prompt.position !== 'in_chat' && prompt.depth === undefined ? 0 : prompt.depth
       if (!Number.isSafeInteger(depth) || depth < 0) throw new TypeError('提示词 depth 必须是非负整数')
       if (prompt.filter !== undefined) throw new Error('DSH 暂不支持提示词 filter 回调')
       return { id: prompt.id, content: prompt.content, position: prompt.position, role: prompt.role,
@@ -28,6 +38,7 @@ export function mutateScriptPrompts(chat, operation = {}) {
     for (const prompt of normalized) current.set(prompt.id, prompt)
   } else throw new TypeError('未知提示词操作')
   const next = Array.from(current.values())
+  if (operation.kind === 'inject') assertScriptPromptBudget(next,limits)
   const previous = chat.tavernScriptPrompts || []
   const fields = ['id', 'content', 'position', 'role', 'depth', 'should_scan', 'once']
   const changed = previous.length !== next.length || next.some((prompt, index) =>
@@ -36,14 +47,16 @@ export function mutateScriptPrompts(chat, operation = {}) {
   return changed
 }
 
-export function scriptPromptScanText(chat) {
+export function scriptPromptScanText(chat,limits=SCRIPT_PROMPT_LIMITS) {
+  assertScriptPromptBudget(chat?.tavernScriptPrompts || [],limits)
   return (chat?.tavernScriptPrompts || []).filter(prompt => prompt.should_scan !== false).map(prompt => prompt.content).join('\n')
 }
 
-export function scriptPromptFrameInputs(chat) {
-  return (chat?.tavernScriptPrompts || []).filter(prompt => prompt.position === 'in_chat').map(prompt => ({
+export function scriptPromptFrameInputs(chat,limits=SCRIPT_PROMPT_LIMITS) {
+  assertScriptPromptBudget(chat?.tavernScriptPrompts || [],limits)
+  return (chat?.tavernScriptPrompts || []).filter(prompt => prompt.position !== 'none').map(prompt => ({
     kind: 'foreground.guide', text: prompt.content, required: true,
-    source: { stage: 'tavern-script-prompt', id: prompt.id, role: prompt.role, depth: prompt.depth }
+    source: { stage: 'tavern-script-prompt', id: prompt.id, role: prompt.role, depth: prompt.depth, ...(prompt.once === true ? { once: true } : {}) }
   }))
 }
 

@@ -5,12 +5,15 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
-  dsh-better-sidebar@0.17.1: 7a52a0f297b795762438b7490834078a77e43b6075146b4a6297fc3d80bd1d1f
+  dsh-better-sidebar@0.17.1: a25ab402136a13de0895ae66ea52be4a31dc86d34839fcecc71c207f32452b69
 
 importers:
 
   .:
     dependencies:
+      '@chevrotain/regexp-to-ast':
+        specifier: 11.2.0
+        version: 11.2.0
       '@jitl/quickjs-singlefile-mjs-release-sync':
         specifier: 0.32.0
         version: 0.32.0
@@ -22,7 +25,7 @@ importers:
         version: 11.2.0
       dsh-better-sidebar:
         specifier: 0.17.1
-        version: 0.17.1(patch_hash=7a52a0f297b795762438b7490834078a77e43b6075146b4a6297fc3d80bd1d1f)
+        version: 0.17.1(patch_hash=a25ab402136a13de0895ae66ea52be4a31dc86d34839fcecc71c207f32452b69)
       dsh-tavern-plugin:
         specifier: link:./tavern-plugin
         version: link:tavern-plugin
@@ -38,9 +41,15 @@ importers:
       mathjs:
         specifier: 12.4.3
         version: 12.4.3
+      playwright-core:
+        specifier: 1.62.1
+        version: 1.62.1
       quickjs-emscripten-core:
         specifier: 0.32.0
         version: 0.32.0
+      sql.js:
+        specifier: 1.14.1
+        version: 1.14.1
       yaml:
         specifier: 2.9.0
         version: 2.9.0
@@ -694,6 +703,11 @@ packages:
   path-data-parser@0.1.0:
     resolution: {integrity: sha512-NOnmBpt5Y2RWbuv0LMzsayp3lVylAHLPUTut412ZA3l+C4uw4ZVkQbjShYCQ8TCpUMdPapr4YjUqLYD6v68j+w==}
 
+  playwright-core@1.62.1:
+    resolution: {integrity: sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw==}
+    engines: {node: '>=20'}
+    hasBin: true
+
   points-on-curve@0.2.0:
     resolution: {integrity: sha512-0mYKnYYe9ZcqMCWhUjItv/oHjvgEsfKvnUTg8sAtnHr3GVy7rGkXCb6d5cSyqrWqL4k81b9CPg3urd+T7aop3A==}
 
@@ -728,6 +742,9 @@ packages:
 
   seedrandom@3.0.5:
     resolution: {integrity: sha512-8OwmbklUNzwezjGInmZ+2clQmExQPvomqjL7LFqOYqtmuxRgQYqOD3mHaU+MvZn5FLUeVxVfQjwLZW/n/JFuqg==}
+
+  sql.js@1.14.1:
+    resolution: {integrity: sha512-gcj8zBWU5cFsi9WUP+4bFNXAyF1iRpA3LLyS/DP5xlrNzGmPIizUeBggKa8DbDwdqaKwUcTEnChtd2grWo/x/A==}
 
   style-mod@4.1.3:
     resolution: {integrity: sha512-i/n8VsZydrugj3Iuzll8+x/00GH2vnYsk1eomD8QiRrSAeW6ItbCQDtfXCeJHd0iwiNagqjQkvpvREEPtW3IoQ==}
@@ -1479,7 +1496,7 @@ snapshots:
     optionalDependencies:
       '@types/trusted-types': 2.0.7
 
-  dsh-better-sidebar@0.17.1(patch_hash=7a52a0f297b795762438b7490834078a77e43b6075146b4a6297fc3d80bd1d1f):
+  dsh-better-sidebar@0.17.1(patch_hash=a25ab402136a13de0895ae66ea52be4a31dc86d34839fcecc71c207f32452b69):
     dependencies:
       '@codemirror/commands': 6.11.0
       '@codemirror/lang-cpp': 6.0.3
@@ -1624,6 +1641,8 @@ snapshots:
 
   path-data-parser@0.1.0: {}
 
+  playwright-core@1.62.1: {}
+
   points-on-curve@0.2.0: {}
 
   points-on-path@0.2.1:
@@ -1660,6 +1679,8 @@ snapshots:
       cosmokit: 1.8.1
 
   seedrandom@3.0.5: {}
+
+  sql.js@1.14.1: {}
 
   style-mod@4.1.3: {}
 

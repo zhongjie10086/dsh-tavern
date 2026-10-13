@@ -2,7 +2,8 @@
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
-    text: ''
+    prefix: ''
+    suffix: ''
     includeRuntimeContext: false
 
 # 卡片模式复用 dsh-base 提供的一次性 bash／pwsh 与文件编辑能力；
@@ -13,8 +14,8 @@
   isolate:
     fs: true
   config:
-    - id: fs-local
-      name: '@deepseek-ai/dsh-fs-local'
+    - id: fs-sandbox
+      name: '@deepseek-ai/dsh-fs-sandbox'
       config:
         cwd: !!js process.env.DSH_CWD ?? process.cwd()
 
@@ -23,17 +24,8 @@
       config:
         maxOutputChars: 16000
 
-# 卡片工作台复用 DSH 原生 Skill 目录和按需加载工具。
-# 只扫描 Tavern 自己的内置目录与用户数据目录，不暴露全局 DSH Skills；
-# 是否对模型可见，仍由 Tavern 按当前会话模式过滤。
-- id: skill-filesystem
-  name: '@deepseek-ai/dsh-skill-filesystem'
-  config:
-    includeDefaultRoots: false
-    customSkillDirs:
-      - !!js "process.getBuiltinModule('node:path').resolve(process.env.DSH_HOME || process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:os').homedir(), '.dsh'), 'profile-data', 'tavern', 'data', 'skills')"
-    bundledSkillDir: !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('skills/', baseUrl))"
-
+# Tavern 在宿主注册按 Agent 用途和本局开关过滤的原生 Skill provider。
+# 原生按需加载工具保留；全局 DSH Skill 目录不会进入此列表。
 - id: tool-skill
   name: '@deepseek-ai/dsh-tool-skill'
 

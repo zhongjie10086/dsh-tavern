@@ -72,7 +72,10 @@ function replaceFormatted(scopes, _substring, prefix, type, path) {
   const rendered = typeof value === 'string'
     ? value
     : YAML.stringify(value, { blockQuote: 'literal' }).trimEnd()
-  return prefix + rendered.replaceAll('\n', '\n' + ' '.repeat(prefix.length))
+  const indent = Math.min(prefix.length, 256)
+  const lines = rendered.split('\n').length - 1
+  if (rendered.length + prefix.length + lines * indent > 8*1024*1024) throw new Error('格式化变量超过 8 MiB 字符预算')
+  return prefix + rendered.replaceAll('\n', '\n' + ' '.repeat(indent))
 }
 
 /**
@@ -82,14 +85,17 @@ function replaceFormatted(scopes, _substring, prefix, type, path) {
 export function renderTavernHelperVariableMacros(value, scopes = {}) {
   let replacements = 0
   let text = typeof value === 'string' ? value : String(value ?? '')
+  if (text.length > 8*1024*1024 || (text.match(/\{\{(?:format|get)_(?:message|chat|character|preset|global)_variable::/gi) || []).length > 512) throw new Error('变量宏超过 8 MiB 字符或 512 次展开预算')
+  let expandedChars = text.length
+  function withinBudget(value, original) { expandedChars += value.length - original.length; if (expandedChars > 8*1024*1024) throw new Error('变量宏展开超过 8388608 字符'); return value }
   text = text.replace(/\{\{get_(message|chat|character|preset|global)_variable::(.*?)\}\}/gi, function (_substring, type, path) {
     replacements += 1
     const result = macroValue(scopes, type, path)
-    return typeof result === 'string' ? result : JSON.stringify(result)
+    return withinBudget(typeof result === 'string' ? result : JSON.stringify(result) ?? 'undefined', _substring)
   })
   replacements += Array.from(text.matchAll(/\{\{format_(?:message|chat|character|preset|global)_variable::.*?\}\}/gi)).length
   text = text.replace(/^(.*)\{\{format_(message|chat|character|preset|global)_variable::(.*?)\}\}/gim, function (...args) {
-    return replaceFormatted(scopes, ...args.slice(0, 4))
+    return withinBudget(replaceFormatted(scopes, ...args.slice(0, 4)), args[0])
   })
   return { text, replacements }
 }

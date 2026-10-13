@@ -8,6 +8,7 @@ function str(value) {
 
 function macroSnapshot(value = {}) {
   return {
+    ...(value.pickSeed?{pickSeed:value.pickSeed}:{}),
     userName: str(value.userName) || '你',
     local: Object.assign({}, value.local && typeof value.local === 'object' ? value.local : {}),
     global: Object.assign({}, value.global && typeof value.global === 'object' ? value.global : {})
@@ -17,15 +18,18 @@ function macroSnapshot(value = {}) {
 function macroProjection(value, options = {}) {
   const state = macroSnapshot(options.macroState)
   const rendered = renderTavernMacros(str(value), {
+    chatId:options.chatId||state.pickSeed,
     charName: str(options.charName),
     userName: state.userName,
     localVariables: state.local,
-    globalVariables: state.global
+    globalVariables: state.global,
+    lastUserMessage: options.lastUserMessage, lastCharMessage: options.lastCharMessage, lastMessage: options.lastMessage
   })
   return {
     text: rendered.text,
     diagnostics: rendered.diagnostics,
     macroState: {
+      ...(state.pickSeed?{pickSeed:state.pickSeed}:{}),
       userName: state.userName,
       local: rendered.localVariables,
       global: rendered.globalVariables
@@ -128,6 +132,7 @@ export function resolveRuntimeMacroText(value, options = {}) {
 }
 
 /** Project one model reply for visible story/UI presentation. */
+export const createRuntimeDisplayProjector=options=>projectReplyHistory.createProjector(options)
 export function projectRuntimeReply(value, options = {}) {
   return projectReplyLayers(value, options)
 }

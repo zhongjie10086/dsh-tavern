@@ -1,3 +1,4 @@
+import {createRollingDiagnosticStorage} from './rolling-diagnostics.js'
 import { createHash } from 'node:crypto'
 import { redactDiagnostic } from './mvu-diagnostics.js'
 
@@ -30,6 +31,7 @@ function bounded(record) {
 /** Bounded attempt journal. Separate from paid job state: a failed diagnostic
  * write is never permission to retry a provider request. */
 export function createSceneImageDiagnostics(store, { onDiagnostic } = {}) {
+  store = createRollingDiagnosticStorage(store)
   return {
     async record(chatId, value, secrets = []) {
       if (!chatId || !value?.requestId || !value.targetKey) return

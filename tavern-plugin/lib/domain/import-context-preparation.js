@@ -1,6 +1,9 @@
+import { decodeTavernSource } from './session-message-source.js'
+import { appendTavernEvent } from './session-message-source.js'
 import { sessionEvents } from './session-events.js'
 
 const PLUGIN = 'dsh-tavern-context-window'
+const isImported = (message, operationId) => Boolean(message?.id?.startsWith('tavern-import:' + operationId + ':') || message?.source?.importSource?.operationId === operationId)
 const eventMessage = event => event.type === 'user/message' ? event.data : event.type === 'assistant/message' ? event.data.message : null
 
 export function needsImportContextPreparation(chat) {
@@ -15,10 +18,10 @@ function importedRounds(session, operationId) {
   let pending = null
   for (const seq of session.surface.nodes) {
     const event = bySeq.get(seq), message = eventMessage(event)
-    const imported = message?.source?.importSource?.operationId === operationId
+    const imported = isImported(message, operationId)
     if (event.type === 'user/message' && imported) pending = { seqs: [], ids: [] }
     if (!pending) continue
-    if (!imported && message?.source?.form !== 'foreground-frame') { pending = null; continue }
+    if (!imported && decodeTavernSource(message?.source)?.form !== 'foreground-frame') { pending = null; continue }
     pending.seqs.push(seq)
     pending.ids.push(message.id)
     if (event.type === 'assistant/message' && imported) {
@@ -43,7 +46,7 @@ export function planImportContext({ session, request, operationId, contextWindow
   // Always keep the latest completed round. With no opening, also retain the first round.
   const events = sessionEvents(session)
   const roundMessageIds = new Set(rounds.flatMap(round => round.ids))
-  const hasOpening = events.some(e => e.type === 'assistant/message' && e.data.message.source?.importSource?.operationId === operationId &&
+  const hasOpening = events.some(e => e.type === 'assistant/message' && isImported(e.data.message, operationId) &&
     !roundMessageIds.has(e.data.message.id))
   const removable = rounds.slice(hasOpening ? 0 : 1, -1)
   const costs = new Map(request.messages.map(m => [m.id, estimateMessage(m)]))
@@ -79,9 +82,9 @@ export function createImportContextPreparation({ readChat, updateChat, getSessio
       request.signal?.throwIfAborted()
       result = planImportContext({ session, request: { ...request, maxTokens: request.maxTokens ?? info.defaultMaxTokens }, operationId: chat.importHistory.operationId, contextWindow: info.context?.contextWindow, estimateMessage })
       const { removedIds, removedSeqs, ...receipt } = result
-      session.append('user/message', { id: markerId, role: 'user', content: [],
+      appendTavernEvent(session, 'user/message', { id: markerId, role: 'user', content: [],
         source: { kind: 'plugin', plugin: PLUGIN, preparation: receipt } }, result.status === 'trimmed' ? {
-          surfaceOp: { op: 'replace', start: removedSeqs[0], end: removedSeqs.at(-1) }, sourceEventSeqs: removedSeqs
+          surfaceOp: { op: 'replace', startSeq: removedSeqs[0], endSeq: removedSeqs.at(-1) }, sourceEventSeqs: removedSeqs
         } : { surfaceOp: 'append' })
     }
     await flush(session)

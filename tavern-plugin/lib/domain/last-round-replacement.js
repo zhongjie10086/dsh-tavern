@@ -1,3 +1,4 @@
+import {captureOriginalSpPersistence,restoreOriginalSpPersistence} from './sp-authority.js'
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value)
 }
@@ -30,7 +31,9 @@ export function assertRegenerationSourceCurrent(input = {}) {
   const currentUser = currentChat.messages[assistantIndex - 1]
   const originalAssistant = originalChat.messages[assistantIndex]
   const currentAssistant = currentChat.messages[assistantIndex]
-  if (!originalUser || !currentUser || originalUser.role !== 'user' || currentUser.role !== 'user' || str(currentUser.text) !== str(originalUser.text)) throw regenerationConflict('玩家输入已经变化')
+  if(input.inputKind==='trigger'){
+    if(!isDeepStrictEqual(originalChat.messages.slice(0,assistantIndex),currentChat.messages.slice(0,assistantIndex)))throw regenerationConflict('触发回合之前的消息已经变化')
+  }else if (!originalUser || !currentUser || originalUser.role !== 'user' || currentUser.role !== 'user' || str(currentUser.text) !== str(originalUser.text)) throw regenerationConflict('玩家输入已经变化')
   if (!originalAssistant || !currentAssistant || originalAssistant.role !== 'assistant' || currentAssistant.role !== 'assistant' || Number(currentAssistant.turn) !== Number(originalAssistant.turn)) throw regenerationConflict('正文楼层已经变化')
   if (str(currentAssistant.text) !== str(originalAssistant.text) || str(currentAssistant.sourceText) !== str(originalAssistant.sourceText)) throw regenerationConflict('正文内容已经变化')
   return currentChat
@@ -45,7 +48,7 @@ export function replaceLastRound(input = {}) {
   const originalAssistant = originalChat.messages[assistantIndex]
   const originalUser = originalChat.messages[assistantIndex - 1]
   const regeneratedAssistant = regeneratedChat.messages[regeneratedChat.messages.length - 1]
-  if (!originalAssistant || originalAssistant.role !== 'assistant' || !originalUser || originalUser.role !== 'user') throw new Error('原正文不是玩家输入与助手回复组合')
+  if (!originalAssistant || originalAssistant.role !== 'assistant' || input.inputKind!=='trigger'&&(!originalUser || originalUser.role !== 'user')) throw new Error('原正文不是玩家输入与助手回复组合')
   if (!regeneratedAssistant || regeneratedAssistant.role !== 'assistant') throw new Error('重新生成没有产生助手回复')
 
   const selected = selectedIndex(regeneratedAssistant)
@@ -61,6 +64,12 @@ export function replaceLastRound(input = {}) {
   if (Array.isArray(originalAssistant.variables) || Array.isArray(regeneratedAssistant.variables)) {
     replacement.variables = [clone(Array.isArray(regeneratedAssistant.variables) ? regeneratedAssistant.variables[selected] || {} : {})]
   }
-  regeneratedChat.messages = originalChat.messages.slice(0, assistantIndex - 1).concat([clone(originalUser), replacement])
+  const originalPersistence = input.preserveOriginalSp ? captureOriginalSpPersistence(regeneratedChat) : null
+  if (originalPersistence) originalPersistence.messages.at(-1).turn = originalAssistant.turn
+  regeneratedChat.messages = input.inputKind==='trigger'?originalChat.messages.slice(0,assistantIndex).concat([replacement]):originalChat.messages.slice(0, assistantIndex - 1).concat([clone(originalUser), replacement])
+  // Preserve the original codec's surviving full root and any newly written
+  // delta on separate floors. Never merge frames or rebuild from cache.
+  if (originalPersistence) restoreOriginalSpPersistence(regeneratedChat, originalPersistence)
   return { chat: regeneratedChat, assistant: replacement }
 }
+import {isDeepStrictEqual} from 'node:util'

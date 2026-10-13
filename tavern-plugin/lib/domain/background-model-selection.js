@@ -12,20 +12,32 @@ export function normalizeBackgroundModel(value) {
   const provider = text(input.provider)
   const model = text(input.model)
   if (provider === '' || model === '') return null
-  return { provider, model }
+  return { provider, model, ...(text(input.reasoningEffort) ? { reasoningEffort: text(input.reasoningEffort) } : {}) }
 }
 
 export function snapshotBackgroundModel(configured) {
   // Null means resolve the current foreground selection when each task starts.
-  // Only an explicit user choice is frozen into the game.
+  // Retain a legacy snapshot; later global revisions supersede it.
   return normalizeBackgroundModel(configured)
 }
 
-export function resolveChatBackgroundModel(chat, fallback) {
-  const source = object(chat).backgroundModelSelection || fallback
-  const selected = normalizeBackgroundModel(source)
-  if (selected !== null && typeof source?.reasoningEffort === 'string' && source.reasoningEffort.trim() !== '') {
-    selected.reasoningEffort = source.reasoningEffort.trim()
-  }
-  return selected
+export function backgroundModelRevision(settings) {
+  const revision = object(settings).backgroundModelRevision
+  return Number.isSafeInteger(revision) && revision > 0 ? revision : 0
+}
+
+export function configuredBackgroundModel(settings) {
+  const config = object(settings)
+  return normalizeBackgroundModel(Object.hasOwn(config, 'defaultBackgroundModel') ? config.defaultBackgroundModel : config.backgroundModel)
+}
+
+export function configuredChatBackgroundModel(chat, settings) {
+  const game = object(chat), revision = backgroundModelRevision(settings)
+  // A later local choice lasts until the next global model/effort edit.
+  if (revision && game.backgroundModelRevision !== revision) return configuredBackgroundModel(settings)
+  return normalizeBackgroundModel(game.backgroundModelSelection)
+}
+
+export function resolveChatBackgroundModel(chat, fallback, settings) {
+  return configuredChatBackgroundModel(chat, settings) || normalizeBackgroundModel(fallback)
 }

@@ -92,10 +92,17 @@ function installTavernTextColors(root, options, findQuotes) {
     const observer = new win.MutationObserver(schedule);
     observer.observe(root, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['style', 'class', 'color', 'hidden'] });
     if (doc.documentElement !== root) observer.observe(doc.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
-    refresh();
+    // Batch mounts before reading computed styles; each message adds a stylesheet.
+    schedule();
     return {
         setColors,
-        setEnabled(value) { enabled = value !== false; if (timer !== null) win.clearTimeout(timer); refresh(); },
+        setEnabled(value) {
+            enabled = value !== false;
+            if (timer !== null) win.clearTimeout(timer);
+            timer = null;
+            if (enabled) schedule();
+            else for (const highlight of highlights.values()) highlight.clear();
+        },
         dispose() {
             disposed = true; observer.disconnect(); if (timer !== null) win.clearTimeout(timer);
             for (const kind of highlights.keys()) win.CSS.highlights.delete(prefix + '-' + kind);

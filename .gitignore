@@ -1,35 +1,31 @@
-# 运行环境
-node_modules
+# Installed dependencies and generated caches
 node_modules/
 .playwright-cli/
-cordis.yml
-*.log
 .DS_Store
+*.tsbuildinfo
+.ua/
+
+# Local configuration and user content
+cordis.yml
 .env
 .env.*
 !.env.example
-!.env.*.example
+data/
+.dsh-tavern-local.json
+.dsh-tavern-release.json
+
+# Development evidence is not part of this runtime release
+*.log
 coverage/
 playwright-report/
 test-results/
-*.tsbuildinfo
-
-# 浏览器验证产生的本地临时截图
-output/playwright/
-
-# 本地代码分析资料、快照和缓存
-.ua/
-
-# 用户数据（人物卡、聊天、剧本、素材、索引、设置、diff）
-data/
-
-# 本地上游源码参考（提交号和拉取方式记录在 references/README.md）
-references/SillyTavern/
-references/JS-Slash-Runner/
-references/ST-Prompt-Template/
-
-# 私人请求快照，仅供本地诊断
-docs/research/sillytavern-successful-prompt-snapshot-*.json
-
-# Local installation context (host and isolated home)
-.dsh-tavern-local.json
+output/
+/doc/
+/docs/
+/test/
+/tests/
+/testsets/
+/scripts/
+**/__tests__/
+**/*.test.*
+**/*.spec.*

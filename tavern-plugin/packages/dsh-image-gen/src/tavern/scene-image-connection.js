@@ -2,6 +2,7 @@ import { sceneImageChannel, imageCredentialRef, SCENE_IMAGE_CHANNELS } from './s
 import { sceneImageAuthProbe, verifySceneImageKey } from './scene-image-auth.js'
 import { imageNetworkCodes } from './scene-image-transport.js'
 import { redactSceneDiagnostic } from './redact.js'
+import {safeOutboundFetch} from './outbound-network-policy.js'
 
 const MAX_BYTES = 256 * 1024
 
@@ -32,7 +33,7 @@ async function limitedJson(response) {
 }
 
 /** Read-only setup checks. No generation, settings writes, or redirect following. */
-export function createSceneImageConnection({ settings, credentials, fetchImpl = fetch, timeoutMs = 5000, onDiagnostic = undefined }) {
+export function createSceneImageConnection({ settings, credentials, fetchImpl, lookup, timeoutMs = 5000, onDiagnostic = undefined }) {
   async function probeRequest(input, listModels, diagnostic, secrets) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('连接配置必须是对象')
     const channel = sceneImageChannel(input.provider)
@@ -68,7 +69,7 @@ export function createSceneImageConnection({ settings, credentials, fetchImpl = 
       const entry = { method: init.method, path: new URL(url).pathname, startedAt: Date.now() }
       diagnostic.requests.push(entry)
       try {
-        const result = await fetchImpl(url, init)
+        const result = await safeOutboundFetch(url,init,{purpose:'model',trustedResource:true,fetcher:fetchImpl,lookup})
         entry.httpStatus = result.status
         return result
       } catch (error) {

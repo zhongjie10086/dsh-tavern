@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { presetNativeFeatures } from './st-preset-compatibility.js'
 import { resolveRuntimeMacroText } from './runtime-content-projection.js'
 
 function emptyState() {
@@ -132,7 +133,8 @@ export function resolveRuntimePresetMacros(snapshot, options = {}) {
     for (const entry of rawPhases[phase].entries) {
       const rendered = resolveRuntimeMacroText(entry.content, {
         charName: typeof options.charName === 'string' ? options.charName : '',
-        macroState: state
+        macroState: state,
+        lastUserMessage: options.lastUserMessage, lastCharMessage: options.lastCharMessage, lastMessage: options.lastMessage
       })
       state = rendered.macroState
       diagnostics.push.apply(diagnostics, rendered.diagnostics.map(function (item) {
@@ -385,18 +387,17 @@ export function createRuntimePresetModule(options = {}) {
       if (!available.has(activePath)) throw new Error('预设已不存在：' + activePath)
       const preset = await readPreset(activePath)
       if (!preset || preset.valid !== true || preset.recognized !== true) throw new Error('预设无法读取：' + activePath)
-      const phases = new Map()
       const draft = preset.dshPreset && typeof preset.dshPreset === 'object' ? preset.dshPreset : null
-      if (draft) {
-        for (const phase of ['front', 'middle', 'back']) {
-          for (const entry of (Array.isArray(draft[phase]) ? draft[phase] : [])) phases.set(String(entry.id || ''), phase)
-        }
-      }
+      const entries = Array.isArray(preset.entries) ? preset.entries : []
+      const ordered = draft ? ['front', 'middle', 'back'].flatMap(phase =>
+        (draft[phase] || []).map(item => ({ phase, entry: Number.isInteger(item.source?.sourcePromptIndex)
+          ? entries.find(entry => entry.sourcePromptIndex === item.source.sourcePromptIndex)
+          : entries.find(entry => entry.entryKey === item.id) })))
+        : entries.filter(entry => entry.ordered === true).map(entry => ({ entry, phase: Number(entry.injectionPosition) === 1 ? 'middle' : 'front' }))
       const phaseEntries = { front: [], middle: [], back: [] }
       const sources = []
-      for (const entry of (Array.isArray(preset.entries) ? preset.entries : [])) {
-        if (entry.ordered !== true || entry.enabled === false || entry.marker === true || entry.injectable !== true) continue
-        const phase = phases.get(entry.entryKey) || (Number(entry.injectionPosition) === 1 ? 'middle' : 'front')
+      for (const { entry, phase } of ordered) {
+        if (!entry || entry.enabled === false || entry.marker === true || entry.injectable !== true) continue
         const projected = {
           id: entry.entryKey,
           role: entry.role,
@@ -415,10 +416,13 @@ export function createRuntimePresetModule(options = {}) {
       const middle = phaseValue(phaseEntries.middle)
       const back = phaseValue(phaseEntries.back)
       const result = {
+        snapshotFormat: 'dsh-full-preset-v1',
         presetPath: activePath,
         presetName: preset.title,
         compatibilityPreset: preset,
         compatibilityPresetDocument: document,
+        nativeFeatures: presetNativeFeatures(document),
+        compatibility: preset.compatibility || null,
         front,
         middle,
         back,
@@ -438,14 +442,16 @@ export function createRuntimePresetModule(options = {}) {
     }
   }
 
-  async function fullSnapshot(requestedPath) {
+  async function fullSnapshot(requestedPath, {omitScriptLibraryDecoration = false} = {}) {
     const current = await state()
     const activePath = typeof requestedPath === 'string' && requestedPath !== '' ? requestedPath : current.activePreset
-    if (pendingFullSnapshots.has(activePath)) return await pendingFullSnapshots.get(activePath)
-    const operation = buildFullSnapshot(activePath, current)
-    pendingFullSnapshots.set(activePath, operation)
+    const variant = omitScriptLibraryDecoration === true
+    const pendingKey = JSON.stringify([activePath, variant])
+    if (pendingFullSnapshots.has(pendingKey)) return await pendingFullSnapshots.get(pendingKey)
+    const operation = buildFullSnapshot(activePath, current).then(snapshot => typeof options.decorateSnapshot === 'function' ? options.decorateSnapshot(snapshot, {omitScriptLibraryDecoration: variant}) : snapshot)
+    pendingFullSnapshots.set(pendingKey, operation)
     try { return await operation }
-    finally { if (pendingFullSnapshots.get(activePath) === operation) pendingFullSnapshots.delete(activePath) }
+    finally { if (pendingFullSnapshots.get(pendingKey) === operation) pendingFullSnapshots.delete(pendingKey) }
   }
 
   async function prepareFullSnapshot() {

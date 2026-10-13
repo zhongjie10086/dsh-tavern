@@ -14,7 +14,7 @@ function configuration(value) {
  * Tavern supplies storage, credentials and (optionally) the legacy settings reader.
  * Existing credential references stay unchanged; plaintext keys are never persisted.
  */
-export function createImageGenerationModule({ store, credentials, readLegacyConfiguration = async () => ({}), fetchImpl, generateImpl, onDiagnostic = undefined }) {
+export function createImageGenerationModule({ store, credentials, readLegacyConfiguration = async () => ({}), fetchImpl, lookup, generateImpl, onDiagnostic = undefined }) {
   async function read() {
     const saved = await store.readJson(IMAGE_MODULE_CONFIGURATION)
     return configuration(saved ?? await readLegacyConfiguration())
@@ -33,7 +33,7 @@ export function createImageGenerationModule({ store, credentials, readLegacyConf
         if (typeof target?.set !== 'function') throw new Error('当前 DSH 不支持保存凭据')
         return target.set(ref, value)
       },
-    }, fetchImpl, generateImpl, onDiagnostic,
+    }, fetchImpl, lookup, generateImpl, onDiagnostic,
   })
   return Object.freeze(imageModule)
 }

@@ -1,4 +1,5 @@
 import { parseExpressionAt } from 'acorn'
+import { assertSafeRegex } from './regex-safety.js'
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 
 // Static validation only: never execute card scripts or rewrite the document.
@@ -47,6 +48,10 @@ export function validateCardText(text) {
     if (data[key] !== undefined && data[key] !== null && !object(data[key])) issue(prefix + '/' + key, '必须是对象')
   }
   const extensions = object(data.extensions) ? data.extensions : {}
+  for (const [index, script] of (Array.isArray(extensions.regex_scripts) ? extensions.regex_scripts : []).entries()) {
+    if (!object(script) || script.disabled === true || script.enabled === false) continue
+    try { assertSafeRegex(script.findRegex) } catch (error) { warnings.push({path:prefix + '/extensions/regex_scripts/' + index + '/findRegex', message:error.message + '；运行时按实际执行预算处理'}) }
+  }
   const helper = extensions.tavern_helper
   if (helper !== undefined && !object(helper)) issue(prefix + '/extensions/tavern_helper', '必须是对象')
   if (object(helper)) {

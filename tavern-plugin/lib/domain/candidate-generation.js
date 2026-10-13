@@ -165,12 +165,12 @@ export const CANDIDATE_SUBMIT_TOOL_NAME = 'candidate_submit_choices'
 
 export const CANDIDATE_SUBMIT_TOOL = Object.freeze({
   name: CANDIDATE_SUBMIT_TOOL_NAME,
-  description: '提交本轮候选项。自由故事必须提交 4 个行动候选和 1 个场景候选；剧本模式提交 1 个行动候选且 scene 留空。',
+  description: '提交本轮候选项。自由故事必须提交 4 个行动候选和 1 个场景候选；剧本模式恰好提交 1 个候选：人物行为填入 actions（1 项）且 scene 留空，或场景变化填入 scene 且 actions 为空数组。',
   parameters: Object.freeze({
     type: 'object',
     additionalProperties: false,
     properties: {
-      actions: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'string', minLength: 1 } },
+      actions: { type: 'array', minItems: 0, maxItems: 4, items: { type: 'string', minLength: 1 } },
       scene: { type: 'string' }
     },
     required: ['actions', 'scene']
@@ -193,7 +193,7 @@ export const SCRIPT_READ_TOOL = Object.freeze({
 export const SCRIPT_POINT_TOOL = Object.freeze({
   name: 'tavern_point_script',
   description: '请求把下一轮剧本游标定位到指定块。只能保持当前位置或向前跳，不能后退；总块数加 1 表示剧本结束。调用只暂存请求，候选成功后才会一起提交。',
-  countsTowardLimit: false,
+  countsTowardLimit: true,
   parameters: {
     type: 'object',
     properties: {
@@ -325,7 +325,7 @@ export function createCandidateGenerator(options) {
     const cardPath = str(chat.cardPath || chat.cardId)
     const card = await store.readCard(cardPath)
     if (card === undefined) throw new Error('人物卡不存在: ' + cardPath)
-    const selection = model.selection(chat)
+    const selection = await model.selection(chat)
     if (selection === null || selection === undefined) throw new Error('没有可用的模型配置')
     const scriptMode = mode === 'script'
     let script = null
@@ -387,7 +387,7 @@ export function createCandidateGenerator(options) {
         }
       }
       if (research !== null) return research.onToolCall(call)
-      return JSON.stringify({ ok: false, retryable: true, error: '当前候选任务只允许调用 candidate_submit_choices' })
+      return JSON.stringify({ ok: false, retryable: true, error: '当前候选任务不接受该工具；请按当前工具目录调用，完成后用 candidate_submit_choices 提交候选项' })
     }
     const callOptions = {
       onPersistentSessionReady: id => taskRun.bindSession(id),

@@ -19,6 +19,7 @@ const PRESENTATION_FIELDS = Object.freeze([
   ['defaultPresentation', '默认形象'],
   ['plotPotential', '剧情潜力']
 ])
+export const CHARACTER_DESIGN_PRESENTATION_FIELDS = PRESENTATION_FIELDS
 const UNKNOWN_MARKER = /未明确|未知|待定|不详|尚未设定|暂未决定/
 
 function str(value) {
@@ -91,7 +92,7 @@ const stringProperty = description => ({ type: 'string', description })
 export const CHARACTER_DESIGN_READ_TOOL = Object.freeze({
   name: CHARACTER_DESIGN_READ_TOOL_NAME,
   description: '读取当前对话的人物设计档案。无参数时返回精简索引；需要复用、补全或修改某人时按姓名读取完整方案。',
-  countsTowardLimit: false,
+  countsTowardLimit: true,
   parameters: Object.freeze({
     type: 'object', additionalProperties: false,
     properties: { name: stringProperty('索引返回的人物姓名。') }
@@ -154,11 +155,13 @@ export function createCharacterDesignDocumentSession(options = {}) {
   function save(args) {
     const input = object(args)
     const name = text(input.name, 'name', 200)
+    if (Array.isArray(input.aliases) && input.aliases.length > 32) throw new Error('人物别名不能超过 32 条')
     const aliases = Array.isArray(input.aliases)
       ? Array.from(new Set(input.aliases.map(function (item) { return text(item, 'aliases', 200) })))
       : []
     const existing = find(input)
     const created = existing === undefined
+    if (created && current.characters.length >= 256) throw new Error('人物档案已达 256 人上限；仍可修改既有人物')
     const timestamp = Math.max(0, Number(now()) || 0)
     const character = Object.assign({}, existing || {}, {
       name, aliases, design: designFrom(input),
@@ -195,6 +198,10 @@ export function createCharacterDesignDocumentSession(options = {}) {
 export function createCharacterDesignDocumentTools(options = {}) {
   const store = options.store
   const now = typeof options.now === 'function' ? options.now : Date.now
+  // 87c4b25a: every saved design is also written into the game's private worldbook layer, in the
+  // same chat update; a worldbook failure never loses the design (the result says what happened).
+  const writeWorldbook = typeof options.writeWorldbook === 'function' ? options.writeWorldbook : null
+  const describeWorldbook = typeof options.describeWorldbook === 'function' ? options.describeWorldbook : () => ''
   if (!store || typeof store.readChat !== 'function' || typeof store.updateChat !== 'function') {
     throw new Error('Character Design Document Tools 缺少 Chat Store adapter')
   }
@@ -217,6 +224,13 @@ export function createCharacterDesignDocumentTools(options = {}) {
         const result = JSON.parse(output)
         if (result.ok !== true || !session.changed()) return undefined
         chat.characterDesignDocument = session.document()
+        if (writeWorldbook) {
+          const character = chat.characterDesignDocument.characters.find(item => item.name === result.name)
+          let worldbook
+          try { worldbook = await writeWorldbook(chat, character) }
+          catch (error) { worldbook = { status: 'failed', error: str(error && error.message || error) } }
+          output = JSON.stringify({ ...result, worldbook: { status: worldbook.status, note: describeWorldbook(worldbook) } })
+        }
         return chat
       }, { source: 'character-design.save' })
       return output

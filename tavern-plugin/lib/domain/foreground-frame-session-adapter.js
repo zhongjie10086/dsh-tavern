@@ -1,3 +1,4 @@
+import { encodeTavernMessage, decodeTavernSource } from './session-message-source.js'
 import { foregroundFrameText } from './agent-input-frame.js'
 
 function str(value) {
@@ -5,7 +6,7 @@ function str(value) {
 }
 
 function frameIdOf(message) {
-  const source = message && message.source
+  const source = decodeTavernSource(message && message.source)
   return str(source && source.trace && source.trace.frameId)
 }
 
@@ -32,7 +33,7 @@ export function createForegroundFrameSessionAdapter(options = {}) {
       }
     })
     return {
-      messages: messages.concat([{
+      messages: messages.concat([encodeTavernMessage({
         id: makeId(),
         role: 'user',
         content: [{ type: 'text', text }],
@@ -50,10 +51,34 @@ export function createForegroundFrameSessionAdapter(options = {}) {
             turn: frame.turn
           }
         }
-      }]),
+      })]),
       receipt: { appended: true, reason: 'appended', frameId: frame.frameId }
     }
   }
 
   return Object.freeze({ append })
+}
+
+// Native history keeps complete frame receipts. Their one-turn instructions
+// must expire in later provider requests without rewriting that audit history.
+export function projectExpiredFramePrompts(messages, currentTurn) {
+  if (!Number.isSafeInteger(currentTurn) || currentTurn < 1) return messages
+  let changed = false
+  const result = messages.flatMap(message => {
+    const source = decodeTavernSource(message?.source)
+    if (message?.role !== 'user' || source?.kind !== 'plugin' || source.plugin !== 'dsh-tavern' || source.form !== 'foreground-frame'
+      || !Number.isSafeInteger(source.trace?.turn) || source.trace.turn < 1 || source.trace.turn >= currentTurn || !Array.isArray(source.sections)) return [message]
+    const sections = source.sections.filter(section => !(section?.source?.stage === 'tavern-script-prompt'
+      && (section.source.once === true || section.source.id === '__dsh_opening__:system')))
+    if (sections.length === source.sections.length) return [message]
+    const frameText = values => foregroundFrameText({contributions: values})
+    // Only rewrite the exact text carrier this adapter produced. Unknown or
+    // manually edited content is not evidence of an owned frame contribution.
+    if (message.content?.length !== 1 || message.content[0]?.type !== 'text'
+      || message.content[0].text !== frameText(source.sections)) return [message]
+    changed = true
+    const text = frameText(sections)
+    return text ? [encodeTavernMessage({...message, content: [{...message.content[0], text}], source: {...source, sections}})] : []
+  })
+  return changed ? result : messages
 }

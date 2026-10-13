@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+import { previewPresetConversion } from './preset-conversion-preview.js'
 import { inspectPreset } from './preset-reading.js'
 
 function str(value) {
@@ -30,6 +32,8 @@ function valueAt(document, pointer) {
 
 function applyOperations(document, operations) {
   const changed = []
+  const layout=document.dsh_tavern?.promptLayout,originalPrompts=[...(document.prompts||[])]
+  const layoutSources=new Map(['front','middle','back'].flatMap(phase=>(layout?.[phase]||[]).map(item=>[item,originalPrompts[item.sourceIndex]])))
   for (const operation of Array.isArray(operations) ? operations : []) {
     const pointer = str(operation && operation.path)
     const parts = pointerParts(pointer)
@@ -62,6 +66,17 @@ function applyOperations(document, operations) {
     }
     if (operation.op !== 'set') throw new Error('未知预设修改操作: ' + str(operation.op))
     if (JSON.stringify(parent[key]) !== JSON.stringify(operation.value)) { parent[key] = clone(operation.value); changed.push(pointer) }
+  }
+  if(layout&&layout===document.dsh_tavern?.promptLayout&&Array.isArray(document.prompts)) {
+    for(const phase of ['front','middle','back'])if(Array.isArray(layout[phase]))layout[phase]=layout[phase].flatMap(item=>{
+      const source=layoutSources.get(item)
+      let index=document.prompts.indexOf(source)
+      if(index<0&&source?.identifier&&originalPrompts.filter(row=>row?.identifier===source.identifier).length===1) {
+        const matches=document.prompts.map((row,index)=>row?.identifier===source.identifier?index:-1).filter(index=>index>=0)
+        if(matches.length===1)index=matches[0]
+      }
+      return index>=0?[{...item,sourceIndex:index,identifier:document.prompts[index].identifier}]:[]
+    })
   }
   return changed
 }
@@ -98,12 +113,12 @@ export function createPresetEditor(options = {}) {
   }
 
   async function load(path) {
-    const normalized = normalizePath(path, 'preset')
+    const normalized = await normalizePath(path, 'preset')
     const text = await readText(normalized)
     if (text === undefined) throw new Error('预设不存在: ' + normalized)
     let document
     try { document = JSON.parse(text) } catch { throw new Error('预设工作版不是有效的 JSON: ' + normalized) }
-    return { normalized, document }
+    return { normalized, document, text }
   }
 
   async function read(path, request = {}) {
@@ -124,7 +139,7 @@ export function createPresetEditor(options = {}) {
     const text = JSON.stringify(next, null, 2)
     const inspected = inspectPreset(text, loaded.normalized)
     if (!inspected.valid) throw new Error(inspected.error || '修改后的预设无效')
-    if (changed.length > 0) await writeText(loaded.normalized, text)
+    if (changed.length > 0) await writeText(loaded.normalized, text, loaded.text)
     return {
       path: loaded.normalized,
       changed,
@@ -145,7 +160,7 @@ export function createPresetEditor(options = {}) {
     const text = JSON.stringify(next, null, 2)
     const nextInspected = inspectPreset(text, loaded.normalized)
     if (!nextInspected.valid) throw new Error(nextInspected.error || '修改后的预设无效')
-    if (changed.length > 0) await writeText(loaded.normalized, text)
+    if (changed.length > 0) await writeText(loaded.normalized, text, loaded.text)
     return {
       path: loaded.normalized,
       changed,
@@ -155,6 +170,30 @@ export function createPresetEditor(options = {}) {
       regexCount: nextInspected.regexCount,
       warning: nextInspected.warning
     }
+  }
+
+  async function moveEntry(path, entryKey, phase, beforeEntryKey, revision) {
+    const loaded = await load(path)
+    if (createHash('sha256').update(loaded.text).digest('hex') !== revision) throw new Error('预设已变化，请重新打开后再移动')
+    if (!['front', 'middle', 'back'].includes(phase)) throw new Error('无效的预设分段')
+    const inspected = inspectPreset(loaded.text, loaded.normalized)
+    const converted = previewPresetConversion(loaded.text, loaded.normalized)
+    const entry = inspected.entries.find(item => item.entryKey === entryKey)
+    const sourceIndex = entry?.sourcePromptIndex
+    const phases = converted.phases
+    const row = ['front', 'middle', 'back'].flatMap(key => phases?.[key] || []).find(item => item.sourceIndex === sourceIndex)
+    if (!row || row.type !== 'text') throw new Error('只能移动三段中的提示词条目')
+    const before = beforeEntryKey ? inspected.entries.find(item => item.entryKey === beforeEntryKey) : null
+    if (beforeEntryKey && (!before || !phases[phase].some(item => item.sourceIndex === before.sourcePromptIndex))) throw new Error('目标条目已变化，请重新打开预设')
+    if (beforeEntryKey === entryKey) return
+    for (const key of ['front', 'middle', 'back']) phases[key] = phases[key].filter(item => item !== row)
+    const index = before ? phases[phase].findIndex(item => item.sourceIndex === before.sourcePromptIndex) : phases[phase].length
+    phases[phase].splice(index, 0, row)
+    const layout = Object.fromEntries(['front', 'middle', 'back'].map(key => [key, phases[key].map(item => ({ sourceIndex: item.sourceIndex, identifier: item.identifier }))]))
+    const next = clone(loaded.document)
+    if (next.dsh_tavern !== undefined && (next.dsh_tavern === null || typeof next.dsh_tavern !== 'object' || Array.isArray(next.dsh_tavern))) throw new Error('预设 dsh_tavern 扩展格式无效')
+    next.dsh_tavern = { ...next.dsh_tavern, promptLayout: layout }
+    await writeText(loaded.normalized, JSON.stringify(next, null, 2), loaded.text)
   }
 
   async function updateRegex(path, regexKey, patch) {
@@ -178,8 +217,19 @@ export function createPresetEditor(options = {}) {
       if (typeof input.enabled !== 'boolean') throw new Error('预设正则 enabled 必须是布尔值')
       operations.push({ op: 'set', path: script.edit.disabledPath, value: !input.enabled })
     }
-    return await update(loaded.normalized, operations)
+    const next = clone(loaded.document), changed = applyOperations(next, operations)
+    const text = JSON.stringify(next, null, 2), result = inspectPreset(text, loaded.normalized)
+    if (!result.valid) throw new Error(result.error || '修改后的预设无效')
+    if (changed.length) await writeText(loaded.normalized,text,loaded.text)
+    return {path:loaded.normalized,changed,valid:result.valid,recognized:result.recognized,promptCount:result.promptCount,regexCount:result.regexCount,warning:result.warning}
   }
 
-  return Object.freeze({ read, update, updateEntry, updateRegex })
+  let tail = Promise.resolve()
+  function locked(operation) {
+    return (...args) => {
+      if (options.withLock) return options.withLock(args[0], () => operation(...args))
+      const pending = tail.catch(() => {}).then(() => operation(...args)); tail = pending; return pending
+    }
+  }
+  return Object.freeze({ read, update:locked(update), updateEntry:locked(updateEntry), updateRegex:locked(updateRegex), moveEntry:locked(moveEntry) })
 }

@@ -162,5 +162,6 @@ export function createCandidateTasks({ chats, generator, backgroundTasks, sessio
     }
   }
 
-  return Object.freeze({ submit: submitCandidateTask, sync: sessionSync, recover, startLegacy })
+  return Object.freeze({ submit: submitCandidateTask, sync: sessionSync, recover, startLegacy,
+    isActive: chat => Object.keys(chat.taskMailbox?.tasks || {}).some(id => candidateTaskJobs.has(id)) })
 }

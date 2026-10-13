@@ -49,6 +49,14 @@ export function nativeRegexScriptsOf(object) {
   return normalizeRegexScripts(Array.isArray(extensions.regex_scripts) ? extensions.regex_scripts : [])
 }
 
+/** Static order hint only; macros, depth entries and the selected API can change the actual tail. */
+export function presetOrderSummary(entries) {
+  const ordered = entries.filter(entry => entry.ordered)
+  const tail = ordered.filter(entry => entry.enabled && Number(entry.injectionPosition) !== 1 && (entry.marker || entry.content.trim())).at(-1)
+  return { ordered: ordered.length, unused: entries.length - ordered.length,
+    assistantPrefixCandidate: tail?.role === 'assistant' && !tail.marker ? tail.entryKey : null }
+}
+
 export function inspectPreset(text, filename = '') {
   let document
   try {
@@ -167,6 +175,7 @@ export function inspectPreset(text, filename = '') {
     promptCount: entries.length,
     enabledCount: entries.filter(function (entry) { return entry.enabled }).length,
     entries,
+    orderSummary: presetOrderSummary(entries),
     regexCount: regexScripts.length,
     enabledRegexCount: regexScripts.filter(function (script) { return script.enabled }).length,
     regexScripts,

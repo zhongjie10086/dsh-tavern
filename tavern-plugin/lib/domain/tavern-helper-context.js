@@ -1,4 +1,12 @@
 import { projectAgentContent } from './runtime-content-projection.js'
+import { freezeJson } from './readonly-json.js'
+const readonlyContexts=new WeakMap()
+export function projectTavernHelperContextReadonly(chat) {
+  if (Object.isFrozen(chat) && readonlyContexts.has(chat)) return readonlyContexts.get(chat)
+  const value=freezeJson(projectTavernHelperContext(chat))
+  if(Object.isFrozen(chat))readonlyContexts.set(chat,value)
+  return value
+}
 
 function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
@@ -52,11 +60,17 @@ export function projectTavernHelperContext(chat) {
       ? source.swipes.map(str)
       : [str(source.sourceText || source.text)]
     const variables = Array.isArray(source.variables) ? clone(source.variables) : []
-    const tavernRole = source.role === 'tavern-helper'
+    const tavernRole = source.tavernRoleOverride || (source.role === 'tavern-helper'
       ? (['system', 'assistant', 'user'].includes(source.tavernRole) ? source.tavernRole : 'assistant')
-      : (source.role === 'user' ? 'user' : 'assistant')
+      : (source.role === 'user' ? 'user' : 'assistant'))
     const projected = {
       pluginData: clone(source.tavernPluginData || {}),
+      ...(source.tavernLegacyId?{id:source.tavernLegacyId}:{}),
+      ...(source.tavernSendDate?{send_date:clone(source.tavernSendDate)}:{}),
+      name: str(source.name || (tavernRole === 'assistant' ? chat.cardName : tavernRole === 'user' ? chat.macroState?.userName : '')),
+      is_hidden: source.tavernHidden === true,
+      extra: clone(source.tavernExtra || {}),
+      swipes_info: clone(source.tavernSwipesInfo || []),
       message_id: messageId,
       role: tavernRole,
       message: swipes[swipeId] ?? swipes[0] ?? '',
@@ -77,10 +91,16 @@ export function projectTavernHelperContext(chat) {
   }
   return {
     version: 1,
+    serverEvents:chat?.tavernHelperServerEvents===true,
     chatId: str(chat && chat.id),
+    databaseInitialized: !!chat?.spDatabase,
+    legacyChatFileName: str(chat?.legacyChatFileName),
+    personaDescription: str(chat?.tavernPersona?.description),
     scriptPrompts: clone(chat && chat.tavernScriptPrompts || []),
     chatMetadata: clone(chat && chat.tavernPluginMetadata || {}),
     mvuEnabled: chat?.mvu?.enabled === true,
+    // Z96: a message frame stops holding a card's opening for MVU once this game's settlement is off.
+    mvuSettlementPaused: chat?.mvu?.enabled === true && Boolean(chat.mvu.settlementPaused),
     stateRevision: Math.max(0, Number(chat && chat._storageRevision) || 0),
     lifecycleRevision: Math.max(0, Number(chat && chat.tavernHelperLifecycleRevision) || 0),
     messages,
@@ -94,14 +114,15 @@ export function projectTavernHelperContext(chat) {
 export function appendTavernHelperMessages(chat, values, option = {}) {
   if (!chat || typeof chat !== 'object') throw new Error('聊天不存在')
   const settings = option && typeof option === 'object' && !Array.isArray(option) ? option : {}
-  if (settings.insert_before !== undefined && settings.insert_before !== 'end') {
-    throw new Error('DSH 的 createChatMessages 只支持追加到末尾')
-  }
+  const insertValue=settings.insert_before ?? settings.insert_at ?? 'end'
+  const length=chat.messages?.length || 0
+  const at=insertValue==='end'?length:Number(insertValue)<0?length+Number(insertValue):Number(insertValue)
+  if(!Number.isSafeInteger(at)||at<0||at>length)throw new Error('插入位置不存在')
   if (settings.refresh !== undefined && !['none', 'affected', 'all'].includes(settings.refresh)) {
     throw new Error('createChatMessages refresh 参数无效')
   }
   if (!Array.isArray(chat.messages)) chat.messages = []
-  const created = []
+  const created = [], additions=[]
   for (const value of Array.isArray(values) ? values : []) {
     if (!value || typeof value !== 'object') throw new TypeError('createChatMessages 消息必须是对象')
     const role = str(value.role)
@@ -120,13 +141,26 @@ export function appendTavernHelperMessages(chat, values, option = {}) {
       displayMode: 'markdown',
       swipeId: 0,
       swipes: [text],
+      tavernExtra: clone(value.extra || {}),
       variables: [clone(value.data && typeof value.data === 'object' && !Array.isArray(value.data) ? value.data : {})]
     }
     if (str(value.name) !== '') message.name = str(value.name)
-    chat.messages.push(message)
-    created.push({ messageId: chat.messages.length - 1 })
+    additions.push(message)
+    created.push({ messageId: at+additions.length-1 })
   }
+  chat.messages.splice(at,0,...additions)
   return created
+}
+
+/** Read the exact Helper namespace targeted by a variable write. */
+export function readTavernHelperVariables(chat, option = {}) {
+  if (option.type === 'chat') return clone(chat.variables || {})
+  if (option.type === 'script') return clone(chat.tavernHelperScriptVariables?.[option.script_id] || {})
+  if (option.type !== 'message') throw Error('只支持 message、chat 或 script 变量')
+  const messages = Array.isArray(chat.messages) ? chat.messages : []
+  const message = messages[normalizeMessageId(messages, option.message_id)]
+  const swipeId = Object.hasOwn(option, 'swipe_id') ? Math.max(0, Number(option.swipe_id) || 0) : selectedSwipe(message)
+  return clone(message.variables?.[swipeId] || {})
 }
 
 /** Apply one explicit Helper variable write without exposing Chat internals. */
@@ -157,6 +191,21 @@ export function replaceTavernHelperVariables(chat, request = {}) {
   return { type: 'message', messageId, swipeId }
 }
 
+function openingVariableSnapshot(chat, message, messageId, value, previous) {
+  const next = clone(value && typeof value === 'object' ? value : {})
+  // Fixed official MVU builds the worldbook schema first, then overrides each
+  // swipe's stat_data with <initvar>. That override does not rebuild strictSet.
+  // Honor its explicit per-opening declaration only on the first complete write;
+  // never generate schema or reinterpret an already initialized/old snapshot.
+  const strictSet = next.stat_data?.$meta?.strictSet
+  if (messageId === 0 && message.greeting === true && chat.mvu?.enabled === true
+      && (previous?.stat_data === undefined || previous?.schema === undefined)
+      && typeof strictSet === 'boolean' && next.schema && typeof next.schema === 'object' && !Array.isArray(next.schema)) {
+    next.schema.strictSet = strictSet
+  }
+  return next
+}
+
 /** Apply the subset of setChatMessages used by card UI and greeting-index scripts. */
 export function replaceTavernHelperMessages(chat, patches) {
   if (!chat || typeof chat !== 'object') throw new Error('聊天不存在')
@@ -166,12 +215,22 @@ export function replaceTavernHelperMessages(chat, patches) {
     if (!patch || typeof patch !== 'object') continue
     const messageId = normalizeMessageId(messages, patch.message_id)
     const message = messages[messageId]
+    const previousVariables = Array.isArray(message.variables) ? message.variables.slice() : []
+    const previousSwipeId = selectedSwipe(message)
+    const writesSwipes = Object.hasOwn(patch, 'swipes')
+    if(writesSwipes) {
+      if(!Array.isArray(patch.swipes)||!patch.swipes.length||patch.swipes.some(text=>typeof text!=='string'))throw new Error('消息至少需要一个有效 swipe')
+      message.swipes=clone(patch.swipes)
+      if(Array.isArray(message.variables))message.variables.length=Math.min(message.variables.length,message.swipes.length)
+    }
+    for(const [from,to]of [['name','name'],['extra','tavernExtra'],['swipes_info','tavernSwipesInfo']])if(Object.hasOwn(patch,from))message[to]=clone(patch[from])
+    if(Object.hasOwn(patch,'is_hidden'))message.tavernHidden=patch.is_hidden===true
+    if(Object.hasOwn(patch,'role')) { if(!['user','assistant','system'].includes(patch.role))throw new Error('消息角色无效');message.tavernRoleOverride=patch.role }
     const count = Math.max(
       Array.isArray(message.swipes) ? message.swipes.length : 0,
       Array.isArray(message.variables) ? message.variables.length : 0,
       1
     )
-    const previousSwipeId = selectedSwipe(message)
     const swipeId = Object.prototype.hasOwnProperty.call(patch, 'swipe_id')
       ? Math.max(0, Math.min(count - 1, Number(patch.swipe_id) || 0))
       : previousSwipeId
@@ -184,20 +243,21 @@ export function replaceTavernHelperMessages(chat, patches) {
     }
     if (Object.prototype.hasOwnProperty.call(patch, 'data')) {
       if (!Array.isArray(message.variables)) message.variables = []
-      message.variables[swipeId] = clone(patch.data && typeof patch.data === 'object' ? patch.data : {})
+      message.variables[swipeId] = openingVariableSnapshot(chat, message, messageId, patch.data, previousVariables[swipeId])
     }
     if (Object.prototype.hasOwnProperty.call(patch, 'swipes_data')) {
       const values = Array.isArray(patch.swipes_data) ? patch.swipes_data : []
-      message.variables = values.map(function (value) {
-        return clone(value && typeof value === 'object' ? value : {})
+      message.variables = values.map(function (value, index) {
+        return openingVariableSnapshot(chat, message, messageId, value, previousVariables[index])
       })
     }
     message.swipeId = swipeId
     // MVU initialization writes swipes_data only. Never replace an already
     // rendered message with raw swipe text or replay stateful macros for it.
-    if ((writesText || swipeId !== previousSwipeId) && Array.isArray(message.swipes) && message.swipes[swipeId] !== undefined) {
+    if ((writesText || writesSwipes || swipeId !== previousSwipeId) && Array.isArray(message.swipes) && message.swipes[swipeId] !== undefined) {
       const sourceText = message.swipes[swipeId]
-      const projection = projectAgentContent(sourceText, { charName: chat.cardName, macroState: chat.macroState })
+      const role=message.tavernRoleOverride || (message.role==='tavern-helper'?message.tavernRole:message.role)
+      const projection = role==='user'||role==='system'?{renderedText:sourceText,sessionText:sourceText,displayText:sourceText,displayMode:'markdown',warnings:[],macroState:chat.macroState}:projectAgentContent(sourceText, { charName: chat.cardName, macroState: chat.macroState })
       message.sourceText = sourceText
       message.projectionText = projection.renderedText
       message.text = projection.sessionText
@@ -212,4 +272,20 @@ export function replaceTavernHelperMessages(chat, patches) {
     updated.push({ messageId, swipeId })
   }
   return updated
+}
+
+/** Delete the requested floors atomically; negative IDs are resolved before removal. */
+export function deleteTavernHelperMessages(chat, values) {
+  if(!Array.isArray(values))throw new Error('删除楼层必须是数组')
+  const ids=[...new Set(values.map(id=>normalizeMessageId(chat.messages,id)))].sort((a,b)=>a-b)
+  const deleted=new Set(ids)
+  chat.messages=chat.messages.filter((_,id)=>!deleted.has(id))
+  return ids.map(messageId=>({messageId}))
+}
+export function rotateTavernHelperMessages(chat, begin, middle, end) {
+  const length=chat.messages.length, bound=value=>Number(value)<0?length+Number(value):Number(value)
+  ;[begin,middle,end]=[begin,middle,end].map(bound)
+  if(![begin,middle,end].every(Number.isSafeInteger)||begin<0||end>length||begin>middle||middle>end)throw new Error('旋转楼层范围无效')
+  chat.messages.splice(begin,end-begin,...chat.messages.slice(middle,end),...chat.messages.slice(begin,middle))
+  return Array.from({length:end-begin},(_,i)=>({messageId:begin+i}))
 }

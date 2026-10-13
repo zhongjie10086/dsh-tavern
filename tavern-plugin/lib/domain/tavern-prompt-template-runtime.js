@@ -24,8 +24,9 @@ function serializable(value) {
 function mergeVariables(target, source) {
   if (!object(source) || Object.keys(object(source)).length === 0) return target
   for (const [key, value] of Object.entries(source)) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue
     if (Array.isArray(value)) target[key] = serializable(value)
-    else if (object(value) === value) target[key] = mergeVariables(object(target[key]), value)
+    else if (object(value) === value) target[key] = mergeVariables(Object.hasOwn(target, key) ? object(target[key]) : {}, value)
     else target[key] = value
   }
   return target
@@ -384,7 +385,10 @@ export class TavernPromptTemplateRuntime {
       }))
       if (!result.ok) {
         diagnostics.push({ kind: 'prompt-template', code: result.kind, messageIndex: index })
-        continue
+        const error = new Error('第 ' + (index + 1) + ' 条消息的提示词模板执行失败（' + result.kind + '），本次请求已停止')
+        error.code = 'TAVERN_TEMPLATE_RENDER_FAILED'
+        error.diagnostics = diagnostics
+        throw error
       }
       scopes = serializable(result.scopes)
       if (result.evaluated) evaluated += 1

@@ -13,6 +13,8 @@ export async function apply(ctx) {
     let disposed = false;
     let retryAttempt = 0;
     let retryTimer;
+    let changeTimer;
+    let connectedIds = new Set();
     let control;
     const sessionIds = () => Array.from(new Set(Array.from(listeners, item => item.sessionId))).sort();
     const key = (sessionId, kind) => `${sessionId}\u0000${kind}`;
@@ -56,11 +58,14 @@ export async function apply(ctx) {
             name: 'Tavern session signal stream',
             isSnapshot: (frame) => frame.type === 'snapshot',
             replace: (frame) => {
+                if (disposed || control !== next || listeners.size === 0)
+                    return;
                 retryAttempt = 0;
                 latest.clear();
                 for (const signal of frame.signals)
                     latest.set(key(signal.sessionId, signal.kind), signal);
                 connected = true;
+                connectedIds = new Set(sessionIds());
                 for (const item of listeners) {
                     item.onConnect?.();
                     const signal = latest.get(key(item.sessionId, item.kind));
@@ -74,6 +79,32 @@ export async function apply(ctx) {
         control = next;
         next.start();
     };
+    const changed = () => {
+        connected = false;
+        connectedIds.clear();
+        if (changeTimer !== undefined)
+            clearTimeout(changeTimer);
+        changeTimer = undefined;
+        if (listeners.size === 0) {
+            if (retryTimer !== undefined)
+                clearTimeout(retryTimer);
+            retryTimer = undefined;
+            const old = control;
+            control = undefined;
+            latest.clear();
+            void old?.dispose();
+            return;
+        }
+        changeTimer = setTimeout(() => {
+            changeTimer = undefined;
+            if (disposed || listeners.size === 0)
+                return;
+            if (control)
+                control.restart();
+            else
+                startStream();
+        }, 50);
+    };
     const service = Object.freeze({
         subscribe(sessionId, kind, listener, onError, onConnect) {
             const item = { sessionId: String(sessionId), kind: String(kind), listener, onError, onConnect };
@@ -81,7 +112,7 @@ export async function apply(ctx) {
             listeners.add(item);
             const after = sessionIds().join('\u0000');
             const signal = latest.get(key(item.sessionId, item.kind));
-            if (connected)
+            if (connected && connectedIds.has(item.sessionId))
                 item.onConnect?.();
             if (signal !== undefined)
                 item.listener(signal);
@@ -92,7 +123,7 @@ export async function apply(ctx) {
             else if (control === undefined)
                 startStream();
             else if (before !== after)
-                control.restart();
+                changed();
             let stopped = false;
             return () => {
                 if (stopped)
@@ -101,7 +132,7 @@ export async function apply(ctx) {
                 const previous = sessionIds().join('\u0000');
                 listeners.delete(item);
                 if (previous !== sessionIds().join('\u0000'))
-                    control?.restart();
+                    changed();
             };
         },
     });
@@ -110,6 +141,8 @@ export async function apply(ctx) {
         disposed = true;
         if (retryTimer !== undefined)
             clearTimeout(retryTimer);
+        if (changeTimer !== undefined)
+            clearTimeout(changeTimer);
         await control?.dispose();
         await unmount();
     };

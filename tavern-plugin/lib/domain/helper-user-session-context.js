@@ -1,3 +1,4 @@
+import { appendTavernEvent } from './session-message-source.js'
 import { sessionEvents } from './session-events.js'
 
 /** Publish script-created user text without starting a turn or rewriting history. */
@@ -10,7 +11,7 @@ export function appendHelperUserSessionContext(session, chat, targets) {
     if (message?.role !== 'tavern-helper' || message.tavernRole !== 'user' || message.tavernHidden === true) continue
     const id = `tavern-helper-user:${chat.id}:${target.messageId}`
     if (existing.has(id)) continue
-    session.append('user/message', {
+    appendTavernEvent(session, 'user/message', {
       id, role: 'user', content: [{ type: 'text', text: String(message.sourceText || message.text || '') }],
       source: { kind: 'plugin', plugin: 'dsh-tavern-helper', chatId: chat.id, messageId: target.messageId }
     }, { surfaceOp: 'append' })

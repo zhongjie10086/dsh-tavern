@@ -1,4 +1,5 @@
 import { normalizeResourcePath, resourceKind } from './file-resources.js'
+import {createHash, randomUUID} from 'node:crypto'
 
 function str(value) { return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value)) }
 
@@ -22,10 +23,12 @@ export function createResourceGraph(options = {}) {
 
   async function projectRename(operation) {
     const oldPath = operation.path
-    const renamed = await resources.rename(oldPath, operation.name)
+    const renamed = operation.result || await resources.rename(oldPath, operation.name, {replayDigest:operation.sourceDigest})
     operation.result = renamed
+    await options.permissions?.movePath(resourceKind(oldPath), renamed.oldPath, renamed.path, operation.id)
     await checkpoint(operation, 'resource-renamed')
     const kind = resourceKind(oldPath)
+    if (kind === "card") await options.cardOrganization?.movePath(renamed.oldPath, renamed.path)
     if (kind === 'preset' && presets && typeof presets.rename === 'function') await presets.rename(renamed.oldPath, renamed.path)
     const replacements = new Map([[renamed.oldPath, renamed.path]])
     if (renamed.scriptOldPath && renamed.scriptPath) replacements.set(renamed.scriptOldPath, renamed.scriptPath)
@@ -63,6 +66,7 @@ export function createResourceGraph(options = {}) {
       if (changed) await chats.writeChat(chat)
     }
     await chats.writeIndex(index)
+    await options.projectReferences?.(operation)
     await checkpoint(operation, 'projected')
     await operations.remove()
     return { kind, path: renamed.path }
@@ -71,7 +75,9 @@ export function createResourceGraph(options = {}) {
   async function projectRemove(operation) {
     const normalized = normalizeResourcePath(operation.path, operation.expectedKind)
     await resources.remove(normalized)
+    await options.permissions?.movePath(resourceKind(normalized), normalized, null, operation.id)
     await checkpoint(operation, 'resource-removed')
+    if (resourceKind(normalized) === 'card') await options.cardOrganization?.movePath(normalized, null)
     if (resourceKind(normalized) === 'preset' && presets && typeof presets.remove === 'function') await presets.remove(normalized)
     const index = await chats.readIndex()
     for (const row of index.chats || []) {
@@ -84,12 +90,14 @@ export function createResourceGraph(options = {}) {
       chat.workspace.mountedResources = nextMounted
       await chats.writeChat(chat)
     }
+    await options.projectReferences?.(operation)
     await checkpoint(operation, 'projected')
     await operations.remove()
     return { kind: resourceKind(normalized), path: normalized }
   }
 
   async function execute(operation) {
+    if (!operation.id) { operation.id = randomUUID(); await operations.write(operation) }
     if (operation.kind === 'rename') return await projectRename(operation)
     if (operation.kind === 'remove') return await projectRemove(operation)
     throw new Error('未知 Resource Graph operation: ' + str(operation.kind))
@@ -112,7 +120,14 @@ export function createResourceGraph(options = {}) {
     return serialize(async function () {
       const previous = await operations.read()
       if (previous) await execute(previous)
-      const operation = { schemaVersion: 1, kind: 'rename', path: normalizeResourcePath(path), name: str(name), stage: 'prepared' }
+      const normalized=resources.canonicalPath?await resources.canonicalPath(path):normalizeResourcePath(path)
+      let sourceDigest
+      if (resources.readText) {
+        const source=await resources.readText(normalized)
+        if (source===undefined) throw new Error('资源不存在: '+normalized)
+        sourceDigest=createHash('sha256').update(source).digest('hex')
+      }
+      const operation = { schemaVersion: 1, kind: 'rename', path: normalized, name: str(name), sourceDigest, stage: 'prepared' }
       await operations.write(operation)
       return await execute(operation)
     })
@@ -122,7 +137,8 @@ export function createResourceGraph(options = {}) {
     return serialize(async function () {
       const previous = await operations.read()
       if (previous) await execute(previous)
-      const operation = { schemaVersion: 1, kind: 'remove', path: normalizeResourcePath(path, expectedKind), expectedKind: str(expectedKind), stage: 'prepared' }
+      const normalized=resources.canonicalPath?await resources.canonicalPath(path,expectedKind):normalizeResourcePath(path,expectedKind)
+      const operation = { schemaVersion: 1, kind: 'remove', path: normalized, expectedKind: str(expectedKind), stage: 'prepared' }
       await operations.write(operation)
       return await execute(operation)
     })

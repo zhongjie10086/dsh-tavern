@@ -1,8 +1,11 @@
 import { access, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import {createHash,randomUUID} from 'node:crypto'
 import { createDurableFilePromotion } from '../durable-file-promotion.js'
 import { createResourceMutationJournal } from './resource-mutation-journal.js'
 import { inspectPreset } from './preset-reading.js'
+import {createVersionedJsonCache} from './versioned-json-cache.js'
+import {mutableJsonDraft} from './json-draft.js'
 
 const KIND_DIR = Object.freeze({ card: 'cards', preset: 'presets', source: 'materials', script: 'scripts', worldbook: 'worldbooks' })
 const INTERNAL_FILE_PATTERNS = Object.freeze([/\.write-lock$/i, /\.pending-\d+-[0-9a-f-]+$/i, /\.staging-[0-9a-f-]+$/i])
@@ -41,6 +44,7 @@ export function normalizeResourcePath(value, expectedKind) {
   if (input === '' || input.startsWith('/') || input.includes('\u0000')) throw new Error('资源路径不合法: ' + input)
   const normalized = path.posix.normalize(input)
   if (normalized === '..' || normalized.startsWith('../') || normalized !== input) throw new Error('资源路径不合法: ' + input)
+  for (const segment of normalized.split('/')) if (!segment || safeResourceName(segment) !== segment) throw new Error('资源路径不合法: ' + input)
   const first = normalized.split('/')[0]
   const actualKind = Object.entries(KIND_DIR).find(function (entry) { return entry[1] === first })?.[0]
   if (actualKind === undefined || (expectedKind !== undefined && actualKind !== expectedKind)) throw new Error('资源路径类型不匹配: ' + input)
@@ -121,6 +125,7 @@ export function createFileResourceStore(options = {}) {
   const bindingsPath = path.join(dataRoot, '.material-bindings.json')
   const worldBookBindingsPath = path.join(dataRoot, '.worldbook-bindings.json')
   const durableFiles = options.files || createDurableFilePromotion(options.filePromotion)
+  const cardCache=createVersionedJsonCache()
   const mutations = options.mutations || createResourceMutationJournal({
     dataRoot,
     files: durableFiles,
@@ -130,6 +135,25 @@ export function createFileResourceStore(options = {}) {
   function absolute(relative, original = false) {
     const normalized = normalizeResourcePath(relative)
     return path.join(original ? originalsRoot : resourcesRoot, ...normalized.split('/'))
+  }
+
+  async function canonicalPath(relative, expectedKind) {
+    const normalized = normalizeResourcePath(relative, expectedKind)
+    if (process.platform !== 'win32') return normalized
+    const parts = normalized.split('/'), result = []
+    for (const part of parts) {
+      let names
+      try { names = await readdir(path.join(resourcesRoot, ...result)) } catch (error) { if (error.code !== 'ENOENT') throw error; names = [] }
+      const matches = names.filter(name => name.normalize('NFC').toLowerCase() === part.toLowerCase())
+      if (matches.length > 1) throw new Error('资源大小写身份不唯一: ' + relative)
+      if (matches.length && matches[0] !== part) throw new Error('资源路径大小写不一致，请使用库中实际路径: ' + [...result,matches[0],...parts.slice(result.length+1)].join('/'))
+      result.push(matches[0] || part)
+    }
+    return result.join('/')
+  }
+
+  async function withEditLock(relative, operation) {
+    return durableFiles.withLock(absolute(await canonicalPath(relative)) + '.editing', operation, { waitMs: 10000 })
   }
 
   async function ensure() {
@@ -145,10 +169,52 @@ export function createFileResourceStore(options = {}) {
     await writeFile(target, data)
   }
 
-  async function writeWorking(relative, data) {
-    const normalized = normalizeResourcePath(relative)
+  async function writeWorking(relative, data, { expectedText } = {}) {
+    const normalized = await canonicalPath(relative)
     const target = absolute(normalized)
+    if (expectedText !== undefined) return durableFiles.update(target, current => {
+      if (current?.toString('utf8') !== expectedText) throw new Error('资源已被其他操作修改，请刷新')
+      return Buffer.isBuffer(data) ? data : Buffer.from(data)
+    })
     await durableFiles.write(target, data)
+  }
+
+  function mvuDefinitionPath(revision) {
+    if(!/^[a-f0-9]{64}$/.test(revision||''))throw Error('MVU 定义版本无效')
+    return path.join(dataRoot,'mvu-conversion-definitions',revision+'.json')
+  }
+  async function readMvuDefinition(revision) {
+    const value=await durableFiles.read(mvuDefinitionPath(revision))
+    return value===undefined?undefined:JSON.parse(value.toString('utf8'))
+  }
+  async function saveMvuDefinition(revision,definition) {
+    if(createHash('sha256').update(JSON.stringify(definition)).digest('hex')!==revision)throw Error('MVU 定义摘要不一致')
+    await durableFiles.write(mvuDefinitionPath(revision),JSON.stringify(definition))
+  }
+  async function inspectMvuDestination(targetPath) {
+    const target=await canonicalPath(targetPath,'card'),working=await readText(target),original=await originalCardName(target)
+    return {available:working!==undefined||original===null,workingExists:working!==undefined,originalExists:original!==null,reason:working===undefined&&original!==null?'副本原版资源已存在，请换名':null}
+  }
+  async function saveMvuCard({sourcePath,targetPath,document,expectedSourceText,expectedTargetText,finalize}) {
+    await ensure()
+    const source=await canonicalPath(sourcePath,'card'),target=await canonicalPath(targetPath,'card')
+    if(source===target)throw Error('MVU 转换不能覆盖原卡')
+    const ordered=[source,target].sort()
+    return withEditLock(ordered[0],()=>withEditLock(ordered[1],async()=>{
+      if(await readText(source)!==expectedSourceText||await readText(target)!==expectedTargetText)throw Error('人物卡已变化，请重新读取后转换')
+      if(expectedTargetText===undefined&&await originalCardName(target)!==null)throw Error('副本原版资源已存在，请换名')
+      const saved=clone(document),image=await readCardImage(source)
+      if(saved.kind==='dsh-tavern-character-workspace'&&!saved.meta?.id)saved.meta={...saved.meta,id:randomUUID()}
+      finalize?.(saved)
+      const text=JSON.stringify(saved,null,2),bindings=await readWorldBookBindings()
+      bindings[target]={kind:'embedded',cardPath:target}
+      const result=await mutations.run('convert-mvu:'+target,async plan=>{
+        await plan.write(absolute(target),text)
+        if(expectedTargetText===undefined)await plan.write(absolute(target.replace(/\.json$/i,image?'.png':'.json'),true),image||text)
+        await plan.write(worldBookBindingsPath,JSON.stringify(bindings,null,2))
+      })
+      return {path:target,changed:result.changed,imageCopied:!!image}
+    }))
   }
 
   async function originalCardName(normalized) {
@@ -180,20 +246,29 @@ export function createFileResourceStore(options = {}) {
   }
 
   async function hasCardImage(relative) {
-    const normalized = normalizeResourcePath(relative, 'card')
+    const normalized = await canonicalPath(relative, 'card')
     const originalName = await originalCardName(normalized)
     return originalName !== null && path.extname(originalName).toLowerCase() === '.png'
   }
 
   async function readCardImage(relative) {
-    const normalized = normalizeResourcePath(relative, 'card')
+    const normalized = await canonicalPath(relative, 'card')
     const originalName = await originalCardName(normalized)
     if (originalName === null || path.extname(originalName).toLowerCase() !== '.png') return undefined
     return await readFile(path.join(path.dirname(absolute(normalized, true)), originalName))
   }
 
+  async function restoreOriginal(relative, data, png = false) {
+    const normalized = normalizeResourcePath(relative)
+    if(png){if(resourceKind(normalized)!=='card')throw Error('卡面缺少人物卡路径');pngCardPayload(Buffer.from(data),normalized)}
+    const original = png ? normalized.replace(/\.json$/i,'.png') : normalized
+    if(resourceKind(normalized)==='card' && await originalCardName(normalized)!==null)return
+    const target=absolute(original,true),existing=await durableFiles.read(target)
+    if(existing===undefined)await writeNew(target,data)
+  }
+
   async function ensureCardWorkspace(relative, migrate) {
-    const normalized = normalizeResourcePath(relative, 'card')
+    const normalized = await canonicalPath(relative, 'card')
     if (typeof migrate !== 'function') throw new Error('缺少人物卡工作区迁移器')
     const workingPath = absolute(normalized)
     const currentText = (await durableFiles.read(workingPath)).toString('utf8')
@@ -207,13 +282,11 @@ export function createFileResourceStore(options = {}) {
     return next
   }
 
-  async function restoreCard(relative, prepare) {
-    const normalized = normalizeResourcePath(relative, 'card')
+  async function restoreCard(relative, prepare, {expectedDigest} = {}) {
+    const normalized = await canonicalPath(relative, 'card')
     if (typeof prepare !== 'function') throw new Error('缺少原版人物卡解析器')
     const workingPath = absolute(normalized)
-    let current
-    current = await durableFiles.read(workingPath)
-    if (current === undefined) throw new Error('人物卡工作版不存在: ' + normalized)
+    if (typeof expectedDigest !== 'string' || !/^[a-f0-9]{64}$/.test(expectedDigest)) throw new Error('原版恢复缺少已确认的 revision')
 
     const stem = path.posix.basename(normalized, path.posix.extname(normalized))
     const payload = await originalCardPayload(normalized)
@@ -226,24 +299,50 @@ export function createFileResourceStore(options = {}) {
 
     const backupName = stem + '-before-original-restore-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.json'
     const backupRelative = 'recovery/cards/' + backupName
-    await writeNew(path.join(dataRoot, ...backupRelative.split('/')), current)
-    await durableFiles.write(workingPath, JSON.stringify(saved, null, 2))
+    await durableFiles.update(workingPath, async current => {
+      if (current === undefined) throw new Error('人物卡工作版不存在: ' + normalized)
+      if (createHash('sha256').update(current).digest('hex') !== expectedDigest) throw new Error('人物卡已变化，请重新查看并确认恢复')
+      const backup = path.join(dataRoot, ...backupRelative.split('/'))
+      await writeNew(backup, current)
+      if (!(await readFile(backup)).equals(current)) throw new Error('人物卡备份回读验证失败，未执行恢复')
+      return Buffer.from(JSON.stringify(saved, null, 2))
+    })
+    await options.onBackupCompleted?.('card:'+normalized,backupRelative)
     return { card: saved, originalPath: 'originals/cards/' + payload.name, backupPath: backupRelative }
   }
 
+  async function version(relative){return durableFiles.version(absolute(await canonicalPath(relative)))}
   async function readText(relative) {
-    const target = absolute(relative)
+    const target = absolute(await canonicalPath(relative))
     const value = await durableFiles.read(target)
     return value === undefined ? undefined : value.toString('utf8')
   }
 
-  async function readCard(relative) {
-    const normalized = normalizeResourcePath(relative, 'card')
-    const text = await readText(normalized)
-    if (text === undefined) return undefined
-    try { return JSON.parse(text) } catch {
-      throw new Error('人物卡 JSON 格式无效：' + normalized)
+  async function metadata(relative) {
+    const normalized = normalizeResourcePath(relative)
+    const workingPath = absolute(normalized)
+    let originalPath = absolute(normalized, true)
+    if (resourceKind(normalized) === 'card') {
+      const originalName = await originalCardName(normalized)
+      if (originalName !== null) originalPath = path.join(path.dirname(originalPath), originalName)
     }
+    const readStat = async function (target) {
+      try { return await stat(target) } catch (error) { if (error && error.code === 'ENOENT') return null; throw error }
+    }
+    const [working, original] = await Promise.all([readStat(workingPath), readStat(originalPath)])
+    return {
+      importedAt: Number(original && original.mtimeMs) || Number(working && working.mtimeMs) || 0,
+      updatedAt: Number(working && working.mtimeMs) || 0
+    }
+  }
+
+  async function readCard(relative) {
+    const normalized = await canonicalPath(relative, 'card')
+    const target=absolute(normalized)
+    return mutableJsonDraft(await cardCache.read(normalized,()=>durableFiles.version(target),async()=>{
+      const bytes=await durableFiles.read(target);if(bytes===undefined)return undefined
+      try{return JSON.parse(bytes.toString('utf8'))}catch{throw new Error('人物卡 JSON 格式无效：'+normalized)}
+    }))
   }
 
   async function scanFiles(folder, prefix) {
@@ -297,30 +396,30 @@ export function createFileResourceStore(options = {}) {
   }
 
   async function worldBookBindingForCard(cardPath) {
-    const card = normalizeResourcePath(cardPath, 'card')
+    const card = await canonicalPath(cardPath, 'card')
     const bindings = await readWorldBookBindings()
     if (!Object.prototype.hasOwnProperty.call(bindings, card)) return { kind: 'default' }
     const value = bindings[card]
     if (value?.version === 2 && Array.isArray(value.sources)) {
       const sources = await Promise.all(value.sources.map(async source => source.kind === 'embedded'
-        ? { kind: 'embedded', cardPath: normalizeResourcePath(source.cardPath, 'card'), available: await exists(absolute(normalizeResourcePath(source.cardPath, 'card'))) }
-        : { kind: 'standalone', path: normalizeResourcePath(source.path, 'worldbook'), available: await exists(absolute(normalizeResourcePath(source.path, 'worldbook'))) }))
+        ? { kind: 'embedded', cardPath: await canonicalPath(source.cardPath, 'card'), available: await exists(absolute(await canonicalPath(source.cardPath, 'card'))) }
+        : { kind: 'standalone', path: await canonicalPath(source.path, 'worldbook'), available: await exists(absolute(await canonicalPath(source.path, 'worldbook'))) }))
       return { kind: 'multiple', sources }
     }
     if (value === null) return { kind: 'none' }
     if (typeof value === 'string') {
-      const worldBookPath = normalizeResourcePath(value, 'worldbook')
+      const worldBookPath = await canonicalPath(value, 'worldbook')
       return { kind: 'standalone', path: worldBookPath, available: await exists(absolute(worldBookPath)) }
     }
     if (value && value.kind === 'embedded') {
-      const ownerCardPath = normalizeResourcePath(value.cardPath, 'card')
+      const ownerCardPath = await canonicalPath(value.cardPath, 'card')
       return { kind: 'embedded', cardPath: ownerCardPath, available: await exists(absolute(ownerCardPath)) }
     }
     return { kind: 'none' }
   }
 
   async function bindWorldBook(cardPath, locator) {
-    const card = normalizeResourcePath(cardPath, 'card')
+    const card = await canonicalPath(cardPath, 'card')
     if (!await exists(absolute(card))) throw new Error('人物卡不存在: ' + card)
     const bindings = await readWorldBookBindings()
     if (locator === undefined || locator === null || str(locator) === '') {
@@ -329,14 +428,14 @@ export function createFileResourceStore(options = {}) {
       return { kind: 'default' }
     }
     if (locator && typeof locator === 'object' && locator.kind === 'embedded') {
-      const ownerCardPath = normalizeResourcePath(locator.cardPath, 'card')
+      const ownerCardPath = await canonicalPath(locator.cardPath, 'card')
       if (!await exists(absolute(ownerCardPath))) throw new Error('人物卡不存在: ' + ownerCardPath)
       bindings[card] = { kind: 'embedded', cardPath: ownerCardPath }
       await writeWorldBookBindings(bindings)
       return { kind: 'embedded', cardPath: ownerCardPath, available: true }
     }
     const worldBookValue = locator && typeof locator === 'object' && locator.kind === 'standalone' ? locator.path : locator
-    const worldBook = normalizeResourcePath(worldBookValue, 'worldbook')
+    const worldBook = await canonicalPath(worldBookValue, 'worldbook')
     if (!await exists(absolute(worldBook))) throw new Error('世界书不存在: ' + worldBook)
     bindings[card] = worldBook
     await writeWorldBookBindings(bindings)
@@ -344,15 +443,15 @@ export function createFileResourceStore(options = {}) {
   }
 
   async function bindWorldBooks(cardPath, sources) {
-    const card = normalizeResourcePath(cardPath, 'card')
+    const card = await canonicalPath(cardPath, 'card')
     if (!await exists(absolute(card))) throw new Error('人物卡不存在: ' + card)
     if (!Array.isArray(sources)) throw new Error('世界书绑定需要有序列表')
     const normalized = []
     const seen = new Set()
     for (const source of sources) {
       const item = source?.kind === 'embedded'
-        ? { kind: 'embedded', cardPath: normalizeResourcePath(source.cardPath, 'card') }
-        : { kind: 'standalone', path: normalizeResourcePath(source?.path, 'worldbook') }
+        ? { kind: 'embedded', cardPath: await canonicalPath(source.cardPath, 'card') }
+        : { kind: 'standalone', path: await canonicalPath(source?.path, 'worldbook') }
       const key = JSON.stringify(item)
       if (seen.has(key)) throw new Error('不能重复绑定同一本世界书')
       if (!await exists(absolute(item.path || item.cardPath))) throw new Error('世界书来源不存在: ' + (item.path || item.cardPath))
@@ -366,7 +465,7 @@ export function createFileResourceStore(options = {}) {
   }
 
   async function unbindWorldBook(cardPath) {
-    const card = normalizeResourcePath(cardPath, 'card')
+    const card = await canonicalPath(cardPath, 'card')
     const bindings = await readWorldBookBindings()
     bindings[card] = null
     await writeWorldBookBindings(bindings)
@@ -374,24 +473,22 @@ export function createFileResourceStore(options = {}) {
   }
 
   async function legacyScriptForCard(cardPath) {
-    const normalized = normalizeResourcePath(cardPath, 'card')
+    const normalized = await canonicalPath(cardPath, 'card')
     const stem = path.posix.basename(normalized, path.posix.extname(normalized))
     const prefix = 'scripts/' + stem + '/'
     return (await list('script')).find(function (item) { return item.startsWith(prefix) })
   }
 
   async function scriptForCard(cardPath) {
-    const normalized = normalizeResourcePath(cardPath, 'card')
+    const normalized = await canonicalPath(cardPath, 'card')
     const bindings = await readBindings()
     const materialPath = bindings[normalized]
-    if (typeof materialPath === 'string' && await exists(absolute(materialPath))) return normalizeResourcePath(materialPath, 'source')
+    if (typeof materialPath === 'string' && await exists(absolute(materialPath))) return await canonicalPath(materialPath, 'source')
     return await legacyScriptForCard(normalized)
   }
 
   async function scriptBindingsForCards(cardPaths) {
-    const cards = Array.from(new Set((Array.isArray(cardPaths) ? cardPaths : []).map(function (cardPath) {
-      return normalizeResourcePath(cardPath, 'card')
-    })))
+    const cards = Array.from(new Set(await Promise.all((Array.isArray(cardPaths) ? cardPaths : []).map(cardPath => canonicalPath(cardPath, 'card')))))
     if (cards.length === 0) return {}
     const [bindings, materialPaths, legacyPaths] = await Promise.all([readBindings(), list('source'), list('script')])
     const availableMaterials = new Set(materialPaths)
@@ -400,7 +497,7 @@ export function createFileResourceStore(options = {}) {
       const materialPath = bindings[cardPath]
       if (typeof materialPath === 'string') {
         try {
-          const normalizedMaterial = normalizeResourcePath(materialPath, 'source')
+          const normalizedMaterial = await canonicalPath(materialPath, 'source')
           if (availableMaterials.has(normalizedMaterial)) { result[cardPath] = normalizedMaterial; continue }
         } catch {}
       }
@@ -413,8 +510,8 @@ export function createFileResourceStore(options = {}) {
   }
 
   async function bindMaterial(cardPath, materialPath) {
-    const card = normalizeResourcePath(cardPath, 'card')
-    const material = normalizeResourcePath(materialPath, 'source')
+    const card = await canonicalPath(cardPath, 'card')
+    const material = await canonicalPath(materialPath, 'source')
     if (!await exists(absolute(card))) throw new Error('人物卡不存在: ' + card)
     if (!await exists(absolute(material))) throw new Error('剧本不存在: ' + material)
     const bindings = await readBindings()
@@ -426,7 +523,7 @@ export function createFileResourceStore(options = {}) {
   }
 
   async function unbindMaterial(cardPath) {
-    const card = normalizeResourcePath(cardPath, 'card')
+    const card = await canonicalPath(cardPath, 'card')
     const bindings = await readBindings()
     const materialPath = bindings[card]
     delete bindings[card]
@@ -435,7 +532,7 @@ export function createFileResourceStore(options = {}) {
   }
 
   async function cardsForMaterial(materialPath) {
-    const material = normalizeResourcePath(materialPath, 'source')
+    const material = await canonicalPath(materialPath, 'source')
     const bindings = await readBindings()
     return Object.keys(bindings).filter(function (cardPath) { return bindings[cardPath] === material })
   }
@@ -470,7 +567,7 @@ export function createFileResourceStore(options = {}) {
     if (kind === 'source') relative = 'materials/' + name
     else if (kind === 'preset') relative = 'presets/' + name
     else {
-      const normalizedCard = normalizeResourcePath(cardPath, 'card')
+      const normalizedCard = await canonicalPath(cardPath, 'card')
       const stem = path.posix.basename(normalizedCard, path.posix.extname(normalizedCard))
       if (await scriptForCard(normalizedCard)) throw new Error('人物卡已经绑定剧本，请先删除原剧本')
       relative = 'scripts/' + stem + '/' + name
@@ -501,7 +598,7 @@ export function createFileResourceStore(options = {}) {
     const originalData = typeof (payload && payload.fileB64) === 'string' && payload.fileB64 !== ''
       ? Buffer.from(payload.fileB64, 'base64')
       : text
-    const normalizedCard = normalizeResourcePath(cardPath, 'card')
+    const normalizedCard = await canonicalPath(cardPath, 'card')
     const stem = path.posix.basename(normalizedCard, path.posix.extname(normalizedCard))
     const name = extensionForText(payload && payload.name || '未命名剧本.txt')
     const next = 'scripts/' + stem + '/' + name
@@ -520,7 +617,7 @@ export function createFileResourceStore(options = {}) {
   }
 
   async function remove(relative) {
-    const normalized = normalizeResourcePath(relative)
+    const normalized = await canonicalPath(relative)
     const kind = resourceKind(normalized)
     if (kind === 'source') {
       const boundCards = await cardsForMaterial(normalized)
@@ -573,12 +670,16 @@ export function createFileResourceStore(options = {}) {
       await plan.remove(absolute(normalized))
       for (const target of originals.concat(recoveries)) await plan.remove(target)
       if (worldBookBindingsChanged) await plan.write(worldBookBindingsPath, JSON.stringify(worldBookBindings, null, 2))
+      if (kind === 'card') {
+        const bindings = await readBindings()
+        if (Object.hasOwn(bindings, normalized)) { delete bindings[normalized]; await plan.write(bindingsPath, JSON.stringify(bindings,null,2)) }
+      }
     })
   }
 
-  async function renameResource(relative, requestedName) {
+  async function renameResource(relative, requestedName, { replayDigest } = {}) {
     await mutations.recover()
-    const oldPath = normalizeResourcePath(relative)
+    const oldPath = await canonicalPath(relative)
     const kind = resourceKind(oldPath)
     const oldName = path.posix.basename(oldPath)
     const oldStem = path.posix.basename(oldName, path.posix.extname(oldName))
@@ -592,6 +693,7 @@ export function createFileResourceStore(options = {}) {
     const newWorking = absolute(newPath)
     const oldWorkingExists = await exists(oldWorking)
     const newWorkingExists = await exists(newWorking)
+    if (!oldWorkingExists && (!replayDigest || !newWorkingExists || createHash('sha256').update(await readFile(newWorking)).digest('hex') !== replayDigest)) throw new Error('资源不存在: ' + oldPath)
     if (!oldWorkingExists && newWorkingExists) {
       let scriptOldPath
       let scriptPath
@@ -884,5 +986,5 @@ export function createFileResourceStore(options = {}) {
     return result
   }
 
-  return Object.freeze({ absolute, bindMaterial, bindWorldBook, bindWorldBooks, cardsForMaterial, ensure, ensureCardWorkspace, hasCardImage, importCard, importText, importWorldBook, list, migrateLegacy, readCard, readCardImage, readText, remove, rename: renameResource, replaceScript, restoreCard, scriptBindingsForCards, scriptForCard, unbindMaterial, unbindWorldBook, worldBookBindingForCard, writeWorking })
+  return Object.freeze({ readMvuDefinition,saveMvuDefinition,inspectMvuDestination,saveMvuCard,absolute, canonicalPath, version, withEditLock, bindMaterial, bindWorldBook, bindWorldBooks, cardsForMaterial, ensure, ensureCardWorkspace, hasCardImage, importCard, importText, importWorldBook, list, metadata, migrateLegacy, readCard, readCardImage, restoreOriginal, readText, remove, rename: renameResource, replaceScript, restoreCard, scriptBindingsForCards, scriptForCard, unbindMaterial, unbindWorldBook, worldBookBindingForCard, writeWorking })
 }
