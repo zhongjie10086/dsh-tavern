@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 if ($env:DSH_TAVERN_OFFLINE -match '^(?i:1|true)$') { throw '离线模式禁止下载安装或更新；请使用已有安装。' }
 
 $InstallHost = if ($env:DSH_TAVERN_HOST) { $env:DSH_TAVERN_HOST } else { 'cli' }
