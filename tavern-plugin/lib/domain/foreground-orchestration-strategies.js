@@ -290,6 +290,7 @@ export function createNativePlayOrchestrationStrategy(options) {
       const prepared = await options.prepareTurn({ sessionId, turn: payload.turn, requestId: input.requestId, userText: userTextOf(payload.messages),
         ...isTavernTriggerInput((payload.messages||[]).findLast(isTurnInput))?{inputKind:'trigger'}:{}, ...(payload.signal ? { signal: payload.signal } : {}) })
       if (prepared && prepared.duplicate) throw new Error('该消息已由酒馆处理，请勿重复发送')
+      if(prepared?.clearedInputMessageIds?.length){const removed=new Set(prepared.clearedInputMessageIds);agentMessages=agentMessages.filter(message=>!removed.has(message?.id))}
       if (mode === 'story' || mode === 'script') {
         const staged = stagedRequests.get(sessionId)
         if (staged) {
@@ -415,6 +416,11 @@ export function createForegroundOrchestrationStrategies(options) {
   }
 
   async function prepareStep(input) {
+    if(input.chat?.regenInProgress||input.chat?.pendingRegeneration){
+      const carrier=(input.payload.messages||[]).findLast(isTurnInput)
+      const source=decodeTavernSource(carrier?.source),record=input.chat.pendingRegeneration
+      if(!isRegenerationInput(carrier)||record?.phase==='adopted'||(record?.id&&source.regenerationId!==record.id))throw new Error('上一次正文重新生成尚未完成：请先恢复历史操作，再发送消息')
+    }
     return await select(input.chat).prepareStep(input)
   }
 

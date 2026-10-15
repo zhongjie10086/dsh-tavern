@@ -1,5 +1,7 @@
 import { decodeTavernSource } from './session-message-source.js'
 import { applyTavernRegexText } from './tavern-regex-display.js'
+import {resolveRuntimeMacroText} from './runtime-content-projection.js'
+import {seededTavernRandom} from './tavern-macro-engine.js'
 
 const str = value => typeof value === 'string' ? value : ''
 const textOf = message => (Array.isArray(message?.content) ? message.content : []).filter(block => block?.type === 'text').map(block => str(block.text)).join('')
@@ -17,7 +19,7 @@ export function projectStoryRegexRequest(request, context = {}) {
   })
   if (context.currentInput) {
     const input = context.currentInput
-    history.push({ role: 'user', projection: str(input.unfiltered ?? input.projectedText ?? input.sourceText),
+    history.push({ role: 'user', current:true,projection: str(input.unfiltered ?? input.projectedText ?? input.sourceText),
       variants: [input.sourceText, input.projectedText, input.unfiltered].filter(value => typeof value === 'string') })
   }
   let cursor = history.length - 1
@@ -35,9 +37,10 @@ export function projectStoryRegexRequest(request, context = {}) {
     }
     if (found < 0) continue
     cursor = found - 1
-    const projected = applyTavernRegexText(history[found].projection, context.regexScripts, {
+    let projected = applyTavernRegexText(history[found].projection, context.regexScripts, {
       placement: message.role === 'user' ? 1 : 2, isMarkdown: false, isEdit: false, depth: history.length - 1 - found
     }).text
+    if(projected.includes('{{')&&context.macroContext)projected=resolveRuntimeMacroText(projected,{...context.macroContext,random:seededTavernRandom(context.macroContext.randomSeed,history[found].current?'prompt-only-input':'request-regex:'+found)}).text
     if (projected === text) continue
     let emitted = false
     const content = (message.content || []).flatMap(block => {

@@ -11,6 +11,12 @@ import {macroDateFormat} from './macro-date-format.js'
 
 let registered = false
 
+/** Request-scoped deterministic draws; callers own the generation identity. */
+export function seededTavernRandom(seed,scope=''){
+ let index=0
+ return ()=>parseInt(sha256Hex(JSON.stringify([seed,scope,index++])).slice(0,13),16)/0x10000000000000
+}
+
 const LEGACY_VARIABLE_EXPRESSION_PATTERN = new RegExp(
   '\\{\\{\\s*(getvar|getglobalvar)::\\s*(' + MACRO_VARIABLE_SHORTHAND_PATTERN.source + ')\\s*(\\?\\?=|\\|\\|=|\\+\\=|-\\=|==|!=|>=|<=|\\?\\?|\\|\\||>|<|=)\\s*([^{}]*?)\\s*\\}\\}',
   'g'
@@ -104,13 +110,16 @@ function registerMacros() {
     if(!choices.length)return ''
     const source=JSON.stringify(args),seed=JSON.stringify([env.pickSeed,source,env.nextPick(source)]);return choices[parseInt(sha256Hex(seed).slice(0,8),16)%choices.length]
   }})
-  MacroRegistry.registerMacro('random', { category:MacroCategory.UTILITY,list:true,strictArgs:false,handler:({args,env})=>{
+  MacroRegistry.registerMacro('random', { category:MacroCategory.UTILITY,list:true,strictArgs:false,handler:({args,env,rawOriginal})=>{
+    if(env.preserveRandom)return rawOriginal
     const choices=args.length===1?str(args[0]).split(',').map(value=>value.trim()):args
     if(!choices.length)return ''
     return choices[Math.min(choices.length-1,Math.floor(env.random()*choices.length))]
   }})
   MacroRegistry.registerMacro('roll', { category:MacroCategory.UTILITY,unnamedArgs:[{name:'dice',optional:true,defaultValue:'1d6'}],handler:({unnamedArgs:[value],env,warn,rawOriginal})=>{
-    const match=str(value).trim().match(/^(\d*)d(\d+)([+-]\d+)?$/i),count=Number(match?.[1]||1),sides=Number(match?.[2]),modifier=Number(match?.[3]||0)
+    if(env.preserveRandom)return rawOriginal
+    const dice=/^\d+$/.test(str(value).trim())?'1d'+str(value).trim():str(value).trim()
+    const match=dice.match(/^(\d*)d(\d+)([+-]\d+)?$/i),count=Number(match?.[1]||1),sides=Number(match?.[2]),modifier=Number(match?.[3]||0)
     if(!match||!Number.isSafeInteger(count)||count<1||count>100||!Number.isSafeInteger(sides)||sides<1||sides>1e9||!Number.isSafeInteger(modifier)||Math.abs(modifier)>1e12){warn('骰子表达式无效或超过数量限制');return rawOriginal}
     let sum=modifier;for(let i=0;i<count;i++)sum+=1+Math.min(sides-1,Math.floor(env.random()*sides));return String(sum)
   }})
@@ -194,6 +203,7 @@ export function renderTavernMacros(text, context = {}) {
   const env = {
     pickSeed:context.chatId||context.pickSeed||context.charName||'',nextPick:(()=>{const occurrences=new Map();return source=>{const index=occurrences.get(source)||0;occurrences.set(source,index+1);return index}})(),
     random:typeof context.random==='function'?context.random:Math.random,
+    preserveRandom:context.preserveRandom===true,
     clock:new Date(typeof context.now==='function'?context.now():context.now??Date.now()),
     locale:context.locale,
     content: str(text),
@@ -206,6 +216,7 @@ export function renderTavernMacros(text, context = {}) {
     extra: { lastUserMessage: str(context.lastUserMessage), lastCharMessage: str(context.lastCharMessage), lastMessage: str(context.lastMessage ?? context.lastUserMessage) }
   }
   let rendered = normalizeLegacyVariableExpressions(text).replace(/\{\{datetimeformat +([^}]*)\}\}/gi,'{{datetimeformat::$1}}')
+  if(!context.preserveRandom)rendered=rendered.replace(/\{\{\s*roll(?::|\s+)\s*([^{}:]+)\}\}/gi,'{{roll::$1}}')
   const diagnostics = []
   // Some ecosystem cards deliberately escape a macro once so that an outer
   // macro pass exposes it for the next pass. Resolve those delayed macros, but

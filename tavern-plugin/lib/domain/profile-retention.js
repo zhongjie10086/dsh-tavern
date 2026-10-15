@@ -7,6 +7,7 @@ import {createRollingDiagnosticStorage} from './rolling-diagnostics.js'
 import {retainModelRequests} from './model-request-retention.js'
 import {decodePackedJson} from '../packed-json.js'
 import {decodeSpFloorArchive} from './sp-floor-archive-format.js'
+import {createStorageFormat} from './storage-format.js'
 
 const digest=value=>createHash('sha256').update(String(value)).digest('hex')
 const shared=/^(preset-history|chat-resources|resource-versions|sp-floor-archives|sp-static-data|sp-vector-indexes|scene-images\/worldbooks)\/([a-f0-9]{64})\.json$/
@@ -18,6 +19,10 @@ function scanCache(root){
 
 /** Mark all retained snapshots, journals, recovery records and library resources before sweeping. */
 export async function profileReferencePlan(dataRoot,{presetVersions=1,exclude=new Set(),onScan}={}){
+  const marker=await createStorageFormat(dataRoot,{maximumVersion:4}).read()
+  // Page graphs intentionally retain every immutable root and orphan in the
+  // first format4 candidate. A legacy resource sweep cannot own their closure.
+  if(marker?.formatVersion===4)return {files:[],references:new Set(),protected:['format4-no-gc']}
   const archiveStore=createProfileDataStore({dataRoot}),cachedScan=scanCache(dataRoot),cache=cachedScan.rows
   const all=await retentionFiles(dataRoot),candidates=new Map(),references=new Set(),protectedFiles=[]
   function mark(value,target=references){
@@ -130,6 +135,15 @@ export function createProfileRetention({dataRoot,store,journal,backups,remoteCac
   })
   function run(options={}){
     const job=tail.catch(()=>{}).then(()=>maintenance(async()=>{
+      const marker=await createStorageFormat(dataRoot,{maximumVersion:4}).read()
+      if(marker?.formatVersion===4){
+        if(await isBusy())return {version:1,dryRun:options.dryRun!==false,status:'busy',results:[],policy:service.limits}
+        // Optional request evidence, rolling diagnostics and re-fetchable cache
+        // are not history authority. Retain their existing cleanup contract.
+        const independent=['remote-cache','diagnostics','model-requests'],only=options.only?options.only.filter(category=>independent.includes(category)):independent
+        const result=await commit(()=>service.run({...options,only}))
+        return {...result,status:'protected',reason:'format4-no-gc',protected:['snapshots','shared-resources','recovery-backups','deleted-chats']}
+      }
       const changed=changeGeneration()
       if(options.automatic===true&&options.dryRun===false&&!options.only&&changed===cleanGeneration)return {version:1,dryRun:false,status:'unchanged',reason:'generation-unchanged',results:[],policy:service.limits}
       exclude.clear();preparedReferences=null;preparedSnapshots=null;preparedBackups=null;preparedRetentionInputs=null
@@ -158,8 +172,11 @@ export function createProfileRetention({dataRoot,store,journal,backups,remoteCac
     tail=job;return job
   }
   async function removeChatArtifacts(chat,{dryRun=false}={}){
+    // A format4 delete only removes live route visibility. Retained immutable
+    // roots can still reference images and recovery receipts; there is no GC.
+    const pageMode=(await createStorageFormat(dataRoot,{maximumVersion:4}).read())?.formatVersion===4
     if(await isBusy(chat))throw Error('对话任务尚未停止，未清理附属文件')
-    const folders=['scene-images/'+digest(chat.id),'model-requests/'+chat.id],rows=[]
+    const folders=[...pageMode?[]:['scene-images/'+digest(chat.id)],'model-requests/'+chat.id],rows=[]
     for(const folder of folders)for(const relative of await retentionFiles(dataRoot,folder))rows.push(await retentionFile(dataRoot,relative,'deleted-chat'))
     for(const relative of await retentionFiles(dataRoot,'diagnostics')){
       if(['diagnostics/rolling.json','diagnostics/index.json'].includes(relative)||relative.startsWith('diagnostics/sessions/'))continue
@@ -168,11 +185,11 @@ export function createProfileRetention({dataRoot,store,journal,backups,remoteCac
     }
     const result=await applyRetentionFiles(dataRoot,rows,{dryRun})
     if(!dryRun){
-      await removeChatReceipts?.(chat)
+      if(!pageMode)await removeChatReceipts?.(chat)
       await diagnostics.removeSession(chat.sessionId,chat.id)
       await store.updateJson('model-requests/index.json',value=>value?{...value,requests:(value.requests||[]).filter(row=>row.chatId!==chat.id)}:undefined)
     }
-    return result
+    return pageMode?{...result,status:'protected',reason:'format4-no-gc',logicalDeletion:true,physicalHistoryRetained:true}:result
   }
   return {...service,run,removeChatArtifacts}
 }

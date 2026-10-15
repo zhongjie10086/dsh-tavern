@@ -1,9 +1,25 @@
 import { appendTavernEvent } from './session-message-source.js'
-import { isTavernSurfaceMarker, surfaceRange, tavernAssistantTurn } from './session-surface-edit.js'
+import { isTavernSurfaceMarker, surfaceRange, tavernAssistantTurn, appendAssistantEvent } from './session-surface-edit.js'
 import { sessionEvents, surfaceReplacementRange } from './session-events.js'
 import { randomUUID } from 'node:crypto'
 import {isDeepStrictEqual} from 'node:util'
-import {isTavernTurnInput,tavernTriggerTurnInput} from './tavern-turn-input.js'
+import {isTavernTurnInput,tavernTriggerTurnInput,storyPlayerInputs} from './tavern-turn-input.js'
+
+function isHelperContext(event){
+ return event?.type==='user/message'&&event.data?.role==='user'&&event.data.source?.kind==='plugin'&&event.data.source.plugin==='dsh-tavern-helper'
+}
+
+function isHistoricalRewrite(event,eventStart){
+ const range=surfaceRange(event?.surfaceOp)
+ return range&&range.start<eventStart&&event.seq>=eventStart&&!isRollbackUserTombstone(event)
+}
+
+function attemptWindow(events,eventStart){
+ const start=events.find(event=>event?.seq>=eventStart&&event.type==='turn/start')
+ if(!start)return {start:eventStart,end:Infinity}
+ const end=events.find(event=>event?.seq>start.seq&&(event.type==='turn/end'||event.type==='turn/start'))
+ return {start:start.seq,end:end?.seq??Infinity}
+}
 
 function object(value) {
   return value !== null && typeof value === 'object' ? value : null
@@ -215,9 +231,13 @@ export function planRegenerationPreview(input){
   return Boolean(beginning&&ending&&leaves.every(seq=>seq>beginning.seq&&seq<ending.seq)
    &&!events.some(candidate=>candidate?.type==='turn/start'&&candidate.seq>beginning.seq&&candidate.seq<ending.seq))
  }
- for(const seq of nodes.slice(start+1))if(!validRollback(bySeq.get(seq))&&!validAbort(bySeq.get(seq)))throw new Error('旧正文之后有非回退空标记或新的消息，拒绝重新生成')
+ const preserved=[]
+ for(const seq of nodes.slice(start+1)){
+  if(isHelperContext(bySeq.get(seq))){preserved.push(seq);continue}
+  if(!validRollback(bySeq.get(seq))&&!validAbort(bySeq.get(seq)))throw new Error('旧正文之后有非回退空标记或新的消息，拒绝重新生成')
+ }
  const shadowedSeqs=nodes.slice(start).map(Number)
- return Object.freeze({start:shadowedSeqs[0],end:shadowedSeqs.at(-1),shadowedSeqs:Object.freeze(shadowedSeqs)})
+ return Object.freeze({start:shadowedSeqs[0],end:shadowedSeqs.at(-1),shadowedSeqs:Object.freeze(shadowedSeqs),...(preserved.length?{preserved}: {})})
 }
 
 export function locateRollbackSurface(input) {
@@ -228,7 +248,8 @@ export function locateRollbackSurface(input) {
     const event = eventAt(events, nodes[index])
     const source = event?.data?.source
     const isFrame = source?.kind === 'plugin' && source.plugin === 'dsh-tavern' && source.form === 'foreground-frame'
-    if (event && event.type === 'user/message' && !isFrame && !isRollbackUserTombstone(event)) {
+    if (event && event.type === 'user/message' && !isFrame &&
+        (isTavernTurnInput(event.data) || !event.data?.source) && !isRollbackUserTombstone(event)) {
       userIndex = index
       break
     }
@@ -272,11 +293,13 @@ export function planRegenerationSurface(input) {
   const eventStart = Math.max(0, Number(input && input.eventStart) || 0)
   const oldAssistantIndex = nodes.indexOf(oldAssistantSeq)
   if (oldAssistantIndex < 0) throw new Error('旧正文已经不在当前模型消息面中')
+  const window=attemptWindow(events,eventStart)
+  if(storyPlayerInputs(events,eventStart).length)throw new Error('重新生成后已有新的玩家输入，无法安全清理')
 
   let finalAssistantIndex = -1
   for (let index = nodes.length - 1; index > oldAssistantIndex; index -= 1) {
     const seq = Number(nodes[index])
-    if (seq < eventStart) continue
+    if (seq < window.start || seq >= window.end) continue
     const event = eventAt(events, seq)
     if (event && event.type === 'assistant/message' && modelSourceOf(event) !== null) {
       finalAssistantIndex = index
@@ -287,12 +310,41 @@ export function planRegenerationSurface(input) {
 
   const shadowedSeqs = nodes.slice(oldAssistantIndex, finalAssistantIndex + 1).map(Number)
   if (shadowedSeqs.length === 0) throw new Error('重新生成流程没有需要替换的旧消息')
+  const runs=[[]]
+  for(const seq of shadowedSeqs){
+    const event=eventAt(events,seq)
+    if(isHelperContext(event)||isHistoricalRewrite(event,eventStart)){if(runs.at(-1).length)runs.push([]);continue}
+    if(seq!==oldAssistantSeq&&event?.type==='assistant/message'&&modelSourceOf(event)!==null&&seq<window.start)throw new Error('重新生成消息归属不一致，无法安全清理')
+    runs.at(-1).push(seq)
+  }
+  if(nodes.slice(finalAssistantIndex+1).some(seq=>!isRollbackUserTombstone(eventAt(events,seq))&&!isRollbackAssistantTombstone(eventAt(events,seq),events)))throw new Error('重新生成后已有新的消息，无法安全清理')
+  const owned=runs.filter(run=>run.length),main=owned.at(-1)
   return Object.freeze({
-    start: shadowedSeqs[0],
-    end: shadowedSeqs[shadowedSeqs.length - 1],
+    start: main[0],
+    end: main.at(-1),
     finalAssistantSeq: Number(nodes[finalAssistantIndex]),
-    shadowedSeqs: Object.freeze(shadowedSeqs)
+    shadowedSeqs: Object.freeze(main),
+    ...(owned.length>1?{cleanups:owned.slice(0,-1).map(run=>({start:run[0],end:run.at(-1),shadowedSeqs:run}))}: {})
   })
+}
+
+/** The rc2 host authors bodies at the tail. Retire earlier owned runs with
+ * empty receipts and leave script messages at their original native seqs. */
+export function regenerationSurfaceRecord(replacement,data,id){
+ return {data,intent:{surfaceOp:{op:'replace',startSeq:replacement.start,endSeq:replacement.end},sourceEventSeqs:replacement.shadowedSeqs},
+  ...(replacement.cleanups?.length?{cleanups:replacement.cleanups.map((run,index)=>({
+   data:{id:id+':cleanup:'+index,role:'user',content:[],source:{kind:'plugin',plugin:'dsh-tavern-regeneration-abort'}},
+   intent:{surfaceOp:{op:'replace',startSeq:run.start,endSeq:run.end},sourceEventSeqs:run.shadowedSeqs}
+  }))}: {})}
+}
+
+export function applyRegenerationSurface(session,surface){
+ for(const cleanup of surface.cleanups||[]){
+  const existing=sessionEvents(session).find(event=>event.type==='user/message'&&event.data?.id===cleanup.data.id)
+  if(existing){if(!isDeepStrictEqual(existing.data,cleanup.data)||!isDeepStrictEqual(existing.sourceEventSeqs,cleanup.intent.sourceEventSeqs))throw new Error('重新生成清理记录已变化');continue}
+  appendTavernEvent(session,'user/message',cleanup.data,cleanup.intent)
+ }
+ return appendAssistantEvent(session,surface.data,surface.intent)
 }
 
 export function planFailedTurnSurface(input) {
@@ -310,21 +362,27 @@ export function planFailedTurnSurface(input) {
 
   let firstIndex = -1
   let lastIndex = -1
+  const owned=[]
   for (let index = 0; index < nodes.length; index += 1) {
     const seq = Number(nodes[index])
     if (seq <= startSeq || seq >= endSeq) continue
+    if(isHistoricalRewrite(eventAt(events,seq),startSeq))continue
     if (firstIndex < 0) firstIndex = index
     lastIndex = index
+    owned.push(seq)
   }
   if (firstIndex < 0 || lastIndex < firstIndex) return null
 
-  const shadowedSeqs = nodes.slice(firstIndex, lastIndex + 1).map(Number)
-  const outsideTurn = shadowedSeqs.find(function (seq) { return seq <= startSeq || seq >= endSeq })
+  const selected=new Set(owned),runs=[[]]
+  for(const seq of nodes.slice(firstIndex,lastIndex+1).map(Number)){if(!selected.has(seq)){if(runs.at(-1).length)runs.push([])}else runs.at(-1).push(seq)}
+  const allRuns=runs.filter(run=>run.length),shadowedSeqs=allRuns[0]
+  const outsideTurn = nodes.slice(firstIndex,lastIndex+1).find(function (seq) { return seq <= startSeq || seq >= endSeq })
   if (outsideTurn !== undefined) throw new Error('失败回合的模型消息面不是连续区间，无法安全清理: ' + outsideTurn)
   return Object.freeze({
     start: shadowedSeqs[0],
     end: shadowedSeqs[shadowedSeqs.length - 1],
-    shadowedSeqs: Object.freeze(shadowedSeqs)
+    shadowedSeqs: Object.freeze(shadowedSeqs),
+    ...(allRuns.length>1?{cleanups:allRuns.slice(1).map(run=>({start:run[0],end:run.at(-1),shadowedSeqs:run}))}: {})
   })
 }
 
@@ -340,16 +398,16 @@ export function clearFailedTurnSurface(input) {
   const makeId = typeof input.id === 'function' ? input.id : function () { return randomUUID() }
   // DSH permits plugin-injected user messages, but assistant messages must be
   // model-sourced on restore. Keep this empty tombstone explicitly plugin-owned.
-  appendTavernEvent(session, 'user/message', {
+  for(const run of [cleanup,...cleanup.cleanups||[]])appendTavernEvent(session, 'user/message', {
     id: makeId(),
     role: 'user',
     content: [],
     source: { kind: 'plugin', plugin: 'dsh-tavern-failed-turn-cleanup' }
   }, {
-    surfaceOp: { op: 'replace', startSeq: cleanup.start, endSeq: cleanup.end },
-    sourceEventSeqs: cleanup.shadowedSeqs
+    surfaceOp: { op: 'replace', startSeq: run.start, endSeq: run.end },
+    sourceEventSeqs: run.shadowedSeqs
   })
-  return cleanup.shadowedSeqs.length
+  return [cleanup,...cleanup.cleanups||[]].reduce((sum,run)=>sum+run.shadowedSeqs.length,0)
 }
 
 /** Remove only the temporary DSH surface nodes appended by a regeneration attempt. */
@@ -357,25 +415,30 @@ export function clearRegenerationAttemptSurface(input) {
   const session = input && input.session
   if (!session || typeof session.append !== 'function') return 0
   const suppliedId = typeof input.id === 'function' ? input.id() : null
-  if (suppliedId && sessionEvents(session).some(event => event.data?.id === suppliedId && event.data?.source?.plugin === 'dsh-tavern-regeneration-abort')) return 0
   const nodes = session.surface && Array.isArray(session.surface.nodes) ? session.surface.nodes : []
   const eventStart = Math.max(0, Number(input && input.eventStart) || 0)
-  const temporary = nodes.filter(function (seq) { return Number(seq) >= eventStart }).map(Number)
+  const events=sessionEvents(session)
+  if(storyPlayerInputs(events,eventStart).length)throw new Error('重新生成后已有新的玩家输入，未清理或覆盖后续对话')
+  const temporary = nodes.filter(function (seq) {
+    const event=eventAt(events,seq)
+    const ownReceipt=suppliedId&&event?.data?.source?.plugin==='dsh-tavern-regeneration-abort'&&(event.data.id===suppliedId||event.data.id?.startsWith(suppliedId+':'))
+    return Number(seq)>=eventStart&&!ownReceipt&&!isHelperContext(event)&&!isHistoricalRewrite(event,eventStart)
+  }).map(Number)
   if (temporary.length === 0) return 0
   const firstIndex = nodes.indexOf(temporary[0])
   const lastIndex = nodes.indexOf(temporary[temporary.length - 1])
-  if (firstIndex < 0 || lastIndex < firstIndex || lastIndex - firstIndex + 1 !== temporary.length) {
-    throw new Error('重新生成临时消息不是连续区间，无法安全清理')
-  }
+  if (firstIndex < 0 || lastIndex < firstIndex) throw new Error('重新生成临时消息不是连续区间，无法安全清理')
+  const selected=new Set(temporary),runs=[[]]
+  for(const seq of nodes.slice(firstIndex,lastIndex+1)){if(!selected.has(Number(seq))){if(runs.at(-1).length)runs.push([])}else runs.at(-1).push(Number(seq))}
   const makeId = () => suppliedId || randomUUID()
-  appendTavernEvent(session, 'user/message', {
-    id: makeId(),
+  for(const [index,run]of runs.filter(run=>run.length).entries())appendTavernEvent(session, 'user/message', {
+    id: suppliedId?suppliedId+':'+run[0]+':abort':makeId(),
     role: 'user',
     content: [],
     source: { kind: 'plugin', plugin: 'dsh-tavern-regeneration-abort' }
   }, {
-    surfaceOp: { op: 'replace', startSeq: temporary[0], endSeq: temporary[temporary.length - 1] },
-    sourceEventSeqs: temporary
+    surfaceOp: { op: 'replace', startSeq: run[0], endSeq: run.at(-1) },
+    sourceEventSeqs: run
   })
   return temporary.length
 }

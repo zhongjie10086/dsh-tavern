@@ -70,6 +70,7 @@ function createTavernSpAuthorityBridge(options) {
   note,
   trace:()=>trace,
   getState:()=>({ready,revision,claim,closed,stale:Boolean(stale)}),
+  isPersisted:()=>{try{const api=options.getOriginalApi();return Boolean(api&&ready&&!closed&&!claim&&!stale&&!queued&&!publishing.size&&lastReceipt&&lastStamp===stamp(api.exportTableAsJson())&&lastScope===scope(api));}catch(_){return false;}},
   close:()=>{closed=true;status('closed')}
  };
 }
@@ -230,6 +231,7 @@ async function connectTavernSpSingleAuthority(win,options,nativeDatabase,descrip
  // `awaitOriginalWork` is false only for an ordinary event on a visible page: the
  // original's deferred table fill then stays parallel to the next send.
  win.__dshFlushOriginalDatabase=async({retry=false,recoveryCall,awaitOriginalWork=true}={})=>{if(awaitOriginalWork)await api.__dshFlushPendingWork?.();if(retry){if(hydration)throw Error('SP 原包正在加载本局表格，当前仅可查看缓存。');const failedHydration=hydrationFailure;hydrationFailure=null;await bridge.publish(true,recoveryCall,failedHydration?'hydration':'retry')}await bridge.flush({settle:awaitOriginalWork,call:recoveryCall});await options.flushSettings?.(recoveryCall);};
+ Object.defineProperty(win,'__dshOriginalDatabaseIsPersisted',{value:()=>{try{return connected&&!internal&&!hydration&&!hydrationFailure&&!state.retired&&state.ready===true&&win.AutoCardUpdaterAPI===api&&Number(options.context().lifecycleRevision)===lifecycle&&api.__dshIsPersistenceIdle?.()===true&&bridge.isPersisted();}catch(_){return false;}}});
  const initial=await bridge.connect();connected=true;
  if(initial.phase==='choice'||initial.phase==='claiming'){
   conflictPanel=win.document.createElement('section');conflictPanel.setAttribute('role','alert');conflictPanel.style.cssText='position:fixed;inset:12px 12px auto;z-index:2147483647;background:Canvas;color:CanvasText;padding:16px;border:1px solid #b88';

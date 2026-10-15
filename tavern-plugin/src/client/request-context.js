@@ -102,6 +102,13 @@ function requestContextSections(request) {
             const [refresh, setRefresh] = React.useState(0);
             const loaded = React.useRef(null);
             const [loading, setLoading] = React.useState(true);
+            const [archiveSession, setArchiveSession] = React.useState("");
+            const [archiveError, setArchiveError] = React.useState("");
+            React.useEffect(() => {
+                let active=true;setArchiveSession("");setArchiveError("");
+                rpc("getTavernSessionIdentity",{sessionId:props.contextSessionId},props.contextSessionId).then(value=>{if(active&&value.identity?.kind==='chat-fields')setArchiveSession(props.contextSessionId)}).catch(error=>{if(active)setArchiveError(String(error?.message||error))});
+                return()=>{active=false};
+            },[props.contextSessionId]);
             React.useEffect(() => {
                 let active = true; setError(""); setLoading(true);
                 if (loaded.current?.sessionId !== props.contextSessionId) { loaded.current = null; setRecord(null); }
@@ -150,6 +157,8 @@ function requestContextSections(request) {
                             h("summary", null, h("span", { className: "dsh-context-chevron", "aria-hidden": true }, "›"), "来源与消息信息"),
                             h("pre", null, section.metadataText)) : null)),
                     query && !visibleSections.length ? h("p", { className: "dsh-context-empty" }, "没有匹配的内容") : null) : null,
-                request ? h("p", { className: "dsh-context-footnote" }, "发送时的上下文快照 · 供应商协议转换前 · 消息顺序保持不变") : null
+                request ? h("p", { className: "dsh-context-footnote" }, "发送时的上下文快照 · 供应商协议转换前 · 消息顺序保持不变") : null,
+                archiveSession === props.contextSessionId ? h(StoredMessageHistory, {key:props.contextSessionId,sessionId:props.contextSessionId}) : null,
+                archiveError ? h("p",{role:"alert"},"存档身份读取失败："+archiveError) : null
             );
 		}

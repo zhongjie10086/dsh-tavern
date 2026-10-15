@@ -7,6 +7,7 @@ import {freezeJson,jsonBytes} from './readonly-json.js'
 import {encodeSpFloorArchive,decodeSpFloorArchive} from './sp-floor-archive-format.js'
 import {persistSpVectorIndex} from './sp-vector-index-store.js'
 import {mutableJsonDraft,finishJsonDraft} from './json-draft.js'
+import {createStorageFormat} from './storage-format.js'
 
 function copySpBranches(input) {
   input=finishJsonDraft(input)
@@ -120,12 +121,28 @@ export function createSpStorageStore(journal, { dataRoot, readOnly = false }) {
   }
   async function pruneSnapshots(references,{dryRun=true}={}){
     if(readOnly)denyWrite()
+    if((await createStorageFormat(dataRoot,{maximumVersion:4}).read())?.formatVersion===4)return {dryRun,snapshots:0,bytes:0,status:'protected',reason:'format4-no-gc'}
     if(!connection&&!await stat(path.join(dataRoot,'sp-database.sqlite')).catch(e=>{if(e.code==='ENOENT')return null;throw e}))return {dryRun,snapshots:0,bytes:0}
     const sql=await db(),rows=sql.prepare('SELECT hash,length(CAST(data AS BLOB)) AS bytes FROM sp_snapshots').all().filter(row=>!references.has(row.hash))
     if(!dryRun&&rows.length){sql.exec('BEGIN IMMEDIATE');try{for(const row of rows){sql.prepare('DELETE FROM sp_snapshots WHERE hash=?').run(row.hash)}sql.exec('COMMIT')}catch(e){sql.exec('ROLLBACK');throw e}sql.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM')}
     return {dryRun,snapshots:rows.length,bytes:rows.reduce((n,row)=>n+row.bytes,0)}
   }
+  async function decodeProjection(id,envelope,paths=[]){
+    if(!envelope||!paths.some(pointer=>pointer==='/spDatabase'||pointer.startsWith('/spDatabase/')))return envelope
+    const full=await journal.readFields(id,{paths:['/spDatabase'],pinnedRevision:envelope.storageRevision,snapshotId:envelope.snapshotId})
+    const field=full.fields[0],decoded=field.found?(await decode({spDatabase:field.value})).spDatabase:undefined
+    const fields=envelope.fields.map(row=>{
+      if(row.path!=='/spDatabase'&&!row.path.startsWith('/spDatabase/'))return row
+      let value=decoded
+      for(const part of row.path.slice('/spDatabase'.length).split('/').slice(1).map(part=>part.replace(/~1/g,'/').replace(/~0/g,'~'))){if(value===null||typeof value!=='object'||!Object.hasOwn(value,part)){value=undefined;break}value=value[part]}
+      return {path:row.path,found:value!==undefined,...value===undefined?{}:{value}}
+    })
+    return freezeJson({...envelope,fields})
+  }
   return { ...journal, ...(readOnly?{remove:denyWrite,prune:denyWrite,migrateResources:denyWrite}:{}), resolveLayer,pruneSnapshots,
+    ...(journal.readFields?{readFields:async(id,options={})=>decodeProjection(id,await journal.readFields(id,options),options.paths),
+      readMessageWindow:async(id,options={})=>decodeProjection(id,await journal.readMessageWindow(id,options),options.fields),
+      readMessageSlice:async(id,options={})=>decodeProjection(id,await journal.readMessageSlice(id,options),options.fields)}:{}),
     readReadonly: async id => {
       const value = await (journal.readReadonly || journal.read)(id)
       if (!value) return value

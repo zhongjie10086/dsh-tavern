@@ -27,6 +27,7 @@ export function createForegroundHandoff(options = {}) {
     if (chat !== undefined && activity.role === 'settlement' && (activity.phase === 'pending' || activity.phase === 'running')) {
       await queueBackground(chat.id)
     }
+    const clearedInputMessageIds=chat===undefined?[]:await options.clearFailedTurns?.(input.sessionId)||[]
     // A greeting is already story text. Direct typing may bypass candidate
     // preparation, so project its keywords locally before the first body request.
     if (chat && ['story', 'script'].includes(chat.mode) && !chat.preparedWorldBook &&
@@ -35,7 +36,8 @@ export function createForegroundHandoff(options = {}) {
       const latest = await store.chatForSession(input.sessionId)
       if (latest && !latest.preparedWorldBook) await options.prepareOpeningWorldBook(latest)
     }
-    return await turns.prepare(input)
+    const prepared=await turns.prepare(input)
+    return clearedInputMessageIds.length?{...prepared,clearedInputMessageIds}:prepared
   }
 
   function later(work, label, input) {

@@ -6,12 +6,12 @@ import { sessionEvents, appendSessionEvent } from './session-events.js'
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { projectPlayerContent } from './player-input-content.js'
-import { clearRegenerationAttemptSurface, locateRegenerationSurface, locateRollbackSurface, planRegenerationSurface, planRegenerationPreview, regenerationAttemptTurns } from './rollback-surface.js'
+import { clearRegenerationAttemptSurface, locateRegenerationSurface, locateRollbackSurface, planRegenerationSurface, planRegenerationPreview, regenerationAttemptTurns, regenerationSurfaceRecord, applyRegenerationSurface } from './rollback-surface.js'
 import { assertRegenerationSourceCurrent, replaceLastRound } from './last-round-replacement.js'
 import { diagnosticIdentity, regenerationTargetDiagnostic } from './regeneration-diagnostics.js'
 import {originalSpRollbackNeedsMaterialization,originalSpFloorCarries} from './sp-authority.js'
 import {tavernTriggerTurnInput} from './tavern-turn-input.js'
-import {encodeTavernMessage} from './session-message-source.js'
+import {encodeTavernMessage,appendTavernEvent} from './session-message-source.js'
 import {characterDesignStamp} from './character-design-rollback.js'
 
 function str(value) {
@@ -208,10 +208,15 @@ export function createRoundHistory({ chats, sessions, scripts, timeline, queueSe
     if (session.header?.version >= 3) {
       const preview = session.constructor.fromRestore(session.id, structuredClone(session.snapshotEvents ? session.snapshotEvents() : sessionEvents(session)), structuredClone(session.header), session.inheritedEventCount, 'detached')
       try {
+        let span=previewSpan
+        if(previewSpan.preserved?.length){
+          const carrier=appendTavernEvent(preview,'user/message',{id:randomUUID(),role:'user',content:[],source:{kind:'plugin',plugin:'dsh-tavern-regen'}},{surfaceOp:'append'})
+          span={start:carrier.seq,end:carrier.seq,shadowedSeqs:[carrier.seq]}
+        }
         appendSessionEvent(preview, 'assistant/message', {
           turn: oldTurn, step: 1,
           message: { id: randomUUID(), role: 'assistant', content: [{ type: 'text', text: msgs0[oldAssistantIndex].text }], source: oldSource }
-        }, { surfaceOp: { op: 'replace', start: previewSpan.start, end: previewSpan.end }, sourceEventSeqs: previewSpan.shadowedSeqs })
+        }, { surfaceOp: { op: 'replace', start: span.start, end: span.end }, sourceEventSeqs: span.shadowedSeqs })
       } catch (error) {
         throw new Error('当前 DSH 不支持正文替换，未启动重新生成。' + str(error?.message || error), { cause: error })
       }
@@ -277,7 +282,7 @@ export function createRoundHistory({ chats, sessions, scripts, timeline, queueSe
         id: randomUUID(),
         role: 'user',
         content: inputKind==='trigger'?[]:projectPlayerContent(msgs0[oldAssistantIndex - 1].inputAttachments, syntheticText),
-        source: { kind: 'plugin', plugin: 'dsh-tavern-regen',...inputKind==='trigger'?{inputKind,targetAssistantId,guidance:guide}:{} }
+        source: { kind: 'plugin', plugin: 'dsh-tavern-regen',regenerationId:regenerationRecord.id,...inputKind==='trigger'?{inputKind,targetAssistantId,guidance:guide}:{} }
       }))
       await agent.whenIdle()
     } catch (error) {
@@ -313,10 +318,8 @@ export function createRoundHistory({ chats, sessions, scripts, timeline, queueSe
     try {
       replacement = planRegenerationSurface({ events: sessionEvents(session), nodes: session.surface?.nodes || [], oldAssistantSeq: oldSeq, eventStart })
     } catch (error) { await restoreFailedRegen(); throw error }
-    const surface = {
-      data: { turn: oldTurn, step: 1, message: { id: regenerationRecord.id, role: 'assistant', content: [{ type: 'text', text: body }], source: oldSource } },
-      intent: { surfaceOp: { op: 'replace', startSeq: replacement.start, endSeq: replacement.end }, sourceEventSeqs: replacement.shadowedSeqs }
-    }
+    const surface = regenerationSurfaceRecord(replacement,
+      { turn: oldTurn, step: 1, message: { id: regenerationRecord.id, role: 'assistant', content: [{ type: 'text', text: body }], source: oldSource } },regenerationRecord.id)
     let committedChat
     try { committedChat = await updateChat(latest.id, function (current) {
       const currentMessages = Array.isArray(current && current.messages) ? current.messages : []
@@ -342,7 +345,7 @@ export function createRoundHistory({ chats, sessions, scripts, timeline, queueSe
       return scripts.stageRegeneration ? scripts.stageRegeneration(next,regenerationRecord.id) : next
     }, { source: 'foreground.regen-commit' })
     } catch (error) { await restoreFailedRegen(); throw error }
-    try { appendAssistantEvent(session, surface.data, surface.intent) }
+    try { applyRegenerationSurface(session, surface) }
     catch (error) {
       // If the native marker exists, adoption began; recovery must finish it.
       if (!pendingAssistantEdit(session, surface.data.message.id)) await restoreFailedRegen()

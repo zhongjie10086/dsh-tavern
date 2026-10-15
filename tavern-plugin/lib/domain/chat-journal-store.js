@@ -12,6 +12,7 @@ import {mutableJsonDraft,finishJsonDraft} from './json-draft.js'
 import { retentionFile, applyRetentionFiles } from './retention-policy.js'
 import {encodePackedJson,decodePackedJson,CARD_MVU_PENDING_CONTRACT} from '../packed-json.js'
 import {createChatResourceCodec} from './chat-resource-codec.js'
+import {canonicalChatId as safeChatId,withChatMutation} from './chat-mutation-lock.js'
 
 const STORAGE_REVISION = '_storageRevision'
 const migrationReceiptLimit = 4096
@@ -54,7 +55,7 @@ function durableChanges(current, changes) {
   }))
 }
 
-function requiredContract(chat) {
+export function requiredChatStorageContract(chat) {
   const marker=chat?.tavernCardMvuContract
   const rows=Array.isArray(chat?.tavernHelperEventJournal)?chat.tavernHelperEventJournal:[]
   if((marker!==undefined&&marker!==1)||rows.some(row=>row?.cardMvu!==undefined&&(marker!==1||row.cardMvu?.version!==1))) {
@@ -62,6 +63,7 @@ function requiredContract(chat) {
   }
   return marker===1?CARD_MVU_PENDING_CONTRACT:undefined
 }
+const requiredContract=requiredChatStorageContract
 
 function encodeSnapshot(value, chat=value) {
   return encodePackedJson(value,{storageVersion:3,requiredContract:requiredContract(chat)})
@@ -69,12 +71,6 @@ function encodeSnapshot(value, chat=value) {
 
 function encodeFrame(value, chat) {
   return encodePackedJson(value,{pretty:false,storageVersion:3,requiredContract:requiredContract(chat)})
-}
-
-function safeChatId(value) {
-  const id = String(value || '')
-  if (id === '' || id.includes('/') || id.includes('\\') || id === '.' || id === '..') throw new Error('Tavern Chat ID 不合法')
-  return process.platform === 'win32' ? id.toLowerCase() : id
 }
 
 async function syncDirectory(directory) {
@@ -103,7 +99,7 @@ export function createChatJournalStore(options = {}) {
   const now = typeof options.now === 'function' ? options.now : Date.now
   const frameLimit = Math.max(1, Number(options.frameLimit) || 200)
   const byteLimit = Math.max(1, Number(options.byteLimit) || 1024 * 1024)
-  const mutationTails = new Map(), readFlights = new Map(), readCache = new Map()
+  const readFlights = new Map(), readCache = new Map()
   const mutationLocks = createDurableFilePromotion(),storageFormat=createStorageFormat(dataRoot)
   const revisionProtectors = new Set()
   function protectRevisions(provider) { revisionProtectors.add(provider); return () => revisionProtectors.delete(provider) }
@@ -161,13 +157,12 @@ export function createChatJournalStore(options = {}) {
   }
 
   function serialize(chatId, operation) {
-    const id = safeChatId(chatId)
-    const previous = mutationTails.get(id) || Promise.resolve()
-    // Keep the lock outside the removable chat directory. Hold it from the
-    // latest materialization through append/rotation (and deletion).
-    const current = previous.catch(function () {}).then(() => mutationLocks.withLock(path.join(chatsRoot, id), operation, { waitMs: 30_000 }))
-    mutationTails.set(id, current)
-    return current.finally(function () { if (mutationTails.get(id) === current) mutationTails.delete(id) })
+    return withChatMutation(dataRoot,chatId,async()=>{
+      // A successful earlier read must not authorize a cached-format writer
+      // after an explicitly published format4 route.
+      await storageFormat.read()
+      return operation()
+    })
   }
 
   async function legacyRead(paths) {
@@ -405,6 +400,20 @@ export function createChatJournalStore(options = {}) {
     return state === null ? undefined : jsonClone(state.chat)
   }
 
+  async function revisions(chatId) {
+    await checkFormat()
+    const paths=layout(chatId),snapshots=await snapshotRows(paths),journals=await journalRows(paths)
+    if(!snapshots.length&&!journals.length){const chat=await readReadonly(chatId);return chat?[revisionOf(chat)]:[]}
+    const minimum=snapshots[0]?.revision
+    if(minimum===undefined)throw Object.assign(Error('Chat history has no snapshot anchor'),{code:'DSH_TAVERN_SNAPSHOT_CORRUPT'})
+    const values=new Set(snapshots.map(row=>row.revision))
+    for(const row of journals){
+      const parsed=await parseJournal(row,-1,Number.POSITIVE_INFINITY,paths.id)
+      for(const frame of parsed.frames)if(frame.revision>=minimum)values.add(frame.revision)
+    }
+    return [...values].sort((a,b)=>a-b)
+  }
+
   async function update(chatId, updater, metadata = {}) {
     metadata.signal?.throwIfAborted()
     if (typeof updater !== 'function') throw new Error('Chat Journal Store 缺少 updater')
@@ -580,5 +589,5 @@ export function createChatJournalStore(options = {}) {
     })
   }
 
-  return Object.freeze({ read, readReadonly, readRevision, update, version, remove, prune, protectRevisions, retentionInputs, migrateResources })
+  return Object.freeze({ read, readReadonly, readRevision, revisions, update, version, remove, prune, protectRevisions, retentionInputs, migrateResources })
 }

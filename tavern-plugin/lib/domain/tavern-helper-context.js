@@ -1,9 +1,11 @@
 import { projectAgentContent } from './runtime-content-projection.js'
-import { freezeJson } from './readonly-json.js'
+import { freezeJson, isFrozenJson } from './readonly-json.js'
+import { immutableJsonSnapshot } from './json-draft.js'
 const readonlyContexts=new WeakMap()
+const readonlyRows=new WeakMap()
 export function projectTavernHelperContextReadonly(chat) {
   if (Object.isFrozen(chat) && readonlyContexts.has(chat)) return readonlyContexts.get(chat)
-  const value=freezeJson(projectTavernHelperContext(chat))
+  const value=freezeJson(projectTavernHelperContext(chat,{readonly:true}))
   if(Object.isFrozen(chat))readonlyContexts.set(chat,value)
   return value
 }
@@ -49,39 +51,54 @@ export function lastTavernHelperVariables(messages) {
 }
 
 /** Project authoritative Chat state into the synchronous Tavern Helper read API. */
-export function projectTavernHelperContext(chat) {
+export function projectTavernHelperContext(chat,{readonly=false}={}) {
+  const copy=readonly?immutableJsonSnapshot:clone
   const messages = []
   const turnMessageIds = {}
   for (const source of Array.isArray(chat && chat.messages) ? chat.messages : []) {
     if (!source || typeof source !== 'object') continue
     const messageId = messages.length
+    const cacheKey=JSON.stringify([messageId,chat.cardName,chat.macroState?.userName])
+    const cached=readonly&&isFrozenJson(source)?readonlyRows.get(source)?.get(cacheKey):null
+    if(cached){
+      messages.push(cached)
+      const turn=Math.max(0,Number(source.turn)||(source.greeting===true?1:0))
+      if(cached.role==='assistant'&&turn>0)turnMessageIds[String(turn)]=messageId
+      continue
+    }
     const swipeId = selectedSwipe(source)
     const swipes = Array.isArray(source.swipes) && source.swipes.length > 0
       ? source.swipes.map(str)
       : [str(source.sourceText || source.text)]
-    const variables = Array.isArray(source.variables) ? clone(source.variables) : []
+    const variables = Array.isArray(source.variables) ? copy(source.variables) : []
     const tavernRole = source.tavernRoleOverride || (source.role === 'tavern-helper'
       ? (['system', 'assistant', 'user'].includes(source.tavernRole) ? source.tavernRole : 'assistant')
       : (source.role === 'user' ? 'user' : 'assistant'))
     const projected = {
-      pluginData: clone(source.tavernPluginData || {}),
+      pluginData: copy(source.tavernPluginData || {}),
       ...(source.tavernLegacyId?{id:source.tavernLegacyId}:{}),
-      ...(source.tavernSendDate?{send_date:clone(source.tavernSendDate)}:{}),
+      ...(source.tavernSendDate?{send_date:copy(source.tavernSendDate)}:{}),
       name: str(source.name || (tavernRole === 'assistant' ? chat.cardName : tavernRole === 'user' ? chat.macroState?.userName : '')),
       is_hidden: source.tavernHidden === true,
-      extra: clone(source.tavernExtra || {}),
-      swipes_info: clone(source.tavernSwipesInfo || []),
+      extra: copy(source.tavernExtra || {}),
+      swipes_info: copy(source.tavernSwipesInfo || []),
       message_id: messageId,
       role: tavernRole,
       message: swipes[swipeId] ?? swipes[0] ?? '',
       swipe_id: swipeId,
       swipes,
       swipes_data: variables,
-      variables: clone(variables[swipeId] || {})
+      variables: copy(variables[swipeId] || {})
     }
     if (source.role === 'tavern-helper') {
       projected.is_hidden = source.tavernHidden === true
       if (str(source.name) !== '') projected.name = str(source.name)
+    }
+    if(readonly&&isFrozenJson(source)){
+      if(!readonlyRows.has(source))readonlyRows.set(source,new Map())
+      const rows=readonlyRows.get(source)
+      if(rows.size>=8)rows.delete(rows.keys().next().value)
+      rows.set(cacheKey,freezeJson(projected))
     }
     messages.push(projected)
     if (projected.role === 'assistant') {
@@ -96,8 +113,8 @@ export function projectTavernHelperContext(chat) {
     databaseInitialized: !!chat?.spDatabase,
     legacyChatFileName: str(chat?.legacyChatFileName),
     personaDescription: str(chat?.tavernPersona?.description),
-    scriptPrompts: clone(chat && chat.tavernScriptPrompts || []),
-    chatMetadata: clone(chat && chat.tavernPluginMetadata || {}),
+    scriptPrompts: copy(chat && chat.tavernScriptPrompts || []),
+    chatMetadata: copy(chat && chat.tavernPluginMetadata || {}),
     mvuEnabled: chat?.mvu?.enabled === true,
     // Z96: a message frame stops holding a card's opening for MVU once this game's settlement is off.
     mvuSettlementPaused: chat?.mvu?.enabled === true && Boolean(chat.mvu.settlementPaused),
@@ -105,8 +122,8 @@ export function projectTavernHelperContext(chat) {
     lifecycleRevision: Math.max(0, Number(chat && chat.tavernHelperLifecycleRevision) || 0),
     messages,
     turnMessageIds,
-    chatVariables: clone(chat && chat.variables && typeof chat.variables === 'object' ? chat.variables : {}),
-    scriptVariables: clone(chat && chat.tavernHelperScriptVariables && typeof chat.tavernHelperScriptVariables === 'object' ? chat.tavernHelperScriptVariables : {})
+    chatVariables: copy(chat && chat.variables && typeof chat.variables === 'object' ? chat.variables : {}),
+    scriptVariables: copy(chat && chat.tavernHelperScriptVariables && typeof chat.tavernHelperScriptVariables === 'object' ? chat.tavernHelperScriptVariables : {})
   }
 }
 

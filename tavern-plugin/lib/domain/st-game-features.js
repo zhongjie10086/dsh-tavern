@@ -79,9 +79,9 @@ export function effectiveGamePreset(chat) {
   return next
 }
 
-export function resolveGamePreset(chat, userText) {
+export function resolveGamePreset(chat, userText, options={}) {
   const last = [...(chat.messages || [])].reverse().find(message => message.role === 'assistant')
-  return resolveRuntimePresetMacros(effectiveGamePreset(chat), { charName: chat.cardName, macroState: chat.macroState,
+  return resolveRuntimePresetMacros(effectiveGamePreset(chat), { ...options,charName: chat.cardName, macroState: chat.macroState,
     lastUserMessage: str(userText), lastCharMessage: str(last?.sourceText ?? last?.text) })
 }
 

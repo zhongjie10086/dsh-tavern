@@ -4,6 +4,33 @@ const isOverflow = failure => failure?.code === 'CONTEXT_WINDOW_EXCEEDED' || /ma
 // Intermediate summaries are private to this operation: the native engine alone
 // commits the final checkpoint, after verifying the original surface is intact.
 export async function* boundedCompaction(ctx, request, stream) {
+  const rawStream = stream
+  let fallbackUsed = false
+  // Buffer a complete response: failed/tool-only output must never reach the
+  // native checkpoint assembler, including its retained-round appendix.
+  stream = async function* (input) {
+    for (;;) {
+      input.signal?.throwIfAborted()
+      const events = []
+      for await (const event of rawStream(input)) {
+        input.signal?.throwIfAborted()
+        events.push(event)
+      }
+      const finish = events.findLast(event => event.type === 'finish')
+      const tool = events.some(event => event.type === 'block-end' && event.block?.type === 'tool-call')
+      const text = events.filter(event => event.type === 'block-end' && event.block?.type === 'text').map(event => event.block.text || '').join('').trim()
+      // Provider failures and truncation are not eligible for a content retry.
+      const eligible = !finish?.reason?.failure && ['stop', 'tool-calls', 'tool-call'].includes(finish?.reason?.kind)
+      if (eligible && (tool || !text)) {
+        if (fallbackUsed) throw Error('总结模型再次返回工具调用或空摘要，未修改历史')
+        fallbackUsed = true
+        input = { ...input, tools: [], toolChoice: 'none' }
+        continue
+      }
+      yield* events
+      return
+    }
+  }
   const info = await ctx.llm.resolveModelInfo?.(request.provider, request.model, request.signal)
   const capacity = info?.context?.contextWindow
   const reserve = request.maxTokens ?? info?.defaultMaxTokens ?? 8192

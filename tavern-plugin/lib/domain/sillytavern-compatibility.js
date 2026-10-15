@@ -1,4 +1,5 @@
 import { inputAttachments } from './player-input-content.js'
+import {seededTavernRandom} from './tavern-macro-engine.js'
 function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
 }
@@ -7,8 +8,8 @@ function role(value) {
   return value === 'user' || value === 'assistant' ? value : 'system'
 }
 
-function macro(text, resolveMacros, state, card) {
-  const result = resolveMacros(str(text), { charName: str(card.name), macroState: state })
+function macro(text, resolveMacros, state, card, context={}) {
+  const result = resolveMacros(str(text), { charName: str(card.name), macroState: state,...context })
   state.userName = result.macroState.userName
   state.local = result.macroState.local
   state.global = result.macroState.global
@@ -149,6 +150,8 @@ export function compileSillyTavernRequest(options = {}) {
     global: Object.assign({}, options.macroState && options.macroState.global || {})
   }
   const diagnostics = []
+  const frontKeys=new Set(options.frontEntryKeys||[])
+  const macroContext=(scope,preserveRandom=false)=>({preserveRandom,random:options.randomSeed?seededTavernRandom(options.randomSeed,scope):undefined})
   const history = (Array.isArray(options.history) ? options.history : []).map(function (item) {
     const sourceText = str(item.sourceText || item.text || item.content)
     return { role: role(item.role), content: sourceText, ...(item.inputAttachments?.length ? { inputAttachments: inputAttachments(item.inputAttachments) } : {}), source: { kind: 'chat-history' } }
@@ -158,7 +161,7 @@ export function compileSillyTavernRequest(options = {}) {
     history.push({ role: 'user', content: inputText, ...(options.inputAttachments?.length ? { inputAttachments: inputAttachments(options.inputAttachments) } : {}), source: { kind: 'current-input' } })
   }
   for (const [index, item] of history.entries()) {
-    const rendered = macro(item.content, resolveMacros, state, card)
+    const rendered = macro(item.content, resolveMacros, state, card,macroContext('history:'+index))
     const messageRole = role(item.role)
     const depth = history.length - index - 1
     const placement = messageRole === 'user' ? 1 : (messageRole === 'assistant' ? 2 : null)
@@ -183,7 +186,7 @@ export function compileSillyTavernRequest(options = {}) {
     return (Number(right.injectionDepth) || 0) - (Number(left.injectionDepth) || 0) || (Number(left.injectionOrder) || 0) - (Number(right.injectionOrder) || 0)
   })
   for (const entry of absolute) {
-    const rendered = macro(overrideContent(entry, card), resolveMacros, state, card)
+    const rendered = macro(overrideContent(entry, card), resolveMacros, state, card,macroContext('preset:'+entry.entryKey,frontKeys.has(entry.entryKey)))
     diagnostics.push(...rendered.diagnostics)
     if (rendered.text.trim() === '') continue
     history.splice(Math.max(0, history.length - (Number(entry.injectionDepth) || 0)), 0, {
@@ -210,7 +213,7 @@ export function compileSillyTavernRequest(options = {}) {
     const values = marker === null ? [{ role: entry.role, content: overrideContent(entry, card) }] : marker
     for (const value of values) {
       const alreadyProjected = value.source && (value.source.kind === 'chat-history' || value.source.kind === 'current-input' || value.source.kind === 'preset-depth')
-      const rendered = alreadyProjected ? { text: value.content, diagnostics: [] } : macro(value.content, resolveMacros, state, card)
+      const rendered = alreadyProjected ? { text: value.content, diagnostics: [] } : macro(value.content, resolveMacros, state, card,macroContext('preset:'+entry.entryKey,frontKeys.has(entry.entryKey)))
       diagnostics.push(...rendered.diagnostics)
       if (rendered.text.trim() === '' && !value.inputAttachments?.length) continue
       messages.push({

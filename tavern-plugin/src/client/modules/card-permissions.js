@@ -63,5 +63,8 @@ function tavernFrameCsp(input = {}) {
   const shipped = origin ? origin + '/api/dsh-tavern/vendor/ ' + origin + '/api/dsh-tavern/client-assets/' : "'self'";
   const assets = input.assetAccess?.prefix && origin ? ' '+origin+input.assetAccess.prefix : '';
   const remote = network ? 'https: http:' : shipped+assets;
-  return '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\' \'unsafe-eval\' data: blob: ' + remote + '; connect-src data: blob: ' + remote + (network ? ' ws: wss:' : '') + '; img-src data: blob: ' + remote + '; media-src data: blob: ' + remote + '; style-src \'unsafe-inline\' data: blob: ' + remote + '; font-src data: ' + remote + '; frame-src data: blob:; object-src \'none\'; base-uri \'none\'; form-action \'none\'">';
+  const unload = (input.spUnload?.participants || []).flatMap(participant=>{
+    try{const url=new URL(participant.path);return url.origin===origin&&!url.search&&!url.hash&&/^\/api\/dsh-tavern\/frame-unload\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]{43}$/.test(url.pathname)?[url.href]:[];}catch(_){return [];}
+  }).map(url=>' '+url.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')) .join('');
+  return '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\' \'unsafe-eval\' data: blob: ' + remote + '; connect-src data: blob: ' + remote + (network ? ' ws: wss:' : '') + unload + '; img-src data: blob: ' + remote + '; media-src data: blob: ' + remote + '; style-src \'unsafe-inline\' data: blob: ' + remote + '; font-src data: ' + remote + '; frame-src data: blob:; object-src \'none\'; base-uri \'none\'; form-action \'none\'">';
 }

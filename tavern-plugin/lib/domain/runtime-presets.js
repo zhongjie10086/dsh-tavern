@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { presetNativeFeatures } from './st-preset-compatibility.js'
 import { resolveRuntimeMacroText } from './runtime-content-projection.js'
+import {seededTavernRandom} from './tavern-macro-engine.js'
 
 function emptyState() {
   return { version: 6, activePreset: '', presetOrder: [], entries: {}, regexes: {}, initialized: {}, plans: [], lastError: null, updatedAt: 0 }
@@ -134,6 +135,8 @@ export function resolveRuntimePresetMacros(snapshot, options = {}) {
       const rendered = resolveRuntimeMacroText(entry.content, {
         charName: typeof options.charName === 'string' ? options.charName : '',
         macroState: state,
+        preserveRandom:phase==='front'||!options.randomSeed,
+        random:seededTavernRandom(options.randomSeed,phase+':'+entries.length+':'+(entry.id||entry.entryKey||'')),
         lastUserMessage: options.lastUserMessage, lastCharMessage: options.lastCharMessage, lastMessage: options.lastMessage
       })
       state = rendered.macroState

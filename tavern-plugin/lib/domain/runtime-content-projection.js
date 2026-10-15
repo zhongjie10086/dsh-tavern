@@ -23,6 +23,7 @@ function macroProjection(value, options = {}) {
     userName: state.userName,
     localVariables: state.local,
     globalVariables: state.global,
+    random:options.random,preserveRandom:options.preserveRandom,
     lastUserMessage: options.lastUserMessage, lastCharMessage: options.lastCharMessage, lastMessage: options.lastMessage
   })
   return {

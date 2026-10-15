@@ -96,7 +96,7 @@ export function run(command, args, options = {}) {
   const nativeNpm = process.platform === 'win32' && command === 'npm'
   const result = spawnSync(nativeNpm ? process.execPath : commandName(command), nativeNpm ? [resolveNpmCliEntry(), ...args] : args, {
     cwd: options.cwd,
-    env: runtimeEnvironment(),
+    env: { ...runtimeEnvironment(), ...options.env },
     encoding: 'utf8',
     shell: process.platform === 'win32' && !nativeNpm,
     stdio: options.capture ? 'pipe' : 'inherit',

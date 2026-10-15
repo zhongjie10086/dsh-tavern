@@ -470,6 +470,7 @@ window.__ModuleLoader__.load({
 			return { phase: String(activity.phase || "idle"), busy: busy, role: role, label: label, blockReason: blockReason };
 		}
 
+		// @include modules/stored-message-history.js
 		// @include modules/history-window.js
         // @include modules/history-viewport.js
 
@@ -1657,6 +1658,7 @@ window.__ModuleLoader__.load({
 			function receive(event) {
 				const data = event.data;
 				if (event.source !== parent || !data || data.token !== token || data.type !== "dsh-tavern-font-size") return;
+				if (data.colorScheme === "light" || data.colorScheme === "dark") document.documentElement.style.colorScheme = data.colorScheme;
 				const next = Number(data.fontSize);
 				if (!Number.isFinite(next) || next < 8 || next > 48 || next === fontSize) return;
 				fontSize = next;
@@ -1795,13 +1797,13 @@ window.__ModuleLoader__.load({
             const activityReporter='<script data-dsh-tavern-frame-activity>(function(){var sent=false;function preserve(event){if(sent||!event.isTrusted)return;var target=event.target;if(event.type!=="play"&&!(target&&target.matches&&target.matches("input,textarea,select,[contenteditable]")))return;sent=true;parent.postMessage({type:"dsh-tavern-frame-stateful",token:'+token+'},"*");}addEventListener("input",preserve,true);addEventListener("change",preserve,true);addEventListener("play",preserve,true);})();<\/script>';
 			const layoutNormalizer = '<script data-dsh-tavern-layout>(function(){if(!document.body)return;Array.prototype.slice.call(document.body.childNodes).forEach(function(node){var value=String(node.nodeValue||"");if(node.nodeType===3&&!/\\S/.test(value)&&/[\\r\\n]/.test(value))node.nodeValue="";});})();<\/script>';
 			const fontRuntime = '<script data-dsh-tavern-font-runtime>(' + installTavernFrameFonts.toString() + ')(' + token + ',' + restoreTavernFrameFontStyles.toString() + ');<\/script>';
-            const textColorRuntime = '<script data-dsh-tavern-text-colors>(function(){const colors=(' + installTavernTextColors.toString() + ')(document.body,{enabled:false},' + findTavernQuoteRanges.toString() + ');addEventListener("message",function(event){const data=event.data;if(event.source===parent&&data&&data.token===' + token + '&&(data.type==="dsh-tavern-text-colors"||data.type==="dsh-tavern-font-size")){colors.setColors(data.textColorOverrides);colors.setEnabled(data.type==="dsh-tavern-font-size"?data.textColorsEnabled:data.enabled);}});addEventListener("pagehide",()=>colors.dispose(),{once:true});})();<\/script>';
+            const textColorRuntime = '<script data-dsh-tavern-text-colors>(function(){const colors=(' + installTavernTextColors.toString() + ')(document.body,{enabled:false},' + findTavernQuoteRanges.toString() + ');addEventListener("message",function(event){const data=event.data;if(event.source===parent&&data&&data.token===' + token + '&&(data.type==="dsh-tavern-text-colors"||data.type==="dsh-tavern-font-size")){colors.setColors(data.textColorOverrides);if(data.colorScheme==="light"||data.colorScheme==="dark")document.documentElement.style.colorScheme=data.colorScheme;colors.setEnabled(data.type==="dsh-tavern-font-size"?data.textColorsEnabled:data.enabled);}});addEventListener("pagehide",()=>colors.dispose(),{once:true});})();<\/script>';
 			const cleanRuntimeReporter = runtimeReporter.replace('dom=copy.innerHTML;', '(' + restoreTavernFrameFontStyles.toString() + ')(copy);Array.from(copy.querySelectorAll("script[data-dsh-tavern-font-runtime],script[data-dsh-tavern-text-colors],script[data-dsh-tavern-frame-activity]")).forEach(function(node){node.remove();});dom=copy.innerHTML;');
 			const frameHtml = '<!doctype html><html><head><meta charset="utf-8">'
 				+ '<meta name="viewport" content="width=device-width,initial-scale=1">'
 				+ '<meta name="referrer" content="no-referrer">'
 				+ tavernFrameCsp(input) + tavernFrameAssetBootstrap(input.assetAccess)
-				+ '<style>:root{color-scheme:light dark}html,body{box-sizing:border-box;margin:0;min-height:0;background:transparent;color:CanvasText;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:16px;line-height:1.75}body{padding:0 1px;overflow-wrap:anywhere;white-space:pre-wrap}html[data-dsh-tavern-scroll]{overflow-y:auto!important}html[data-dsh-tavern-scroll] body{overflow-y:visible!important}body>*{white-space:normal}maintext{display:block;white-space:pre-wrap;overflow-wrap:anywhere}.dsh-tavern-plain-text{white-space:pre-wrap;overflow-wrap:anywhere}*,*:before,*:after{box-sizing:border-box}img,video,svg,canvas{max-width:100%;height:auto}pre{max-width:100%;overflow:auto;white-space:pre-wrap}table{max-width:100%;border-collapse:collapse}a{color:LinkText}</style>' + (preparationRuntime ? preparationRuntime.head : helperDependencies) + tavernStaticAssetShim() + storageShim + helperShim + interactiveHelperShim + mvuViewObservationShim + cleanRuntimeReporter
+				+ '<style>:root{color-scheme:' + (input && /^(light|dark)$/.test(input.colorScheme) ? input.colorScheme : 'light dark') + '}html,body{box-sizing:border-box;margin:0;min-height:0;background:transparent;color:CanvasText;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:16px;line-height:1.75}body{padding:0 1px;overflow-wrap:anywhere;white-space:pre-wrap}html[data-dsh-tavern-scroll]{overflow-y:auto!important}html[data-dsh-tavern-scroll] body{overflow-y:visible!important}body>*{white-space:normal}maintext{display:block;white-space:pre-wrap;overflow-wrap:anywhere}.dsh-tavern-plain-text{white-space:pre-wrap;overflow-wrap:anywhere}*,*:before,*:after{box-sizing:border-box}img,video,svg,canvas{max-width:100%;height:auto}pre{max-width:100%;overflow:auto;white-space:pre-wrap}table{max-width:100%;border-collapse:collapse}a{color:LinkText}</style>' + (preparationRuntime ? preparationRuntime.head : helperDependencies) + tavernStaticAssetShim() + storageShim + helperShim + interactiveHelperShim + mvuViewObservationShim + cleanRuntimeReporter
 				+ (input && input.helperContext && input.helperContext.openingHost ? '<script data-dsh-tavern-session-opening>(' + installSessionOpeningBridge.toString() + ')(' + token + ',' + (input.contextFromParent ? 'Object.assign({},window.__dshMessageContext.openingHost,{extensionSettings:window.__dshMessageContext.extensionSettings||{}})' : JSON.stringify(Object.assign({}, input.helperContext.openingHost, { extensionSettings: input.helperContext.extensionSettings || {} })).replace(/</g, '\\u003c')) + ');<\/script>' : '')
 				+ (input && input.helperContext ? '<script data-dsh-tavern-frame-variable-aliases>(' + installTavernFrameVariableAliases.toString() + ')();<\/script>' : '')
 				+ (input && input.refreshLegacyStatus ? '<script data-dsh-tavern-static-status>(' + installTavernStaticStatusDisplay.toString() + ')(' + token + ',' + JSON.stringify(input.staticStatusCandidate === true) + ');<\/script>' : '')
@@ -1843,7 +1845,7 @@ window.__ModuleLoader__.load({
 		function createTavernHelperTransport(options) {
 			const { parent, token, copy, identity, onContext, onEvent } = options;
 			let nextId = 1;
-			let contextSequence = 0, awaitingContext = false;
+			let contextSequence = 0, awaitingContext = false, unloading = false;
 			const contextEvents = [];
 			const pending = Object.create(null);
             const eventReceipts = new Map();
@@ -1852,6 +1854,7 @@ window.__ModuleLoader__.load({
 				// A card may replace its document; DOM listeners must be restored before RPC.
 				options.listen(receive);
 				const owner = Object.assign({}, identity(), identityOverride || {});
+                if(unloading&&options.allowUnloadDrain?.()!==true)return Promise.reject(new Error("脚本窗口正在关闭，未接纳新的工作"));
                 const promise = new Promise(function (resolve, reject) {
 					const requestId = String(nextId++);
 					pending[requestId] = { resolve: resolve, reject: reject, method: method, owner: owner };
@@ -1873,16 +1876,34 @@ window.__ModuleLoader__.load({
                 }
                 return promise;
 			}
+            function trackTask(promise, owner) {
+                if (owner?.eventId) {
+                    let receipts=eventReceipts.get(owner.eventId);
+                    if(!receipts)eventReceipts.set(owner.eventId,receipts=new Set());
+                    receipts.add(promise.then(()=>null,error=>error));
+                }
+                return promise;
+            }
             async function drainEvent(eventId) {
                 const receipts = eventReceipts.get(eventId);
                 if (!receipts) return;
                 let failure;
                 try {
-                    while (receipts.size) {
+                    while (true) {
                         const batch = [...receipts];
                         for (const item of batch) receipts.delete(item);
                         const errors = await Promise.all(batch);
                         failure ||= errors.find(Boolean);
+                        // A completed body reader queues its caller's Promise
+                        // continuation. Let that microtask checkpoint finish so
+                        // its Helper writes can join this same event ledger.
+                        // This is a task boundary, not a millisecond grace period.
+                        await new Promise(resolve => {
+                            const channel = new MessageChannel();
+                            channel.port1.onmessage = () => { channel.port1.close();channel.port2.close();resolve(); };
+                            channel.port2.postMessage(null);
+                        });
+                        if (!receipts.size) break;
                     }
                     if (failure) throw failure;
                 } finally { eventReceipts.delete(eventId); }
@@ -1927,7 +1948,7 @@ window.__ModuleLoader__.load({
 				}
 			}
 			options.listen(receive);
-			return Object.freeze({ request: request, post: post, drainEvent: drainEvent });
+			return Object.freeze({ request: request, post: post, drainEvent: drainEvent, trackTask:trackTask, freezeForUnload:()=>{unloading=true;},isIdle:()=>!awaitingContext&&!contextEvents.length&&!Object.keys(pending).length&&!eventReceipts.size });
 		}
 
 		function createTavernHelperEventBus(options) {
@@ -2298,7 +2319,11 @@ window.__ModuleLoader__.load({
 				});tail=task;task.catch(function(error){console.error(error);});return task;
 			}
 			sync(options.context());
-			return { sync: sync, save: () => save(), retry: retryRequest => save(retryRequest), reload: reload, flush:()=>tail, failed:()=>failedSave, updateMetadata: updateMetadata, chat: () => chat, metadata: () => metadata };
+			function isPersisted(){try{
+                if(!binding||binding!==keyOf(options.context())||saving||deferred||pendingSaves||failedSave||copyConflict||markerCollision||dirty())return false;
+                return rows.every(row=>own(row.view,copyMarker)&&row.view[copyMarker]===row.generation&&[...reserved].every(key=>{const base=opaque.has(key)&&!own(row.core,key)?row.base:row.core;return own(row.view,key)===own(base,key)&&same(row.view[key],base[key]);}));
+            }catch(_){return false;}}
+            return { isPersisted:isPersisted,sync: sync, save: () => save(), retry: retryRequest => save(retryRequest), reload: reload, flush:()=>tail, failed:()=>failedSave, updateMetadata: updateMetadata, chat: () => chat, metadata: () => metadata };
 		}
 
 		function installTavernCompatibilityDiagnostics(options) {
@@ -2563,14 +2588,15 @@ window.__ModuleLoader__.load({
             };
             window.toastr = Object.fromEntries(['success','info','warning','error'].map(level=>[level,function(message,title){window.__dshTavernToast(level,message,title);return console[level==='error'?'error':level==='warning'?'warn':'info'](message)}]));
 			function flushAll(retryCall){return Promise.all([retryCall?chatData.retry(retryCall):chatData.save(),saveExtensionSettings(retryCall)]);}
-			window.addEventListener('pagehide',()=>{void flushAll().catch(error=>console.error('页面关闭时插件数据尚未保存',error));});
+			function isPersisted(){try{return !settingsPending&&!settingsFailed&&settingCanonical(extensionSettings)===settingCanonical(savedExtensionSettings)&&chatData.isPersisted()===true;}catch(_){return false;}}
+            window.addEventListener('pagehide',()=>{if(!isPersisted())void flushAll().catch(error=>console.error('页面关闭时插件数据尚未保存',error));});
 			if(options.token)window.addEventListener('message',event=>{if(event.source===window.parent&&event.data?.token===options.token&&event.data.type==='dsh-tavern-retry-script-storage')void flushAll().catch(error=>console.error('插件数据重试失败',error));});
 			// An event epilogue waits for the saves already issued. A save that failed
 			// earlier is submitted once more from the current unsaved state; only that
 			// attempt can fail the caller, an old failure is never rethrown forever.
 			async function settleSettings(retryCall){await settingsTail.catch(function(){});if(settingsFailed)await saveExtensionSettings(retryCall);}
 			async function settleChat(retryCall){await chatData.flush().catch(function(){});if(chatData.failed())await (retryCall?chatData.retry(retryCall):chatData.save());}
-			return { retry:flushAll,sync: chatData.sync, flushSettings: settleSettings,flush:retryCall=>Promise.all([settleChat(retryCall),settleSettings(retryCall)]) };
+			return { isPersisted:isPersisted,retry:flushAll,sync: chatData.sync, flushSettings: settleSettings,flush:retryCall=>Promise.all([settleChat(retryCall),settleSettings(retryCall)]) };
 		}
 
         // Bounded, value-free timings shared by every card's initialization.
@@ -2666,7 +2692,8 @@ window.__ModuleLoader__.load({
 			const scriptsById = Object.create(null);
 			for (const script of scriptList) scriptsById[script.id] = script;
 			let currentScriptId = scriptList[0] ? scriptList[0].id : "";
-			let activeHostEventId = "";
+			let activeHostEventId = "", activeHostEventName = "";
+            const unloadFetch=metadata.spUnload&&typeof window.fetch==="function"?window.fetch.bind(window):null;
 			let synchronousScriptId = "";
 			let hostEventTail = Promise.resolve();
 			let facade, databaseBridge, scriptLibraryBridge, scriptStorageBridge, audioBridge,presetBridge,nativePresetBridge;
@@ -2682,7 +2709,7 @@ window.__ModuleLoader__.load({
             // and still fails the event exactly as before.
             function writerOrigin() { return { eventId: activeHostEventId, verified: Boolean(activeHostEventId && synchronousScriptId) }; }
             function recordUnverifiedWrite(eventId, scriptId, message) { parent.postMessage({ type: "dsh-tavern-helper-diagnostic", token: token, level: "warn", eventId: eventId, scriptId: scriptId, message: "写入归属无法核验（R8 Z59，只记录）：" + message }, "*"); }
-			const transport = modules.createTransport({ parent: parent, token: token, copy: copy, writer: writerOrigin, recordUnverifiedWrite: recordUnverifiedWrite,
+			const transport = modules.createTransport({ allowUnloadDrain:()=>activeHostEventName==="DSH_SP_DRAIN",parent: parent, token: token, copy: copy, writer: writerOrigin, recordUnverifiedWrite: recordUnverifiedWrite,
 				identity: function () { return { eventId: activeHostEventId, scriptId: currentScript().id, lifecycleRevision: Number(state.lifecycleRevision) || 0 }; },
 				listen: function (receive) { addEventListener("message", receive); },
 				onContext: function (result, method) {
@@ -2705,10 +2732,10 @@ window.__ModuleLoader__.load({
 					diagnosticCount = 0;
 					const suppliedArgs = copy(data.args || []);
 					const run = async function () {
-						const previousEventId = activeHostEventId;
+						const previousEventId = activeHostEventId,previousEventName=activeHostEventName;
                         const eventBody=window.document&&window.document.body, previousInert=eventBody&&eventBody.inert;
                         if(eventBody)eventBody.inert=true;
-						activeHostEventId = String(data.eventId || "");
+						activeHostEventId = String(data.eventId || "");activeHostEventName=String(data.name||"");
                         let finishOriginalHydration,originalHydrationError;
 						try {
                             if(data.name === "CHAT_CHANGED" && window.__dshOriginalExtensionState?.id === "sp-database")finishOriginalHydration=window.__dshBeginOriginalDatabaseHydration?.();
@@ -2760,7 +2787,7 @@ window.__ModuleLoader__.load({
                                 await transport.drainEvent(String(data.eventId||''));
                             }
                             catch(error) { if(!finishOriginalHydration||!originalHydrationError)throw error;console.error(error); }
-                            finally { activeHostEventId = previousEventId; if(eventBody)eventBody.inert=previousInert; }
+                            finally { activeHostEventId = previousEventId;activeHostEventName=previousEventName; if(eventBody)eventBody.inert=previousInert; }
                         }
 					};
 					// A listener may await a different event emitted by a companion. Only
@@ -3399,12 +3426,24 @@ window.__ModuleLoader__.load({
             modules.installMirror({window,token,post:transport.post});
             window.getProxyPresetNames = () => copy(state.proxyPresetNames || []);
             scriptStorageBridge = modules.installScriptStorage({ window, context: () => state, currentScript, call, post: transport.post, token });
-            modules.installGenerationBridge(window, call, events, () => ({ scriptId: currentScript().id, lifecycleRevision: Number(state.lifecycleRevision || 0), eventId: activeHostEventId }), owner => drainPromptWrites(owner.scriptId));
+            modules.installGenerationBridge(window, call, events, () => ({ scriptId: currentScript().id, lifecycleRevision: Number(state.lifecycleRevision || 0), eventId: activeHostEventId }), owner => drainPromptWrites(owner.scriptId), transport.trackTask);
             scriptLibraryBridge = modules.installScriptLibraryBridge({ window, call, context: () => state, currentScript, scriptList, buttonEvent, writer: writerOrigin, recordUnverifiedWrite });
             modules.installSlash({window,call,assertSlash:modules.assertSlash,trusted:metadata.trustedResource,currentScript,publish:transport.post});
             // Read by the projected original package: only a background instance keeps
             // its deferred work on the ledger until the event epilogue drains it.
             window.__dshAwaitOriginalWork=metadata.background===true;
+            Object.defineProperty(window,'__dshTavernIsPersisted',{value:()=>{try{return !activeHostEventId&&transport.isIdle()&&facade.isPersisted()&&scriptStorageBridge?.isPersisted()===true&&![...promptWritesByScript.values()].some(w=>w.pending.size||w.failures.size)&&window.__dshTavernGenerationBusy?.()!==true;}catch(_){return false;}}});
+            if(unloadFetch&&metadata.spUnload){
+                window.addEventListener('pagehide',event=>{
+                    // This capture listener precedes original retirement/authority close.
+                    // A restored BFCache realm keeps the existing resume contract.
+                    if(event.persisted||window.__dshTavernIsPersisted()!==true||(scriptList.some(script=>script.id==='extension-sp-database')&&window.__dshOriginalDatabaseIsPersisted?.()!==true))return;
+                    transport.freezeForUnload();
+                    // A Request object passes the existing asset-only fetch shim
+                    // unchanged; only these exact URLs are allowed by frame CSP.
+                    for(const participant of metadata.spUnload.participants)void unloadFetch(new Request(participant.path,{method:'POST',mode:'no-cors',credentials:'omit',keepalive:true,body:''})).catch(()=>{});
+                },{capture:true});
+            }
             modules.installExtensionHost(window,{token:metadata.token,background:metadata.background===true,post:transport.post,call,context:()=>state,flushSettings:retryCall=>facade.flushSettings(retryCall),connectSingleAuthority:modules.connectSpSingleAuthority,createAuthorityBridge:modules.createSpAuthorityBridge});
             modules.installGithubExtensionHost(window,{call,context:()=>state});
             databaseBridge = modules.createDatabaseBridge({ window: window, context: function () { return state; }, call: call, loadSqlCode: function () { return call("getTavernSqlCode",{}).then(function(result){return result.sqlCode;}); }, openVisualizer: function () { transport.post({ type: "dsh-tavern-helper-open-database" }); } });
@@ -3839,6 +3878,7 @@ window.__ModuleLoader__.load({
 				token: String(input && input.token || ""),
 				relayEvents: input.relayEvents === true,
                 background: input.background === true,
+                ...(input.spUnload?{spUnload:input.spUnload}:{}),
                 trustedHostDocument: input.trustedCardMode===true&&!scripts.some(s=>s.uiKind||s.originalUi),
                 trustedResource:input.trustedCardMode === true,
                 requiresComposer: input.background!==true && !input.previewScope && scripts.some(s=>s.uiKind||s.originalUi||/\b(send_textarea|send_but)\b/.test(s.content||"")),
@@ -3949,6 +3989,7 @@ window.__ModuleLoader__.load({
 			const eventTimeoutMs = Math.max(10, Number(options && options.eventTimeoutMs) || 15000);
 			const now = options && options.now || Date.now;
 			const records = new Map();
+            let unloadAccess=null;
 			const officialMvuSources = new WeakSet();
             let expectedScriptIds = [];
             let mvuDependency = null, mvuReadyOwner = null, mvuDependencyEpoch = 0, mvuStoppedScope = null;
@@ -3963,7 +4004,7 @@ window.__ModuleLoader__.load({
 			const allowedMethods = new Set(["prepareTavernOriginalDatabaseMutation","setTavernMvuActivity","selectTavernFrontendWorldInfo","startTavernFrontendGeneration","startTavernFrontendMainGeneration","tavernHelperBrowserCache","tavernHelperComposer","triggerTavernSlash","tavernHelperDatabaseTemplates","tavernHelperChatFiles","tavernHelperIzumiConnection","tavernHelperPresets","tavernHelperIzumiAdvice","tavernHelperAudio","mutateTavernHelperHistory","tavernHelperWorldbookLibrary","tavernScriptStorage", "fillTavernScriptDatabase", "getTavernScriptResource", "editTavernRuntimeScripts", "startTavernHelperGeneration", "pollTavernHelperGeneration", "stopTavernHelperGeneration", "listTavernHelperModels", "commitTavernScriptDatabase", "tavernScriptImages", "tavernScriptFiles", "getTavernScriptLibrary", "changeTavernScriptLibrary", "generateTavernHelperRaw", "updateTavernHelperPrompts", "updateTavernHelperVariables", "updateTavernHelperMessages", "createTavernHelperMessages", "getTavernHelperWorldbook", "replaceTavernHelperWorldbook", "saveTavernExtensionSettings", "loadTavernWorldInfo", "saveTavernWorldInfo", "saveTavernChatData"]);
 			for(const method of ['beginTavernSpAuthority','chooseTavernSpAuthority','publishTavernSpAuthorityCache','getSpDatabase'])allowedMethods.add(method);
 			// Page-only calls that cannot write host state; a background runtime skips them (R8 Z61).
-			const foregroundOnlyMethods = new Set(["selectTavernFrontendWorldInfo","startTavernFrontendGeneration","startTavernFrontendMainGeneration","tavernHelperComposer"]);
+			const foregroundOnlyMethods = new Set(["tavernHelperComposer"]);
 			let activeSessionId = "";
             let releaseHostComposer = null;
             let releaseSlashComposer = null;
@@ -4510,14 +4551,16 @@ window.__ModuleLoader__.load({
 					initializationFailed: false,
 					initializationTimer: null,
 					lastRuntimeError: "",
-					scripts: new Map(scripts.map(function (script) { return [String(script.id), { id: String(script.id), system:script.system || '', mvuInitialization:script.mvuInitialization || null, name: String(script.name || script.id), loaded: false, subscriptionsReady: false, initializationFailed: false }]; }))
+					scripts: new Map(scripts.map(function (script) { return [String(script.id), { id: String(script.id), sourceDigest:script.sourceDigest || script.content, system:script.system || '', mvuInitialization:script.mvuInitialization || null, name: String(script.name || script.id), loaded: false, subscriptionsReady: false, initializationFailed: false }]; }))
 				};
 				frame.title = uiKind ? name : "人物卡共享脚本沙箱";
 				if (!trustedCardMode) frame.sandbox = "allow-scripts";
 				frame.referrerPolicy = "no-referrer";
                 const dependency = mvuDependencyStatus();
                 const mvuReady = dependency?.state.phase === 'ready' && !scripts.some(script => String(script.id) === mvuDependency.id) ? { events: dependency.state.events } : null;
-                frame.srcdoc = buildTavernHelperScriptDocument({ token: record.token, scripts: scripts, officialMvu:Boolean(mvuDependency), mvuCoreId:mvuDependency?.id, mvuReady, background:options?.background===true, relayEvents:true, context: projectTavernScriptContext(context,scripts.map(script=>String(script.id)),policy), trustedCardMode: trustedCardMode, networkAllowed:policy.capabilities?.includes('network'),assetAccess:policy.assetAccess });
+                const participants=scripts.map(script=>unloadAccess?.participants?.find(p=>p.scriptId===script.id&&p.sourceDigest===(script.sourceDigest||script.content)));
+                const spUnload=participants.length&&participants.every(Boolean)&&unloadAccess.lifecycleRevision===Number(context.lifecycleRevision||0)?{unloadId:unloadAccess.unloadId,participants}:null;
+                frame.srcdoc = buildTavernHelperScriptDocument({ ...(spUnload?{spUnload}:{}),token: record.token, scripts: scripts, officialMvu:Boolean(mvuDependency), mvuCoreId:mvuDependency?.id, mvuReady, background:options?.background===true, relayEvents:true, context: projectTavernScriptContext(context,scripts.map(script=>String(script.id)),policy), trustedCardMode: trustedCardMode, networkAllowed:policy.capabilities?.includes('network'),assetAccess:policy.assetAccess });
 				frame.addEventListener("load", function () {
 					if (records.get(record.id) !== record) return;
 					record.loaded = true;
@@ -4834,7 +4877,7 @@ window.__ModuleLoader__.load({
 				if (!record.scripts.has(String(data.scriptId || '')) || data.lifecycleRevision !== undefined && Number(data.lifecycleRevision) !== Number(record.context.lifecycleRevision || 0)) {
 					post(record,{type:'dsh-tavern-helper-response',requestId:data.requestId,ok:false,error:'脚本身份不属于此窗口或生命周期已变化'});return;
 				}
-				if (data.eventId && (closedEventIds.has(record.id + "\n" + String(data.eventId)) || pendingEvents.get(record.id + "\n" + String(data.eventId))?.finishing)) {
+                if (data.eventId && (closedEventIds.has(record.id + "\n" + String(data.eventId)) || pendingEvents.get(record.id + "\n" + String(data.eventId))?.finishing)) {
 					post(record, { type: "dsh-tavern-helper-response", requestId: data.requestId, ok: false, error: "事件已经结束，已拒绝迟到写入" });
 					return;
 				}
@@ -5029,6 +5072,24 @@ window.__ModuleLoader__.load({
                         target.seal();return {handled:true,args:[target.identity.messageId],diagnostics};
                     } catch(error) {target.abort(error);reportError('正文显示改写',error);throw error;}
                 },
+                setUnloadAccess: value=>{unloadAccess=value;},
+                prepareUnload: function(){
+                    try{
+                        if(!records.size||pendingEvents.size)return false;
+                        let originals=0;const actual=[];
+                        for(const record of records.values()){
+                            if(record.sessionId!==activeSessionId||record.rpcInFlight||record.storagePending||record.storageFailed||record.facadePending||record.facadeFailed||!record.loaded||!record.subscriptionsReady||record.initializationFailed||record.initializationWorkPending||record.initializationWorkWaiting||record.initializationWorkFailed||record.initializationWorkTimedOut||[...record.scripts.values()].some(script=>!script.loaded||!script.subscriptionsReady||script.initializationFailed))return false;
+                            for(const script of record.scripts.values())actual.push({scriptId:script.id,sourceDigest:script.sourceDigest||script.content});
+                            if(record.scripts.has('extension-sp-database'))originals++;
+                        }
+                        if(originals!==1)return false;
+                        const expected=unloadAccess?.participants||[];
+                        if(actual.length!==expected.length||actual.some(p=>!expected.some(e=>e.scriptId===p.scriptId&&e.sourceDigest===p.sourceDigest))||new Set(actual.map(p=>p.scriptId)).size!==actual.length)return false;
+                        // Each realm proves and fences its own local persistence;
+                        // an opaque/dirty/missing participant never votes.
+                        return true;
+                    }catch(_){return false;}
+                },
                 drain: function(options){
                     const original=[...records.values()].filter(record=>record.scripts.has('extension-sp-database'));
                     // An original package that is absent, never finished loading or failed
@@ -5142,7 +5203,7 @@ window.__ModuleLoader__.load({
                 const request=Promise.resolve(invoke("releaseTavernHelperRuntime",{runtimeId:previousLease.id},previousLease.sessionId,{keepalive:true})).catch(()=>{}).finally(()=>{releasesPending--;});
                 releaseBarrier=Promise.all([releaseBarrier,request]).then(()=>{});return request;
             }
-            function retireOriginal(previousLease,previousRuntime,failure){
+            function retireOriginal(previousLease,previousRuntime,failure,unloadRequest){
                 const existing=pendingReleases.get(previousLease);if(existing)return existing.attempt;
                 drainingLeases.add(previousLease);
                 let finishBarrier;const barrier=new Promise(resolve=>{finishBarrier=resolve;});spReleaseBarriers.set(previousLease.sessionId,barrier);
@@ -5165,7 +5226,8 @@ window.__ModuleLoader__.load({
                     entry.attempt=(async()=>{
                         try{
                             if(retry)await timed(()=>previousLease.idle);
-                            const reserved=await timed(()=>invoke('reserveTavernHelperRuntime',{runtimeId:previousLease.id,durationMs:Math.max(1,deadline-monotonicNow()),retry,recoveryToken},previousLease.sessionId));
+                            const reserved=await timed(()=>!retry&&unloadRequest?unloadRequest:invoke('reserveTavernHelperRuntime',{runtimeId:previousLease.id,durationMs:Math.max(1,deadline-monotonicNow()),retry,recoveryToken},previousLease.sessionId));
+                            if(reserved?.unloadResolved===true){entry.saved=true;previousRuntime.dispose();if(entry.heartbeat!==null)stopHeartbeat(entry.heartbeat);pendingReleases.delete(previousLease);drainingLeases.delete(previousLease);if(spReleaseBarriers.get(previousLease.sessionId)===barrier)spReleaseBarriers.delete(previousLease.sessionId);finishBarrier();return {released:true,unloadResolved:true};}
                             if(reserved?.reserved!==true&&!reserved?.superseded&&!(reserved?.released&&entry.saved))throw new Error('SP 原包保存租约未获确认，未保存内容已保留');
                             if(reserved?.superseded){
                                 // A new lifecycle already fenced all old writes. Never replay
@@ -5192,12 +5254,21 @@ window.__ModuleLoader__.load({
                 if(failure){fence(failure);return Promise.resolve({released:false,drainError:entry.error});}
                 return entry.retry();
             }
-			function dispose({quarantineError}={}) {
+			function dispose({quarantineError,idlePagehide=false}={}) {
 				const previousLease = lease,previousRuntime=runtime;
                 const displayJobs=displayedQueue.clear();
                 for(const job of displayJobs)void Promise.resolve(invoke('cancelTavernDisplayedMessage',{eventId:job.packet.eventId,runtimeId:previousLease?.id},job.packet.sessionId)).catch(error=>console.warn('正文显示取消失败',error));
                 let drain;
-                if(previousLease&&previousRuntime?.inspect().scriptIds?.includes('extension-sp-database'))drain=retireOriginal(previousLease,previousRuntime,quarantineError);
+                if(previousLease&&previousRuntime?.inspect().scriptIds?.includes('extension-sp-database')){
+                    let unloadRequest;
+                    if(idlePagehide&&!quarantineError&&options?.background!==true&&previousLease.unloadAccess&&!previousLease.workDeadline&&!previousLease.displayExecuting&&!pendingReleases.size){
+                        const hostIdle=previousRuntime.prepareUnload?.()===true;
+                        // Authenticated parent intent starts synchronously. The SP's
+                        // independent positive vote alone cannot release this owner.
+                        try{unloadRequest=Promise.resolve(invoke('reserveTavernHelperRuntime',{runtimeId:previousLease.id,kind:'unloading',unloadId:previousLease.unloadAccess.unloadId,hostIdle,durationMs:91000},previousLease.sessionId,{keepalive:true}));}catch(error){unloadRequest=Promise.reject(error);}
+                    }
+                    drain=retireOriginal(previousLease,previousRuntime,quarantineError,unloadRequest);
+                }
                 else if(previousLease?.displayExecuting){
                     drainingLeases.add(previousLease);
                     previousRuntime.dispose();
@@ -5305,6 +5376,7 @@ window.__ModuleLoader__.load({
                     if(spReleaseBarriers.has(currentLease.sessionId))await spReleaseBarriers.get(currentLease.sessionId);
 					if (lease !== currentLease) return;
 					const result = await invokeWithDeadline("claimTavernScriptWork", currentLease, currentRuntime.inspect());
+                    if(result?.active&&result.unloadAccess){currentLease.unloadAccess={...result.unloadAccess,participants:result.unloadAccess.participants.map(p=>({...p,path:hostWindow.location?.origin?hostWindow.location.origin+p.path:p.path}))};currentRuntime.setUnloadAccess?.(currentLease.unloadAccess);}
 					if (lease !== currentLease) {
 						if (result && result.active) releaseLease(currentLease);
 						return;
@@ -5386,6 +5458,7 @@ window.__ModuleLoader__.load({
 				heartbeatBusy=currentLease;
 				try {
 					const result = await invokeWithDeadline("heartbeatTavernScriptRuntime", currentLease, runtime.inspect());
+                    if(lease===currentLease&&result?.active&&result.unloadAccess){currentLease.unloadAccess={...result.unloadAccess,participants:result.unloadAccess.participants.map(p=>({...p,path:hostWindow.location?.origin?hostWindow.location.origin+p.path:p.path}))};runtime.setUnloadAccess?.(currentLease.unloadAccess);}
 					if (lease === currentLease && result?.resetRequired) { resetRuntime(); return; }
 					if(lease===currentLease)ownership(result?.active===false);
                     if (lease === currentLease && Boolean(result && result.active) !== active) {
@@ -5494,11 +5567,11 @@ window.__ModuleLoader__.load({
 				}
 				return "";
 			}
-			function release() {
+			function release(idlePagehide=false) {
 				current = null;
 				if (stopView) stopView();
 				stopView = null;
-				execution.dispose();
+				execution.dispose({idlePagehide});
 				publish("", null);
 			}
 			function syncView() {
@@ -5530,13 +5603,13 @@ window.__ModuleLoader__.load({
 				select();
                 tavernDisplayedMessages.setDispatcher(presentDisplayed);
 			}
-			function suspend() {
+			function suspend(event) {
                 tavernDisplayedMessages.setDispatcher(null);
 				observing = false;
 				if (stopSessions) stopSessions();
 				if (stopTransition) stopTransition();
 				stopSessions = stopTransition = null;
-				release();
+				release(event?.type==="pagehide"&&event.persisted!==true);
 			}
 			return Object.freeze({
 				start: function () {
@@ -5801,7 +5874,7 @@ window.__ModuleLoader__.load({
 			let listener = null;
 			let lifetime = 0;
 			let synchronizationKey = "";
-			let lastFontSize = null;
+			let lastFontSize = null, lastColorScheme = null;
 			let documentInputs = null;
 			let cachedDocumentKey = "";
             let composerStop = null, composerRevision = 0;
@@ -5826,7 +5899,7 @@ window.__ModuleLoader__.load({
 					heightKey: tavernFrameHeightKey(props), content: props.content,
 					trustedCardMode: staticStatusCandidate ? false : props.trustedCardMode, staticStatusCandidate: staticStatusCandidate === true, refreshRequested: false
 				};
-				const documentOptions = { content: props.content, token: document.token, openingPreview: props.openingPreview, helperContext: helperContext, contextProjected:true, contextFromParent:true, trustedCardMode: document.trustedCardMode === true, staticStatusCandidate: document.staticStatusCandidate, refreshLegacyStatus: props.refreshLegacyStatus, turn: props.turn, observeMvuView: props.observeMvuView, runtimeReporting: props.runtimeReporting, persistent: props.persistent, preserveInstance: props.preserveInstance, textColorsEnabled: tavernTextColorsEnabled(hostWindow) };
+				const documentOptions = { content: props.content, token: document.token, openingPreview: props.openingPreview, helperContext: helperContext, contextProjected:true, contextFromParent:true, trustedCardMode: document.trustedCardMode === true, staticStatusCandidate: document.staticStatusCandidate, refreshLegacyStatus: props.refreshLegacyStatus, turn: props.turn, observeMvuView: props.observeMvuView, runtimeReporting: props.runtimeReporting, persistent: props.persistent, preserveInstance: props.preserveInstance, textColorsEnabled: tavernTextColorsEnabled(hostWindow), colorScheme: hostWindow.document?.body?.hasAttribute?.("data-ds-dark-theme") ? "dark" : "light" };
                 let html;
                 documents.add(document);
                 document.dropSourceCache=function(){html=undefined;};
@@ -5894,7 +5967,7 @@ window.__ModuleLoader__.load({
                 channels.forEach(function (channel, token) {
                     if (document && token !== document.token) return;
                     const node = channel.element();
-                    if (node && node.contentWindow) node.contentWindow.postMessage({ type: "dsh-tavern-text-colors", token: token, enabled: tavernTextColorsEnabled(hostWindow), textColorOverrides: tavernTextColorOverrides(hostWindow) }, "*");
+                    if (node && node.contentWindow) node.contentWindow.postMessage({ type: "dsh-tavern-text-colors", token: token, enabled: tavernTextColorsEnabled(hostWindow), textColorOverrides: tavernTextColorOverrides(hostWindow), colorScheme: hostWindow.document?.body?.hasAttribute?.("data-ds-dark-theme") ? "dark" : "light" }, "*");
                 });
             }
 			function sendFontSize(document) {
@@ -5902,12 +5975,14 @@ window.__ModuleLoader__.load({
 				if (!body || typeof hostWindow.getComputedStyle !== "function") return;
 				const value = parseFloat(hostWindow.getComputedStyle(body).getPropertyValue("--dsh-content-font-size"));
 				const fontSize = props.followContentFont !== false && Number.isFinite(value) && value >= 8 && value <= 48 ? value : 14;
-				if (!document && fontSize === lastFontSize) return;
+				const colorScheme = body.hasAttribute?.("data-ds-dark-theme") ? "dark" : "light";
+				if (!document && fontSize === lastFontSize && colorScheme === lastColorScheme) return;
+				lastColorScheme = colorScheme;
 				lastFontSize = fontSize;
 				channels.forEach(function (channel, token) {
 					if (document && token !== document.token) return;
 					const node = channel.element();
-					if (node && node.contentWindow) node.contentWindow.postMessage({ type: "dsh-tavern-font-size", token: token, fontSize: fontSize, textColorsEnabled: tavernTextColorsEnabled(hostWindow), textColorOverrides: tavernTextColorOverrides(hostWindow) }, "*");
+					if (node && node.contentWindow) node.contentWindow.postMessage({ type: "dsh-tavern-font-size", token: token, fontSize: fontSize, textColorsEnabled: tavernTextColorsEnabled(hostWindow), textColorOverrides: tavernTextColorOverrides(hostWindow), colorScheme: colorScheme }, "*");
 				});
 			}
 			function reconcile() {
@@ -6189,7 +6264,7 @@ window.__ModuleLoader__.load({
 					let fontObserver = null;
 					if (hostWindow.document && typeof hostWindow.MutationObserver === "function") {
 						fontObserver = new hostWindow.MutationObserver(function () { sendFontSize(); });
-						[hostWindow.document.documentElement, hostWindow.document.body].filter(Boolean).forEach(function (node) { fontObserver.observe(node, { attributes: true, attributeFilter: ["style", "class"] }); });
+						[hostWindow.document.documentElement, hostWindow.document.body].filter(Boolean).forEach(function (node) { fontObserver.observe(node, { attributes: true, attributeFilter: ["style", "class", "data-ds-dark-theme", "color-scheme"] }); });
 					}
 					return function () {
 						releaseComposer();
@@ -8582,7 +8657,8 @@ window.__ModuleLoader__.load({
                 React.createElement("p", { className: "dsh-tavern-settings-desc" }, "默认手动。自动模式在剧情后台结算后联合压缩前后台，再继续下一轮；不会删除原始剧情记录。"),
                 policy ? React.createElement("label", { className: "dsh-tavern-compaction-field" }, "压缩模式", React.createElement("select", { className: "dsh-tavern-settings-select", value: policy.mode, disabled: busy, onChange: function (e) { setPolicy(Object.assign({}, policy, { mode: e.target.value })); } }, [["manual", "手动压缩（默认）"], ["rounds", "每 N 轮自动压缩"], ["percent", "上下文达到 X% 自动压缩"]].map(function (item) { return React.createElement("option", { key: item[0], value: item[0] }, item[1]); }))) : null,
                 policy && policy.mode !== "manual" ? React.createElement("label", { className: "dsh-tavern-compaction-field" }, policy.mode === "rounds" ? "剧情轮数（1–1000）" : "上下文占用百分比（10–95，估算）", React.createElement("input", { className: "dsh-tavern-settings-select", type: "number", min: policy.mode === "rounds" ? 1 : 10, max: policy.mode === "rounds" ? 1000 : 95, step: 1, value: policy[policy.mode], disabled: busy, onChange: function (e) { setPolicy(Object.assign({}, policy, { [policy.mode]: e.target.value })); } })) : null,
-                React.createElement("p", { className: "dsh-tavern-settings-desc" }, "重写同一轮、工具调用和生图不计轮数。模型窗口未知时百分比模式会提示；可改用轮数模式。"),
+                policy ? React.createElement("label", { className: "dsh-tavern-compaction-field" }, "压缩后保留最近剧情原文轮数（0–100）", React.createElement("input", { className: "dsh-tavern-settings-select", type: "number", min: 0, max: 100, step: 1, value: policy.retainRounds === undefined ? 10 : policy.retainRounds, disabled: busy, onChange: function (e) { setPolicy(Object.assign({}, policy, { retainRounds: Number(e.target.value) })); } })) : null,
+                React.createElement("p", { className: "dsh-tavern-settings-desc" }, "默认保留最近 10 轮原文，0 表示不保留；实际保留受模型窗口保护限制。重写同一轮、工具调用和生图不计轮数。模型窗口未知时百分比模式会提示；可改用轮数模式。"),
                 React.createElement("button", { type: "button", className: "dsh-tavern-btn", disabled: busy || !policy, onClick: save }, busy ? "保存中…" : "保存压缩设置"),
                 notice ? React.createElement("p", { role: "status", className: "dsh-tavern-settings-desc" }, notice) : null);
         }
@@ -8634,6 +8710,8 @@ window.__ModuleLoader__.load({
 			}, React.createElement("span", null, label));
 		}
 
+        // @include modules/story-alignment-settings.js
+
 		function TavernRecoverySettings() {
 			const h = React.createElement;
 			const [state, setState] = React.useState({ busy: false, report: null, error: "" });
@@ -8653,6 +8731,7 @@ window.__ModuleLoader__.load({
 			const labels = { healthy: "正常", repairable: "可恢复", recovered: "已恢复", busy: "正在运行，已跳过", unknown: "信息不足", blocked: "需人工检查", partial: "仍有未恢复项", missing: "对话不存在", unreadable: "存档不可读取" };
 			return h("div", { className: "dsh-tavern-settings-group" },
 				h("h3", null, "状态恢复"),
+                h(TavernStoryAlignmentSettings),
 				h("p", { className: "dsh-tavern-settings-desc" }, "检查意外关闭后残留的任务状态。修复前验证备份，正在运行的任务会跳过。"),
 				h("button", { type: "button", disabled: state.busy, onClick: function () { return run(false); } }, "检查状态"),
 				h("button", { type: "button", disabled: state.busy || !state.report || !state.report.results.some(function (row) { return row.status === "repairable"; }), onClick: function () { return run(true); } }, "修复可恢复项"),
@@ -8812,6 +8891,7 @@ window.__ModuleLoader__.load({
                 h('button',{type:'button',className:'dsh-tavern-btn',disabled:state.loading||state.busy,onClick:save},'保存上限'),
                 h('button',{type:'button',className:'dsh-tavern-btn',disabled:state.busy,onClick:reload},'刷新用量'));
         }
+        // @include modules/background-generation-settings.js
 		function TavernSettingsSection() {
 			const [defaultPlayerName, setDefaultPlayerName] = React.useState("");
 			React.useEffect(function () { setDefaultPlayerName(String(window.localStorage.getItem("dsh-tavern-player-name") || "").trim()); }, []);
@@ -8884,6 +8964,7 @@ window.__ModuleLoader__.load({
                 React.createElement(TavernTextColorSettings),
                 React.createElement(ContextCompactionSettings),
                 React.createElement(TavernCapacitySettings),
+                React.createElement(TavernBackgroundGenerationSettings),
 				React.createElement("div", { className: "dsh-tavern-settings-group" },
 					React.createElement("label", { className: "dsh-tavern-settings-row" },
 						React.createElement("span", { className: "dsh-tavern-settings-copy" },
@@ -11026,6 +11107,7 @@ window.__ModuleLoader__.load({
                 );
             }
 			function TavernStatusPanel(props) {
+            const [designRemoving, setDesignRemoving] = React.useState("");
             const askConfirm = useTavernConfirm([props.sessionId,props.scope?.sessionId,props.cardPath,props.path,props.card?.path,props.view?.card?.path,props.record?.source?.path,props.record?.source?.cardPath].join("\n"));
 			const [error, setError] = usePersistentError("酒馆状态");
 			const [guideDraft, setGuideDraft] = React.useState("");
@@ -11232,7 +11314,8 @@ window.__ModuleLoader__.load({
 										aliases ? h("div", { className: "dsh-tavern-character-design-row" }, h("b", null, "别名"), h("p", null, aliases)) : null,
 										(character.sections || []).map(function (section) {
 											return h("div", { key: section.key, className: "dsh-tavern-character-design-row" }, h("b", null, section.label), h("p", null, section.text));
-										})
+										}),
+                                        h("button", { type: "button", className: "dsh-tavern-btn danger", disabled: Boolean(designRemoving) || running || designStatus === "running" || Boolean(view.activity?.busy), onClick: () => removeCharacterDesign(character.name) }, designRemoving === character.name ? "删除中…" : "删除这个人物档案")
 									)
 								);
 							}) : h("div", { className: "dsh-tavern-status-empty" }, "后台发现重要人物需要补全设计后，档案会自动出现在这里。")
@@ -11887,16 +11970,19 @@ window.__ModuleLoader__.load({
 			);
 		}
 
+		const regenGuidance = new Map();
 		function RegenPanel(props) {
 			const panel = useRegenPanel();
 			const sessionMode = useTavernSessionMode(props.sessionId);
 			const running = props.useSession(function (snapshot) { return snapshot.running; });
-			const [guidance, setGuidance] = React.useState("");
-			React.useEffect(()=>{setGuidance("")},[props.sessionId,panel?.messageId,panel?.turn]);
+			const [guidance, setGuidance] = React.useState(() => regenGuidance.get(props.sessionId) || "");
+			const opened = panel && panel.sessionId === props.sessionId && panel.phase === "input";
+			React.useEffect(() => { if (opened) setGuidance(regenGuidance.get(props.sessionId) || ""); }, [opened, props.sessionId]);
 			const h = React.createElement;
 			if (!isPlayMode(sessionMode) || running || !panel || panel.sessionId !== props.sessionId) return null;
 			async function generate() {
 				const guide = guidance.trim();
+				if (guide) regenGuidance.set(props.sessionId, guide); else regenGuidance.delete(props.sessionId);
 				setRegenPanel(Object.assign({}, panel, { phase: "loading", error: "" }));
 				try {
 					await submitBodyRegeneration(props.sessionId, panel, guide);

@@ -4,6 +4,7 @@ import {outboundDisabled} from './outbound-network-policy.js'
 import { SYSTEM_PROMPT_NAMES } from '../prompt-catalog.js'
 import { worldBookRecallLimit } from './worldbook-recall.js'
 import { foregroundModelRevision } from './foreground-model-selection.js'
+import { normalizeBackgroundGeneration } from './background-generation-policy.js'
 
 function object(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {}
@@ -28,6 +29,7 @@ export function normalizeBackgroundTasks(value) {
 export function applyTavernSettingsPatch(current, patch) {
   const next = Object.assign({}, object(current))
   const input = object(patch)
+  if (Object.hasOwn(input, 'backgroundScriptGeneration')) next.backgroundScriptGeneration = normalizeBackgroundGeneration(input.backgroundScriptGeneration)
   if (Object.hasOwn(input, 'fakeIpMode')) {
     if (input.fakeIpMode !== 'trusted-proxy') throw new Error('Fake-IP 仅支持信任本机代理模式')
     next.fakeIpMode = input.fakeIpMode
@@ -119,6 +121,7 @@ export function presentTavernSettings(document, defaults) {
   const story = prompts.find(function (item) { return item.name === 'story' }) || { text: '', customized: false }
   return {
     fakeIpMode: 'trusted-proxy',
+    backgroundScriptGeneration: normalizeBackgroundGeneration(object(document).backgroundScriptGeneration),
     candidateDismissMode: object(document).candidateDismissMode === 'after-send' ? 'after-send' : 'after-fill',
     contextCompaction: compactionPolicy(object(document).contextCompaction),
     worldBookRecallLimit: worldBookRecallLimit(object(document).worldBookRecallLimit),

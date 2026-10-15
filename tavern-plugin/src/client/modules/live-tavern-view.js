@@ -32,6 +32,25 @@ function expandSessionViewWire(bundle) {
     }
     for(const index of bundle.aliases?.helperSwipes||[]){const row=view.tavernHelper?.messages?.[index];if(!row||typeof row.message!=="string")throw Error("视图消息别名无效");row.swipes=[row.message];}
     for(const index of bundle.aliases?.replyText||[]){const row=view.replyProjections?.[index];if(typeof row?.parts?.[0]?.content!=="string")throw Error("视图正文别名无效");row.text=row.parts[0].content;}
+    const variableJson=new WeakMap(),variableSlots=new Map();
+    function snapshotVariable(value){if(!variableJson.has(value))variableJson.set(value,JSON.stringify(value));return variableJson.get(value);}
+    function independentVariable(target,key,json){
+        const put=value=>Object.defineProperty(target,key,{value,enumerable:true,writable:true,configurable:true});
+        Object.defineProperty(target,key,{enumerable:true,configurable:true,get(){const value=JSON.parse(json);put(value);return value;},set(value){put(value);}});
+    }
+    for(const reference of bundle.aliases?.helperData||[]){
+        if(!Array.isArray(reference)||reference.length!==4||reference.some(value=>!Number.isSafeInteger(value)||value<0))throw Error('视图变量引用无效');
+        const [message,swipe,sourceMessage,sourceSwipe]=reference,target=view.tavernHelper?.messages?.[message]?.swipes_data,source=view.tavernHelper?.messages?.[sourceMessage]?.swipes_data;
+        if(!Array.isArray(target)||!Array.isArray(source)||target[swipe]!==null||!source[sourceSwipe]||typeof source[sourceSwipe]!=='object'||sourceMessage>message||sourceMessage===message&&sourceSwipe>=swipe)throw Error('视图变量引用无效');
+        const json=variableSlots.get(sourceMessage+':'+sourceSwipe)||snapshotVariable(source[sourceSwipe]);
+        variableSlots.set(message+':'+swipe,json);independentVariable(target,swipe,json);
+    }
+    for(const index of bundle.aliases?.helperVariables||[]){
+        const row=view.tavernHelper?.messages?.[index];
+        const json=variableSlots.get(index+':'+row?.swipe_id);
+        if(!Number.isSafeInteger(index)||index<0||!row||Object.hasOwn(row,'variables')||!json&&(!row.swipes_data?.[row.swipe_id]||typeof row.swipes_data[row.swipe_id]!=='object'))throw Error('视图选中变量引用无效');
+        independentVariable(row,'variables',json||snapshotVariable(row.swipes_data[row.swipe_id]));
+    }
     if(bundle.aliases?.globalRegex){
         const raw=view.tavernHelper?.extensionSettings?.regex,target=view.tavernHelper?.regexScripts;
         if(!Array.isArray(raw)||!target||Object.hasOwn(target,'global'))throw Error('视图全局正则投影无效');
@@ -126,7 +145,7 @@ function createLiveTavernViewModule(options) {
 			let load = null;
 			if (loadTimeoutMs > 0) {
 				load = Promise.race([
-					Promise.resolve(options.load(record.id, { signal: controller.signal, ifVersion:record.version, viewProtocol:4 })),
+					Promise.resolve(options.load(record.id, { signal: controller.signal, ifVersion:record.version, viewProtocol:5 })),
 					new Promise(function (_resolve, reject) {
 						deadlineTimer = scheduleTimer(function () {
 							deadlineExpired = true;
@@ -135,7 +154,7 @@ function createLiveTavernViewModule(options) {
 						}, loadTimeoutMs);
 					})
 				]);
-			} else load = options.load(record.id, {ifVersion:record.version, viewProtocol:4, signal:controller?.signal});
+			} else load = options.load(record.id, {ifVersion:record.version, viewProtocol:5, signal:controller?.signal});
 			let result = null;
 			try { result = await load; }
 			finally { if (deadlineTimer !== null) cancelTimer(deadlineTimer); }
@@ -143,7 +162,7 @@ function createLiveTavernViewModule(options) {
             record.retryAt = 0;
             const unchanged=result?.unchanged===true && record.authoritativeView!==null;
             let view = unchanged ? record.authoritativeView : result && result.view ? result.view : null;
-            if(!unchanged&&[2,3,4].includes(result?.viewEncoding)){
+            if(!unchanged&&[2,3,4,5].includes(result?.viewEncoding)){
                 try{
                     if(result.patch&&(!record.wireView||result.patch.baseVersion!==record.version||loadVersion!==record.version))throw Error("视图差量基线已变化");
                     const wire=result.patch?applySessionViewPatch(record.wireView,result.patch.changes):{view:result.view,aliases:result.aliases};

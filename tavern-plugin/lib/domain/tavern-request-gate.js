@@ -43,6 +43,8 @@ export function createTavernRequestGate(options = {}) {
     // Shipped immutable dependencies remain usable by card frames, including opaque origins.
     const publicAsset = req.method === 'GET' && /^(?:client-assets\/|vendor\/runtime-assets\/|vendor\/st-prompt-template\/|vendor\/magvarupdate\/bundle\.js$)/.test(method)
     const frameAsset = method.startsWith('frame-assets/') && options.frameResources?.accepts(req) === true
+    const frameUnload=options.frameUnloads?.accepts(req)===true
+    if(frameUnload){if(!/^text\/plain(?:\s*;|$)/i.test(String(req.headers['content-type']||'')))reject(415,'Unsupported unload content type');if(Number(req.headers['content-length'])>0)reject(413,'Unload request must be empty');return {pathname,frameUnload:true,limit:0,message:'Unload request must be empty'};}
     const origin = req.headers.origin
     if (!publicAsset && !frameAsset && origin !== undefined && origin !== '' && origin !== authority.origin) reject(403, 'forbidden origin')
     if (remoteAsset && (req.headers['sec-fetch-mode'] === 'navigate' || ['document', 'iframe', 'frame', 'object', 'embed'].includes(req.headers['sec-fetch-dest']))) reject(403, 'resource navigation forbidden')

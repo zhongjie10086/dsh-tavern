@@ -71,6 +71,14 @@ export function projectOriginalSpPendingWork(source,version){
  function __dshCancelOriginalWork(timer){const entry=__dshOriginalWork.get(timer);if(entry&&!entry.running){clearTimeout(timer);entry.resolve(null);__dshOriginalWork.delete(timer);}else if(!entry)clearTimeout(timer);}
  Object.defineProperty(api,'__dshGetCurrentIsolationCode',{value:()=>getCurrentIsolationKey_ACU()});
  Object.defineProperty(api,'__dshPendingWork',{value:()=>__dshOriginalWork.size});
+ // Read only: no checkpoint materialization, queued transaction or implicit save.
+ Object.defineProperty(api,'__dshIsPersistenceIdle',{value:()=>{try{
+  return __dshOriginalWork.size===0&&__dshOriginalWorkDrains===0&&pendingByScope_ACU.size===0
+   &&pendingCompatTransitionFixations_ACU.size===0&&pendingVectorIndexArchives_ACU.size===0&&vectorIndexPersistTimers_ACU.size===0&&summaryVectorIndexArchiveLocks_ACU.size===0
+   &&!isNotifyingTableUpdate_ACU&&!hasPendingTableUpdateNotification_ACU&&!pendingNotificationHasUnpersisted_ACU
+   &&![...keyedLocks_ACU.values()].some(lock=>lock.activeReaders!==0||lock.activeWriter!==false||lock.queue.length!==0)
+   &&!hasActiveProvisionalBridgeAnywhere_ACU(getChatArray_ACU());
+ }catch(_){return false;}}});
  Object.defineProperty(api,'__dshFlushPendingWork',{value:async()=>{let failure;__dshOriginalWorkDrains++;try{while(__dshOriginalWork.size){const batch=[...__dshOriginalWork];const results=await Promise.all(batch.map(([,entry])=>entry.settled));for(const [timer,entry]of batch)if(__dshOriginalWork.get(timer)===entry)__dshOriginalWork.delete(timer);failure ||= results.find(Boolean);}}finally{__dshOriginalWorkDrains--;}if(failure)throw failure;}});
  `);
 }

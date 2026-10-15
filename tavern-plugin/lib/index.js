@@ -1,5 +1,8 @@
+import { createStoryAlignment } from './domain/story-alignment.js'
+import { createCardTextReplacement } from './domain/card-text-replace.js'
 import {assertOriginalSpRollbackReceipt,assertOriginalSpDeletionReceipt} from './domain/tavern-original-extension.js'
 import {isDeepStrictEqual} from 'node:util'
+import {createSessionReadQueries} from './domain/session-read-queries.js'
 import {createMvuConversion} from './domain/mvu-conversion.js'
 import {registerMvuConversionTools} from './domain/mvu-conversion-tools.js'
 import {disposeMvuConversionBrowser} from './domain/mvu-conversion-browser.js'
@@ -61,7 +64,7 @@ import { createGameplayApi } from './gameplay-api.js'
 import { cardOpeningChoices } from './domain/card-openings.js'
 import { marked } from 'marked'
 import { presentModelError } from './domain/model-error-presentation.js'
-import { validateCardFile } from './domain/card-validation.js'
+import { validateCardFile, validateCardText } from './domain/card-validation.js'
 import { resolveAgentCompaction } from './agent-compaction.js'
 import { createAutoCompaction, installCompactionPolicy } from './domain/auto-compaction.js'
 import { observeHttpRequests } from './domain/http-performance-diagnostics.js'
@@ -95,7 +98,7 @@ import { createImportContextPreparation, needsImportContextPreparation } from '.
 import { sessionEvents, appendSessionEvent } from './domain/session-events.js'
 import {readDisplayedMessageIdentity} from './domain/displayed-message-identity.js'
 import { tavernSourceDiagnostics } from './domain/session-message-source.js'
-import { isTavernTurnInput, isTavernTriggerInput, tavernTriggerTurnInput } from './domain/tavern-turn-input.js'
+import { isTavernTurnInput, isTavernTriggerInput, tavernTriggerTurnInput, userMessageForTurn, requestIdForTurn } from './domain/tavern-turn-input.js'
 import { createTavernTrigger } from './domain/tavern-trigger.js'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { randomUUID, createHash } from 'node:crypto'
@@ -119,7 +122,7 @@ import { createCardPreparation } from './domain/card-preparation.js'
 import { withGlobalRegexScripts, composeTavernRegexScripts } from './domain/card-extension-reading.js'
 import { projectCardOpeningPreviews } from './domain/card-opening-previews.js'
 import { compactOpeningResponse } from './domain/opening-response.js'
-import { READABLE_CARD_FIELDS, readCardField } from './domain/card-reading.js'
+import { READABLE_CARD_FIELDS, readCardField, searchCardRaw } from './domain/card-reading.js'
 import { createConversationInitialization } from './domain/conversation-initialization.js'
 import { assertConversationForkable, conversationForkReceipt, forkConversationChat } from './domain/conversation-fork.js'
 import { configuredChatBackgroundModel, resolveChatBackgroundModel } from './domain/background-model-selection.js'
@@ -158,8 +161,8 @@ import {
   createCharacterDesignDocumentTools,
   projectCharacterDesignDocument
 } from './domain/character-design-document.js'
-import { writeCharacterDesignWorldbook, characterDesignWorldbookNote } from './domain/character-design-worldbook.js'
-import { createManualCharacterDesign } from './domain/manual-character-design.js'
+import { writeCharacterDesignWorldbook, removeCharacterDesignWorldbook, characterDesignWorldbookNote } from './domain/character-design-worldbook.js'
+import { createManualCharacterDesign, characterDesignRemovalStamp } from './domain/manual-character-design.js'
 import { createLedgerEditor } from './domain/ledger-editor.js'
 import { readLedger,createLedgerSubmission,LEDGER_SUBMIT_TOOL,LEDGER_RULES,ledgerContext } from './domain/story-ledger.js'
 import { POSTURE_SUBMIT_TOOL, POSTURE_SUBMIT_TOOL_NAME, normalizePostureSubmission } from './domain/posture-submission.js'
@@ -191,6 +194,7 @@ import { createHelperGenerationService } from './domain/helper-generation-servic
 import { createTavernScriptServices, scriptDatabaseSnapshot } from './domain/tavern-script-services.js'
 import { createTavernScriptLibrary, resolveTavernScripts, importScriptTrees, flattenScriptTrees } from './domain/tavern-script-library.js'
 import { projectTavernHelperScripts, hasTavernScriptRuntime } from './domain/tavern-helper-scripts.js'
+import {createFrameUnloadCapabilities} from './domain/frame-unload-capabilities.js'
 import { createTavernScriptDispatch } from './domain/tavern-script-dispatch.js'
 import { createTavernExtensionSettings } from './domain/tavern-extension-settings.js'
 import { createTavernScriptHostAdapter } from './domain/tavern-script-host-adapter.js'
@@ -220,10 +224,11 @@ import {
   resolveRuntimeMacroText,
   sanitizeAgentProjectionText
 } from './domain/runtime-content-projection.js'
+import {seededTavernRandom} from './domain/tavern-macro-engine.js'
 import { createScriptContinuity } from './domain/script-continuity.js'
 import { scriptChunkLayout } from './domain/script-chunks.js'
 import { createScriptNavigation } from './domain/script-navigation.js'
-import {consumeTemplateInput,templateInputView,persistTemplateInputView} from './domain/full-prompt-template-input.js'
+import {consumeTemplateInput,templateInputView,persistTemplateInputView,rememberTemplateInputScopes} from './domain/full-prompt-template-input.js'
 import {renderLightTemplateRequest} from './domain/light-template-request.js'
 import {replaceTavernHelperVariables} from './domain/tavern-helper-context.js'
 import { filterSkillMessages, ensureWritingSkillStatus } from './domain/skill-visibility.js'
@@ -253,7 +258,7 @@ import {createVersionedJsonCache} from './domain/versioned-json-cache.js'
 import {mutableJsonDraft} from './domain/json-draft.js'
 import {createDependencyProjectionCache} from './domain/dependency-projection-cache.js'
 import {createSessionViewTransport} from './domain/session-view-transport.js'
-import { createChatJournalStore } from './domain/chat-journal-store.js'
+import { createChatRecordsStore } from './domain/chat-records-store.js'
 import {jsonHttpResponse} from './domain/json-http-response.js'
 import {createMaintenanceGate} from './domain/maintenance-gate.js'
 import {createRetentionScheduler} from './domain/retention-scheduler.js'
@@ -264,6 +269,7 @@ import {createRetentionService,readRetentionPolicy} from './domain/retention-pol
 import { createResourceGraph } from './domain/resource-graph.js'
 import { createCardOrganization } from './domain/card-organization.js'
 import { normalizeBackgroundTasks, applyTavernSettingsPatch, presentTavernSettings, resolveSystemPrompt } from './domain/tavern-settings.js'
+import { createBackgroundGenerationPolicy, helperGenerationScope, originalSpForegroundGenerationScope } from './domain/background-generation-policy.js'
 // Runtime reads go through runtimePrompt() so panel overrides apply; the raw
 // file catalog only supplies built-in defaults. (upstream e2627511)
 import { prompt as promptFile, SYSTEM_PROMPT_DEFINITIONS, SYSTEM_PROMPT_NAMES } from './prompt-catalog.js'
@@ -513,10 +519,10 @@ export async function apply(ctx) {
     const m = mode || 'story'
     return m === 'story' || m === 'script' ? 'play' : 'card'
   }
-  function renderCardText(text, card, macroState = {}) {
+  function renderCardText(text, card, macroState = {},options={}) {
     const result = projectAgentContent(text, {
       charName: str(card && card.name),
-      macroState
+      macroState,...options
     })
     macroState.userName = result.macroState.userName
     macroState.local = result.macroState.local
@@ -932,7 +938,13 @@ export async function apply(ctx) {
     }
     return origins
   }
-  helperGenerations = createHelperGenerationService({ networkPolicy:async(sessionId,id)=>({trustedResource:(await scriptPolicy(await chatForSessionReadonly(sessionId),id)).capabilities.includes('network')}),store: profileData, allowedModelOrigins: configuredModelOrigins, assertOwner: assertHelperOwner, callModel, selection: modelSelection, context: async (sessionId,config,scriptId,lifecycleRevision) => {
+  const backgroundGeneration = createBackgroundGenerationPolicy({readChat:chatForSessionReadonly,updateChat,settings:readTavernSettings,notify:async(sessionId,scriptId,message)=>{await mvuDiagnostics.record(sessionId,{stage:'script-runtime',diagnostic:{level:'warn',scriptId,message}});sessionSignals.publish(sessionId,{kind:'tavern-state',version:'background-generation-paused:'+Date.now()})}})
+  helperGenerations = createHelperGenerationService({scope:async(sessionId,{scriptId,background,anchor}={})=>{
+    const chat=await chatForSessionReadonly(sessionId)
+    return scriptId==='extension-sp-database'&&background===false&&extensionRuntime.usesOriginal(sessionId)
+      ? {...originalSpForegroundGenerationScope(chat,anchor),originalPackageDigest:extensionRuntime.status().installed.digest}
+      : helperGenerationScope(chat)
+  },admitBackground:backgroundGeneration.admit,networkPolicy:async(sessionId,id)=>({trustedResource:(await scriptPolicy(await chatForSessionReadonly(sessionId),id)).capabilities.includes('network')}),store: profileData, allowedModelOrigins: configuredModelOrigins, assertOwner: assertHelperOwner, callModel, selection: modelSelection, context: async (sessionId,config,scriptId,lifecycleRevision) => {
     const chat = await chatForSession(sessionId); if (!chat) throw new Error('找不到当前游戏')
     const card = await readChatCard(chat), worldBook=await worldBooks.bound(chat.cardPath,card,chat), scriptPrompts=structuredClone(chat.tavernScriptPrompts||[]);
     const scan=[String(config?.user_input||''),scriptPromptScanText(chat,capacityLimits.prompts),...(config?.max_chat_history===0?[]:config?.max_chat_history==='all'||config?.max_chat_history===undefined?chat.messages:chat.messages.slice(-Number(config.max_chat_history))).map(m=>m.text||'')].join('\n');
@@ -1044,22 +1056,48 @@ export async function apply(ctx) {
     }
     return chat
   }
-  const chatJournalStore = createChatJournalStore({ dataRoot, legacyData: profileData, now: Date.now, logger: console, snapshotLimit:retentionLimits.snapshots,onMetric:performanceDiagnostics.storage, protectedRevisionsUsesChat:false,protectedRevisions: id => chatPersistence.retainedRevisions(id) })
+  const chatJournalStore = createChatRecordsStore({ dataRoot, legacyData: profileData, now: Date.now, logger: console, snapshotLimit:retentionLimits.snapshots,onMetric:performanceDiagnostics.storage, protectedRevisionsUsesChat:false,protectedRevisions: id => chatPersistence.retainedRevisions(id) })
   const spStorage = createSpStorageStore(chatJournalStore, { dataRoot })
   ctx.effect(() => () => { void spStorage.close() }, 'dsh-tavern: close database storage')
   const nativeUpgradeReceipt = await profileData.readJson('native-session-upgrade.json')
   const chatPersistence = createChatPersistence({ store: spStorage, onMetric:performanceDiagnostics.storage, normalize: value => applyNativeSessionUpgrade(normalizeChat(value), nativeUpgradeReceipt), now: Date.now })
-  const maintenanceChatIdentity=new Map()
+  const maintenanceChatIdentity=new Map(),maintenanceChatSessionIds=new Map()
   function noteMaintenanceChat(chat){
     if(!chat)return
     const previous=maintenanceChatIdentity.get(chat.id)
     if(previous&&Number(previous._storageRevision)>Number(chat._storageRevision))return
-    maintenanceChatIdentity.set(chat.id,{id:chat.id,sessionId:chat.sessionId,_storageRevision:chat._storageRevision,
+    if(previous?.sessionId&&previous.sessionId!==chat.sessionId)maintenanceChatSessionIds.delete(previous.sessionId)
+    maintenanceChatSessionIds.set(chat.sessionId,chat.id)
+    const lifecycleRevision=Number(chat.tavernHelperLifecycleRevision||0),scriptTreeRevision=Number(chat.tavernScriptTreeRevision||0)
+    maintenanceChatIdentity.set(chat.id,{id:chat.id,sessionId:chat.sessionId,_storageRevision:chat._storageRevision,lifecycleRevision,scriptTreeRevision,mode:chat.mode||'story',
+      ...(previous?.lifecycleRevision===lifecycleRevision&&previous.scriptTreeRevision===scriptTreeRevision&&previous.sessionId===chat.sessionId&&previous.mode===(chat.mode||'story')?{unloadSource:previous.unloadSource}:{}),
       taskMailbox:{tasks:Object.fromEntries(Object.keys(chat.taskMailbox?.tasks||{}).map(id=>[id,true]))},
       timeline:{participants:Object.fromEntries(Object.entries(chat.timeline?.participants||{}).map(([key,value])=>[key,{sessionId:value.sessionId}]))}})
   }
+  function forgetMaintenanceChat(chatId){const previous=maintenanceChatIdentity.get(chatId);if(previous)maintenanceChatSessionIds.delete(previous.sessionId);maintenanceChatIdentity.delete(chatId)}
+  function originalSpUnloadScope(sessionId){
+    const id=maintenanceChatSessionIds.get(sessionId),identity=maintenanceChatIdentity.get(id),scope=identity?.unloadSource;
+    if(!scope||deletedChatIds.has(id)||deletingChatIds.has(id)||identity.sessionId!==sessionId||identity.lifecycleRevision!==scope.lifecycleRevision||identity.scriptTreeRevision!==scope.scriptTreeRevision||!['story','script'].includes(identity.mode)||!extensionRuntime.installed()||!extensionRuntime.usesOriginal(sessionId)||extensionRuntime.status().installed?.digest!==scope.packageDigest||extensionRuntime.status().revision!==scope.extensionRevision||!extensionRuntime.scripts(sessionId).some(script=>script.id==='extension-sp-database'))return null;
+    return scope;
+  }
+  function rememberOriginalSpUnloadScope(chat,capturedIdentity,packageDigest,extensionRevision,publishedScripts,extensionScripts,mvuSelection){
+    const identity=maintenanceChatIdentity.get(chat.id),original=publishedScripts.filter(script=>script.id==='extension-sp-database'),source=extensionScripts.find(script=>script.id==='extension-sp-database');
+    const currentSource=extensionRuntime.scripts(chat.sessionId).find(script=>script.id==='extension-sp-database');
+    // use() publishes immutable JSON snapshots, not extension object identity.
+    if(!capturedIdentity||!identity||Number(identity._storageRevision)!==Number(chat._storageRevision)||identity.lifecycleRevision!==Number(chat.tavernHelperLifecycleRevision||0)||identity.sessionId!==chat.sessionId||identity.mode!==(chat.mode||'story')||deletedChatIds.has(chat.id)||deletingChatIds.has(chat.id)||!extensionRuntime.installed()||!extensionRuntime.usesOriginal(chat.sessionId)||extensionRuntime.status().installed?.digest!==packageDigest||extensionRuntime.status().revision!==extensionRevision||!source||!currentSource||source.id!==currentSource.id||source.scope!==currentSource.scope||typeof source.content!=='string'||source.content!==currentSource.content||original.length!==1||original[0].scope!=='extension'||! /^[a-f0-9]{64}$/.test(original[0].sourceDigest||''))return;
+    if(mvuSelection?.status==='incompatible')return;
+    const participants=publishedScripts.map(script=>({scriptId:script.id,sourceDigest:script.sourceDigest}));
+    // This is the same official-core projection as scriptsForView, including its
+    // exact immutable loader source when the selected core is not in the list.
+    if(mvuSelection?.owner==='official'&&mvuSelection.assetUrl)participants.unshift({scriptId:'__dsh_official_mvu__',sourceDigest:'await import(new URL('+JSON.stringify(String(mvuSelection.assetUrl))+', document.baseURI).href);'});
+    participants.sort((a,b)=>a.scriptId.localeCompare(b.scriptId));
+    if(participants.some(p=>!p.scriptId||!p.sourceDigest)||new Set(participants.map(p=>p.scriptId)).size!==participants.length)return;
+    identity.unloadSource={chatId:chat.id,lifecycleRevision:identity.lifecycleRevision,scriptTreeRevision:identity.scriptTreeRevision,scriptId:'extension-sp-database',sourceDigest:original[0].sourceDigest,packageDigest,extensionRevision,participants};
+  }
+  const frameUnloads=createFrameUnloadCapabilities({dispatch:tavernScriptDispatch,scopeFor:originalSpUnloadScope})
   async function readChat(chatId) {
     const chat = await chatPersistence.read(chatId)
+    if(!chat)forgetMaintenanceChat(chatId)
     noteMaintenanceChat(chat)
     if (chat) {
       const runtime=playRuntimeSettings(chat,await readTavernSettings())
@@ -1070,6 +1108,7 @@ export async function apply(ctx) {
   const preferenceViews = new WeakMap()
   async function readChatReadonly(chatId) {
     const chat = await chatPersistence.readReadonly(chatId)
+    if(!chat)forgetMaintenanceChat(chatId)
     noteMaintenanceChat(chat)
     if (!chat) return chat
     const runtime=playRuntimeSettings(chat,await readTavernSettings()),cached=preferenceViews.get(chat)
@@ -1352,6 +1391,10 @@ export async function apply(ctx) {
     await syncCardName(cardPath, savedCard.name)
     return Object.assign({}, change, { card: savedCard })
   }
+  const replaceCardText = createCardTextReplacement({
+    resources: fileResources, cards: cardPreparation, validate: validateCardText,
+    afterSave: async (path, card) => { await bumpCardProjectionRevision(path); await syncCardName(path, card.name) }
+  })
   async function replaceCardVariables(cardPath, variables) {
     const workspace = await readCardWorkspace(cardPath)
     if (workspace === undefined) throw new Error('人物卡不存在: ' + cardPath)
@@ -1444,9 +1487,8 @@ export async function apply(ctx) {
     // Registry index updates must remain sequential.
     for (const chatId of new Set(chatIds)) {
       try {
-        if (prepareOnly) await stopChatForDeletion(chatId)
-        else await deleteChat(chatId)
-        results.push({ chatId, ok: true })
+        const result = prepareOnly ? await stopChatForDeletion(chatId) : await deleteChat(chatId)
+        results.push({ chatId, ok: true, ...(result?.logicalDeletion ? {logicalDeletion:true,physicalCleanup:result.physicalCleanup,cleanupReason:result.cleanupReason,bytesFreed:result.bytesFreed} : {}) })
       } catch (error) { results.push({ chatId, ok: false, error: String(error?.message || error) }) }
     }
     return { results }
@@ -1462,7 +1504,7 @@ export async function apply(ctx) {
         const result=await conversationRegistry.remove(chatId)
         deletedChatIds.add(chatId)
         if(chat){
-          try{await profileRetention.removeChatArtifacts(chat)}catch(error){await profileData.writeJson('recovery/deletions/'+createHash('sha256').update(chatId).digest('hex')+'.json',{version:1,chat:{id:chat.id,sessionId:chat.sessionId},cleanupPending:true,error:String(error.message||error)});return {...result,cleanupPending:true,cleanupError:String(error.message||error)}}
+          try{const cleanup=await profileRetention.removeChatArtifacts(chat);if(cleanup?.reason==='format4-no-gc')return {...result,logicalDeletion:true,physicalCleanup:'protected',cleanupReason:cleanup.reason,bytesFreed:cleanup.bytes||0}}catch(error){await profileData.writeJson('recovery/deletions/'+createHash('sha256').update(chatId).digest('hex')+'.json',{version:1,chat:{id:chat.id,sessionId:chat.sessionId},cleanupPending:true,error:String(error.message||error)});return {...result,cleanupPending:true,cleanupError:String(error.message||error)}}
         }
         return result
       })
@@ -1819,6 +1861,7 @@ export async function apply(ctx) {
   // Assigned with the background coordinator below; a view built before that reports the stored state.
   let manualCharacterDesign = null
   async function view(chat, card) {
+    const unloadIdentity=maintenanceChatIdentity.get(chat.id),unloadPackageDigest=extensionRuntime.status().installed?.digest,unloadExtensionRevision=extensionRuntime.status().revision
     return viewProjectionCache.read(chat.sessionId,[chat,card],async use=>{
     await use(readTavernSettings)
     let scriptProgress = null
@@ -1983,6 +2026,7 @@ export async function apply(ctx) {
       posture: chat.posture || '',
       ledger: readLedger(chat.ledger),
       characterDesigns: projectCharacterDesignDocument(chat.characterDesignDocument),
+      characterDesignRemovalStamp: characterDesignRemovalStamp(chat),
       characterDesignTask: manualCharacterDesign ? manualCharacterDesign.project(chat, await use(()=>manualCharacterDesign.runtime(chat.id))) : (chat.characterDesignTask || { status: 'idle' }),
       phoneChat: await use(()=>phoneChat.project(chat, card)),
       guides: Array.isArray(chat.guides) ? chat.guides : [],
@@ -2044,6 +2088,7 @@ export async function apply(ctx) {
     }
     result.resourceRestrictions=projectPermissionDenials(await use(()=>permissionDenials.read(chat.sessionId)),{scripts:helperRuntime.scripts,cardPolicy:runtimePolicy,scriptPolicies:result.tavernRuntimePolicy.scriptPolicies})
     if(result.tavernHelper)result.tavernHelper.contextRevision=createHash('sha256').update(JSON.stringify([result.tavernHelper,result.card,result.tavernHelperWorldbook,result.tavernHelperScripts])).digest('hex')
+    rememberOriginalSpUnloadScope(chat,unloadIdentity,unloadPackageDigest,unloadExtensionRevision,publishedScripts,extensionScripts,mvuSelection)
     return result
     })
   }
@@ -2148,26 +2193,27 @@ export async function apply(ctx) {
     if (script === undefined || !Array.isArray(script.chunks)) return null
     return scriptContinuity.inspect({ script: script, state: chat.scriptState, request: { kind: 'preview' } })
   }
+  const sessionReadQueries=createSessionReadQueries({links:()=>conversationRegistry.links(),records:spStorage,readFull:chatForSessionReadonly,coordinator:{activity:input=>backgroundTasks.activity(input),operation:(input,id)=>backgroundTasks.operation(input,id)},upgradeReceipt:nativeUpgradeReceipt})
   async function sessionActivity(sessionId) {
-    let chat = await chatForSessionReadonly(sessionId)
-    if (chat === undefined) return null
-    const activity = backgroundTasks.activity(chat)
+    const result=await sessionReadQueries.activity(sessionId)
+    if (!result) return null
+    const activity = result.value
     return {
-      chatId: chat.id,
+      chatId: result.chatId,
       phase: activity.phase,
       busy: activity.busy,
       role: activity.role,
       operationId: activity.operationId,
       basedOn: activity.basedOn,
-      updatedAt: activity.updatedAt || chat.updatedAt || 0
+      updatedAt: activity.updatedAt || result.updatedAt || 0
     }
   }
   async function sessionOperation(sessionId, operationId) {
-    const chat = await chatForSessionReadonly(sessionId)
-    if (chat === undefined) return null
-    const operation = backgroundTasks.operation(chat, operationId)
+    const result=await sessionReadQueries.operation(sessionId,operationId)
+    if (!result) return null
+    const operation = result.value
     if (operation === null || operation.role !== 'candidate' || operation.successful !== true) return operation
-    const candidates = await candidateGenerator.find({ sessionId, messageId: chat.candidates && chat.candidates.messageId })
+    const candidates = await candidateGenerator.find({ sessionId, messageId: result.candidateMessageId })
     if (candidates === null || candidates.operationId !== operation.operationId || candidates.requestId !== operation.requestId) return operation
     return Object.assign({}, operation, { result: { candidates } })
   }
@@ -2339,7 +2385,7 @@ export async function apply(ctx) {
       const chat = await chatForSession(input.sessionId)
       return chat ? (await nativeWorldBookTemplateContext(chat, await readChatCard(chat))).context : undefined
     },
-    resolveStablePrefixRevision: async input => Number((await chatForSessionReadonly(input.sessionId))?.cardContextRevision) || 0,
+    resolveStablePrefixRevision: async input => Number(await sessionReadQueries.value(input.sessionId,'/cardContextRevision')) || 0,
     resolveStablePrefix: async function (input) {
       // Image tasks share the opening snapshot; current-worldbook replacement stays disabled above
       // because a requested illustration may target an earlier story turn.
@@ -2353,7 +2399,7 @@ export async function apply(ctx) {
     flushSession: async function (session) {
       const sessions = ctx.get('sessions')
       if (sessions === undefined) throw new Error('dsh-tavern: 缺少 sessions 服务')
-      await sessions.flush(session)
+      return await sessions.flush(session)
     },
     resolveRuntimePresetSnapshot: async function (input) {
       // 外部 Tavern 预设只投影到前台正文请求。后台 Agent 有自己的结构化任务协议，
@@ -2435,6 +2481,7 @@ export async function apply(ctx) {
     runAgent: input => backgroundAgentRunner.run(input),
     selection: backgroundModelSelection,
     designs: characterDesignDocuments,
+    removeWorldbook: async (chat, name) => removeCharacterDesignWorldbook({ worldBooks, chat, card: await readChatCard(chat), name }),
     // Upstream ef5ec5b5: restore the game's foreground agent first when it is not live.
     ensureSession: async sessionId => { if (!agentRegistry.get(sessionId)?.session) await resolveForegroundAgent(sessionId) },
     assertIdle: chat => assertConversationIdle(chat)
@@ -3425,8 +3472,8 @@ export async function apply(ctx) {
       prepare: prepareWorkspace,
       commit: commitWorkspace
     },
-    renderMacros: function (text, chat) {
-      return renderCardText(text, { name: chat.cardName }, chat.macroState)
+    renderMacros: function (text, chat, options) {
+      return renderCardText(text, { name: chat.cardName }, chat.macroState, options)
     },
     projectReply: projectRuntimeReply,
     projectWorldBookTemplates: input => nativeWorldBookTemplateContext(input.chat, input.card, {foreground:true,turn:input.turn}),
@@ -3458,12 +3505,29 @@ export async function apply(ctx) {
     now: Date.now,
     shellToolName: process.platform === 'win32' ? 'pwsh' : 'bash'
   })
+  async function clearFailedInputsBeforeTurn(sessionId){
+    const chat=await chatForSession(sessionId)
+    if(!chat||!['story','script'].includes(chat.mode||'story'))return []
+    const session=sessionStore.get(sessionId)||agentRegistry.get(sessionId)?.session
+    if(!session)return []
+    const events=sessionEvents(session),ids=new Set(),before=new Set(session.surface?.nodes||[])
+    const turns=[...new Set(events.filter(event=>event?.type==='turn/end'&&['error','aborted','interrupted'].includes(event.data?.reason?.kind)&&!chat.nativeCommits?.[String(event.data.turn)]).map(event=>Number(event.data.turn)))]
+    let changed=0
+    for(const turn of turns){await turnOrchestrator.discard({sessionId,turn});changed+=clearFailedTurnSurface({session,turn})}
+    if(changed){
+      const visible=new Set(session.surface?.nodes||[])
+      for(const event of events)if(before.has(event.seq)&&!visible.has(event.seq)){const id=event.data?.id||event.data?.message?.id;if(id)ids.add(id)}
+      await sessionStore.flush(session)
+    }
+    return [...ids]
+  }
   const foregroundHandoff = createForegroundHandoff({
     turns: turnOrchestrator,
     prepareOpeningWorldBook: prepareNextWorldBookContext,
     store: { chatForSession, readChat },
     tasks: backgroundTasks,
     queueBackground: queueSettlement,
+    clearFailedTurns:clearFailedInputsBeforeTurn,
     onError: (input, stage, error) => runtimeNotices.report(input, stage, error),
     onSuccess: (input, stage) => runtimeNotices.clear(input, stage),
     onInterrupted: async (input, before) => {
@@ -3595,6 +3659,34 @@ export async function apply(ctx) {
     }
   })
 
+  const storyAlignment = createStoryAlignment({
+    list: async () => (await readIndex()).chats || [], read: readChatReadonly, readRevision: readChatRevision,
+    update: updateChat, store: profileData, agent: id => agentRegistry.get(id),
+    busy: chat => Boolean(settlementJobs.has(chat.id) || spPostCommitJobs.has(chat.sessionId) || spDatabase.isActive?.(chat.id)
+      || autoCompaction?.isActive(chat.id) || candidateTasks.isActive(chat) || sceneIllustrations?.isActive(chat.id)
+      || helperGenerations.busy(undefined,chat.sessionId) || historyOperations.isRunning(chat.sessionId)
+      || ['pending','running'].includes(chat.settleStatus) || backgroundTasks.activity(chat).busy
+      || Object.values(chat.timeline?.participants || {}).some(p => agentRegistry.get(p.sessionId)?.phase?.kind === 'running')),
+    native: async chat => {
+      const live=sessionStore.get(chat.sessionId) || agentRegistry.get(chat.sessionId)?.session
+      if(live)return live
+      const persistence=ctx.get('sessionPersistence');if(!persistence)return null
+      let handle
+      try {handle=await persistence.open(chat.sessionId,'read');const snapshot=await handle.read(0);const detached=sessionStore.prepare(chat.sessionId,{seed:snapshot.events,meta:structuredClone(handle.header),eventState:snapshot.eventState});return {id:chat.sessionId,header:structuredClone(handle.header),surface:{nodes:[...detached.surface.nodes]},snapshotEvents:()=>snapshot.events}}
+      catch(error){if(error.name==='SessionPersistenceNotFoundError')return null;throw error}
+      finally {await handle?.close()}
+    },
+    flush: session => sessionStore.flush(session), onBackupCompleted: verifiedBackups.remember,
+    exclusive: async (chatId,work) => {
+      const target=await profileSessionAccess.exportTarget(chatId)
+      await runtimeRecovery.waitSession(target.sessionId)
+      await resolveForegroundAgent(target.sessionId)
+      const agent=agentRegistry.get(target.sessionId)
+      if(typeof agent?.runMaintenance!=='function')throw Error('当前原生内核不提供空闲独占维护，请升级后修复')
+      return agent.runMaintenance(signal => maintenanceGate.write(() => work({agent,signal})))
+    }
+  })
+
   const inputEditor=createInputEditor({chats:{forSession:chatForSession},history:historyOperations,present:view})
   const bodyEditor = createBodyEditor({
     history: historyOperations,
@@ -3613,7 +3705,7 @@ export async function apply(ctx) {
   // ---------- HTTP RPC（客户端同源 fetch） ----------
   async function retentionBusy(chat){
     const rows=chat?[]:(await readIndex()).chats||[],live=new Set(rows.map(row=>typeof row==='string'?row:row.id))
-    if(!chat)for(const id of maintenanceChatIdentity.keys())if(!live.has(id))maintenanceChatIdentity.delete(id)
+    if(!chat)for(const id of maintenanceChatIdentity.keys())if(!live.has(id))forgetMaintenanceChat(id)
     const chats=chat?[chat]:await Promise.all([...live].map(async id=>{if(!maintenanceChatIdentity.has(id))await readChatReadonly(id);return maintenanceChatIdentity.get(id)}))
     return chats.filter(Boolean).some(current=>agentRegistry.get(current.sessionId)?.phase?.kind==='running'||settlementJobs.has(current.id)||spPostCommitJobs.has(current.sessionId)||spDatabase.isActive?.(current.id)||autoCompaction?.isActive(current.id)||candidateTasks.isActive(current)||sceneIllustrations?.isActive(current.id)||helperGenerations.busy(undefined,current.sessionId)||historyOperations.isRunning(current.sessionId)||Object.values(current.timeline?.participants||{}).some(p=>agentRegistry.get(p.sessionId)?.phase?.kind==='running'))
   }
@@ -3664,7 +3756,7 @@ export async function apply(ctx) {
       return profileRetention.run({dryRun:args?.dryRun!==false,only:args?.only})
     }
     if(deletingChatIds.size&&args?.sessionId){const chat=await conversationRegistry.resolve(args.sessionId,{readonly:true});if(chat&&deletingChatIds.has(chat.id)&&!['stopTavernHelperGeneration','cancelSceneImage'].includes(method))throw Error('对话正在删除')}
-    if(method.startsWith('gameplay.')||['deleteChat','deleteChats','prepareDeleteChats'].includes(method))return dispatchMethodGated(method,args)
+    if(method.startsWith('gameplay.')||['deleteChat','deleteChats','prepareDeleteChats','repairStoryAlignment','inspectStoryAlignment'].includes(method))return dispatchMethodGated(method,args)
     const gateOperation=method==='captureDisplayRuntime'||/^(?:get|list|poll|inspect|preview|export|parse|plan|browse)/.test(method)||(method==='doctorTavern'&&!args?.repair)?maintenanceGate.read:maintenanceGate.mutate
     return gateOperation(()=>args?.scriptScope==='frame'&&args.scriptId!=='__dsh_message__'?tavernScriptDispatch.runOwned(args.sessionId,args.runtimeId,()=>dispatchMethodGated(method,args),{method,scriptId:args.scriptId,token:args.spRecoveryToken,eventId:args.apiCallOrigin?.eventId||args.eventId}):dispatchMethodGated(method,args))
   }
@@ -3680,12 +3772,19 @@ export async function apply(ctx) {
       return sources.some(source=>sourceKey(source)===sourceKey(row?.source))
     }})
     await profileSessionAccess.assertRpc(method, args)
+    if(args?.sessionId&&['startTavernTrigger','gameplay.send','regenBody','rollbackTurn','saveBodyEdit','saveChat'].includes(method)&&(await chatForSessionReadonly(args.sessionId))?.pendingStoryAlignment)throw Error('剧情对账修复尚未完成，请先在状态恢复中重新检查并完成修复')
     if (method === 'startTavernTrigger') return tavernTrigger.start(args)
     // Reading the host's settings panel is passive. A card script using the
     // template API is an actual dependency and activates auto mode for this game.
     if(args?.scriptScope==='frame'&&/^(?:get|load|save)FullPromptTemplate(?:State|Globals|Settings|WorldInfo|Runtime)$/.test(method))await templateEngineStatus(args.sessionId,{api:true})
     if(method!=='getSpDatabase'&&!extensionRuntime.installed()&&(/^(?:get|list|save|delete|preview|apply|select|import|export|query|sync|run|update|fill|generate)Sp/.test(method)||['commitTavernScriptDatabase','fillTavernScriptDatabase'].includes(method)))throw new Error('SP·数据库扩展未安装或已停用，请在扩展程序中安装或启用。')
     if(args?.sessionId&&(/^(?:get|list|save|delete|preview|apply|select|import|export|query|sync|run|update|fill|generate|cancel)Sp/.test(method)||['commitTavernScriptDatabase','fillTavernScriptDatabase','tavernHelperDatabaseTemplates','spCompanionAction'].includes(method)))originalSpCatalog.assertBackend(args.sessionId,await chatForSessionReadonly(args.sessionId))
+    if (method === 'inspectStoryAlignment' || method === 'repairStoryAlignment') {
+      if(args?.scriptScope || args?.scriptId)throw Error('剧情对账只能从宿主设置界面操作')
+      if(method==='repairStoryAlignment')return storyAlignment.repair(args?.chatId,args?.expectedStamp)
+      const ids=args?.chatId?[args.chatId]:((await readIndex()).chats || []).map(row=>row.id)
+      return {results:await Promise.all(ids.map(id=>storyAlignment.inspect(id).catch(error=>({chatId:id,status:'unknown',findings:[],error:String(error.message||error)}))))}
+    }
     if (method === 'doctorTavern') {
       if (args?.scriptScope === 'frame') throw new Error('状态恢复只能从宿主设置界面操作')
       return await runtimeRecovery.run({ repair: args?.repair === true, chatId: args?.chatId })
@@ -3746,8 +3845,8 @@ export async function apply(ctx) {
         for(const sessionId of extensionSessions)sessionSignals.publish(sessionId,{kind:'tavern-state',version:'extensions:'+result.extensions.revision})
         return {...result,templateMigration:migration}
       }
-      case 'startTavernHelperGeneration': return await helperGenerations.start(args.sessionId, args.config, args.raw !== false, args.scriptId, args.expectedLifecycleRevision)
-      case 'pollTavernHelperGeneration': return helperGenerations.poll(args.sessionId, args.id, args.scriptId, args.offset, args.expectedLifecycleRevision)
+      case 'startTavernHelperGeneration': return await helperGenerations.start(args.sessionId, args.config, args.raw !== false, args.scriptId, args.expectedLifecycleRevision,{background:String(args.runtimeId||'').startsWith('background:'),runtimeId:args.runtimeId,eventId:args.apiCallOrigin?.eventId||args.eventId})
+      case 'pollTavernHelperGeneration': return helperGenerations.poll(args.sessionId, args.id, args.scriptId, args.offset, args.expectedLifecycleRevision,{received:args.received,runtimeId:args.runtimeId})
       case 'stopTavernHelperGeneration': return helperGenerations.stop(args.sessionId, args.id, args.scriptId, args.expectedLifecycleRevision)
       case 'listTavernHelperModels': return await helperGenerations.models(args.api,args.sessionId,args.scriptId,args.expectedLifecycleRevision)
       case 'prepareTavernOriginalDatabaseMutation': {
@@ -3871,8 +3970,8 @@ export async function apply(ctx) {
         return {...await scriptLibrary.planImport(args.sessionId,args.scope,[imported.script],imported.script.name,args.existing,'github:'+imported.provenance.repository),github:imported.provenance,modules:imported.modules};
       }
       case 'selectTavernFrontendWorldInfo': {const chat=await chatForSessionReadonly(args.sessionId);if(!chat)throw Error('当前会话不存在');return selectFrontendWorldInfo(args.input,chat,effectiveGamePreset(chat)?.compatibilityPresetDocument||{});}
-      case 'startTavernFrontendMainGeneration': return helperGenerations.start(args.sessionId,frontendMainGenerationConfig(args.body),true,args.scriptId,args.expectedLifecycleRevision,{exactMessages:true});
-      case 'startTavernFrontendGeneration': return helperGenerations.start(args.sessionId,frontendGenerationConfig(args.body),true,args.scriptId,args.expectedLifecycleRevision,{exactMessages:true});
+      case 'startTavernFrontendMainGeneration': return helperGenerations.start(args.sessionId,frontendMainGenerationConfig(args.body),true,args.scriptId,args.expectedLifecycleRevision,{exactMessages:true,background:String(args.runtimeId||'').startsWith('background:'),runtimeId:args.runtimeId,eventId:args.apiCallOrigin?.eventId||args.eventId});
+      case 'startTavernFrontendGeneration': return helperGenerations.start(args.sessionId,frontendGenerationConfig(args.body),true,args.scriptId,args.expectedLifecycleRevision,{exactMessages:true,background:String(args.runtimeId||'').startsWith('background:'),runtimeId:args.runtimeId,eventId:args.apiCallOrigin?.eventId||args.eventId});
       case 'planTavernScriptUpdate': return await scriptLibrary.planImport(args?.sessionId,args.scope,args.document,args.name,args.existing,undefined,args.selections)
       case 'parseTavernScriptImport': return { trees: importScriptTrees(args.document, args.name) }
       case 'getMigrationConfiguration': return { configuration: {...await migrationSettings.read(),...(originalSpCatalog.owns()?{templates:await originalSpCatalog.list(),templateOwner:'original'}:{})} }
@@ -4138,6 +4237,23 @@ export async function apply(ctx) {
         return capacitySettings.save(args.settings)
       }
       case 'getCandidatePreferences': return {candidateDismissMode:(await readTavernSettings()).candidateDismissMode}
+      case 'getBackgroundScriptGeneration': {
+        if(args?.scriptScope||args?.scriptId)throw Error('后台脚本控制只能在宿主设置中使用')
+        const library=await scriptLibrary.get(args?.sessionId),scripts=new Map()
+        for(const trees of Object.values(library.library))for(const script of flattenScriptTrees(trees))scripts.set(script.id,{id:script.id,name:script.name})
+        for(const script of extensionRuntime.scripts(args?.sessionId))scripts.set(script.id,{id:script.id,name:script.name})
+        return {policy:(await readTavernSettings()).backgroundScriptGeneration,scripts:[...scripts.values()],sessions:(await readIndex()).chats.filter(chat=>['story','script'].includes(chat.mode||'story')).map(chat=>({sessionId:chat.sessionId,title:chat.title||chat.cardName||chat.id})),jobs:await helperGenerations.list(args?.sessionId)}
+      }
+      case 'stopBackgroundScriptGeneration': {
+        if(args?.scriptScope||args?.scriptId)throw Error('后台脚本控制只能在宿主设置中使用')
+        const job=(await helperGenerations.list(args?.sessionId)).find(job=>job.id===args?.id)
+        if(!job)return {stopped:false}
+        return helperGenerations.stop(job.scope.sessionId,job.id,job.scriptId,job.scope.lifecycleRevision)
+      }
+      case 'recoverScriptGeneration': {
+        if(args?.scriptScope||args?.scriptId)throw Error('生成结果核对只能在宿主设置中使用')
+        return helperGenerations.recovery(args.sessionId,args.id,{reviewed:args.reviewed===true})
+      }
       case 'getDisplayPreferences': return { hideContextAndReasoning: (await readTavernSettings()).hideContextAndReasoning }
       case 'getTavernSettings': {const settings=await readTavernSettings();return {writingSkills:await writingSkillsFor({disabledWritingSkills:settings.defaultDisabledWritingSkills}),settings,modelCatalog:await tavernModelCatalog(),releaseCapabilities:TAVERN_RELEASE_CAPABILITIES}}
       case 'getSceneImageSettings': return { settings: await enabledSceneIllustrations().settings(args?.provider) }
@@ -4321,7 +4437,7 @@ export async function apply(ctx) {
         await backgroundScripts.yieldToFrontend(args.sessionId,args.runtimeId,{takeover:true})
         return taken
       }
-	  case 'claimTavernScriptWork': await backgroundScripts.yieldToFrontend(args?.sessionId,args?.runtimeId); return tavernScriptHostAdapter.claimWork(args && args.sessionId, args && args.runtimeId, args && args.ready, args && args.initializationError,args?.leaseProtocol,args?.mvuValidation)
+	  case 'claimTavernScriptWork': {await backgroundScripts.yieldToFrontend(args?.sessionId,args?.runtimeId);const result=tavernScriptHostAdapter.claimWork(args && args.sessionId,args && args.runtimeId,args && args.ready,args && args.initializationError,args?.leaseProtocol,args?.mvuValidation);const unloadAccess=result.active?frameUnloads.issue(args.sessionId,args.runtimeId):null;return unloadAccess?{...result,unloadAccess}:result}
 	  case 'startTavernScriptWork': return String(args?.eventId||'').startsWith('display-render:')?tavernScriptHostAdapter.startDisplayedMessageWork(args):tavernScriptHostAdapter.startWork(args && args.sessionId, args && args.eventId, args && args.leaseToken, args && args.runtimeId)
       case 'enqueueTavernDisplayedMessage': {
         if(args?.scriptScope||args?.scriptId)throw new Error('正文呈现只能由宿主界面登记');
@@ -4331,9 +4447,13 @@ export async function apply(ctx) {
         if(args?.scriptScope||args?.scriptId)throw new Error('正文呈现只能由宿主界面取消');
         return tavernScriptDispatch.cancelDisplayedMessage(args?.sessionId,args?.eventId,args?.runtimeId);
       }
-	  case 'heartbeatTavernScriptRuntime': await backgroundScripts.yieldToFrontend(args?.sessionId,args?.runtimeId); return tavernScriptHostAdapter.heartbeatRuntime(args && args.sessionId, args && args.runtimeId, args && args.ready, args && args.initializationError,args?.leaseProtocol,args?.mvuValidation)
-	  case 'completeTavernHelperEvent': return { completed: tavernScriptHostAdapter.completeEvent(args && args.sessionId, args && args.eventId, args && args.args, args && args.runtimeId, args && args.leaseToken, args && args.error, sanitizeRuntimeDiagnostics(args && args.diagnostics)) }
-      case 'reserveTavernHelperRuntime': {const result=tavernScriptDispatch.reserveDrain(args?.sessionId,args?.runtimeId,args?.error,args?.durationMs,args?.retry,args?.recoveryToken);if(args?.error)await mvuDiagnostics.record(args.sessionId,{stage:'sp-drain-failed',error:String(args.error).slice(0,2000)});return result}
+	  case 'heartbeatTavernScriptRuntime': {await backgroundScripts.yieldToFrontend(args?.sessionId,args?.runtimeId);const result=tavernScriptHostAdapter.heartbeatRuntime(args && args.sessionId,args && args.runtimeId,args && args.ready,args && args.initializationError,args?.leaseProtocol,args?.mvuValidation);const unloadAccess=result.active?frameUnloads.issue(args.sessionId,args.runtimeId):null;return unloadAccess?{...result,unloadAccess}:result}
+	  case 'completeTavernHelperEvent': {
+        const completed=tavernScriptHostAdapter.completeEvent(args && args.sessionId, args && args.eventId, args && args.args, args && args.runtimeId, args && args.leaseToken, args && args.error, sanitizeRuntimeDiagnostics(args && args.diagnostics))
+        if(completed&&!args?.error)await helperGenerations.completeEvent(args.sessionId,args.eventId,args.runtimeId)
+        return {completed}
+      }
+      case 'reserveTavernHelperRuntime': {const result=args?.kind==='unloading'&&!args?.retry&&!args?.error?tavernScriptDispatch.reserveUnload(args.sessionId,args.runtimeId,{unloadId:args.unloadId,hostIdle:args.hostIdle,scope:originalSpUnloadScope(args.sessionId),durationMs:args.durationMs}):tavernScriptDispatch.reserveDrain(args?.sessionId,args?.runtimeId,args?.error,args?.durationMs,args?.retry,args?.recoveryToken);if(args?.error)await mvuDiagnostics.record(args.sessionId,{stage:'sp-drain-failed',error:String(args.error).slice(0,2000)});return result}
       case 'quarantineTavernHelperRuntime': return tavernScriptDispatch.quarantine(args?.sessionId,args?.runtimeId,args?.error)
       case 'retryTavernBackgroundScriptDrain': return backgroundScripts.retryDrain(args?.sessionId)
 	  case 'releaseTavernHelperRuntime': return { released: tavernScriptHostAdapter.releaseRuntime(args && args.sessionId, args && args.runtimeId) }
@@ -4368,6 +4488,7 @@ export async function apply(ctx) {
         const chat = await chatForSession(sessionId)
         if (!chat || !['story', 'script'].includes(chat.mode || 'story') || chat.requestMode === 'sillytavern') throw new Error('仅支持当前游玩会话')
         if ((await sessionActivity(sessionId))?.busy || agentRegistry.get(sessionId)?.phase?.kind === 'running') throw new Error('请等待当前生成和后台任务完成后再应用人物卡')
+        if(chat.regenInProgress||chat.pendingRegeneration)throw new Error('上一次正文重新生成尚未完成：请先恢复历史操作，再应用人物卡')
         const card = await readChatCard(chat)
         if (typeof args.digest !== 'string' || !args.digest) throw new Error('请刷新后确认人物卡和世界书更新')
         const patch = {...await playCardSnapshots.replacement(chat, card, args.digest),...await scriptLibrary.cardReplacement(chat)}
@@ -4389,7 +4510,10 @@ export async function apply(ctx) {
         const result = await withCompactionSession(id, async agent => (await agentCompaction(agent)).compactNow(agent, compactionAbort.signal))
         return { result: { status: 'completed', foreground: { status: 'succeeded', message: result ? '压缩完成' : '没有可压缩的历史' }, background: { status: 'skipped' } } }
       }
-      case 'compactionStatus': return { state: (await chatForSessionReadonly(args && args.sessionId))?.contextCompaction || null }
+      case 'compactionStatus': return { state: await sessionReadQueries.value(args && args.sessionId,'/contextCompaction') || null }
+      case 'getTavernSessionIdentity': return {identity:await sessionReadQueries.fields(args?.sessionId,['/mode','/cardName'])}
+      case 'getTavernMessageWindow': return {window:await sessionReadQueries.window(args?.sessionId,{before:args?.before,cursor:args?.cursor,limit:args?.limit,pinnedRevision:args?.pinnedRevision,snapshotId:args?.snapshotId})}
+      case 'getTavernMessageSlice': return {slice:await sessionReadQueries.slice(args?.sessionId,{indices:args?.indices,pinnedRevision:args?.pinnedRevision,snapshotId:args?.snapshotId})}
       case 'prepareCompaction': return { plan: await tavernCompaction.prepare(args && args.sessionId) }
       case 'compactBackground': return { result: await compactBackground(args && args.sessionId, args && args.operationId) }
       case 'completeCompaction': return { result: await tavernCompaction.complete(args && args.sessionId, args) }
@@ -4440,6 +4564,7 @@ export async function apply(ctx) {
       case 'editLedger': { await ledgerEditor(args || {}); return { view: await sessionView(args.sessionId) } }
       case 'addGuide': return { guides: await addGuide(args && args.sessionId, args && args.text) }
       case 'deleteGuide': return { guides: await deleteGuide(args && args.sessionId, args && args.id) }
+      case 'removeCharacterDesign': return await manualCharacterDesign.remove({ sessionId: args?.sessionId, name: args?.name, expectedStamp: args?.expectedStamp })
       case 'designCharacter': return await manualCharacterDesign.start({ sessionId: args && args.sessionId, guidance: args && args.guidance })
       case 'listGuideLibrary': return { items: await guideLibrary.list() }
       case 'saveGuideLibrary': return { item: await saveGuidePlan(args && args.sessionId, args && args.name) }
@@ -4492,7 +4617,7 @@ export async function apply(ctx) {
 
   const webServer = ctx.get('webServer')
   if (webServer !== undefined) {
-    const requestGate = createTavernRequestGate({ rpcBytes:capacityLimits.process.rpcBytes,frameResources, address: () => webServer.server.address(), requestRejection: req => {
+    const requestGate = createTavernRequestGate({ rpcBytes:capacityLimits.process.rpcBytes,frameResources,frameUnloads, address: () => webServer.server.address(), requestRejection: req => {
       const connection = ctx.get('connection')
       if (typeof connection?.requestRejection !== 'function') return 503
       return connection.requestRejection(req)
@@ -4523,6 +4648,11 @@ export async function apply(ctx) {
           return
         }
         const pathname = access.pathname
+        if(access.frameUnload){
+          try{await requestGate.readBody(req,access);const vote=frameUnloads.vote(req);res.writeHead(vote.invalid?409:204,{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end();}
+          catch(error){res.writeHead(error.status||400,{'Cache-Control':'no-store'});res.end();}
+          return;
+        }
         const cachedAssetMatch = /^\/api\/dsh-tavern\/remote-assets\/([0-9a-f]{64})(?:\/[^/]*)?$/i.exec(pathname)
         const readsStaticAsset = req.method === 'GET' && pathname === '/api/dsh-tavern/static-assets'
         const readsFullTemplate = req.method === 'GET' && pathname.startsWith(FULL_PROMPT_TEMPLATE_ASSET_PREFIX)
@@ -4733,43 +4863,10 @@ export async function apply(ctx) {
     return phase && phase.kind === 'running' ? Math.max(0, Number(phase.turn) || 0) : 0
   }
 
-  function turnStartIndex(session, turn) {
-    const events = sessionEvents(session)
-    for (let index = events.length - 1; index >= 0; index--) {
-      const event = events[index]
-      if (event && event.type === 'turn/start' && Number(event.data && event.data.turn) === Number(turn)) return index
-    }
-    return -1
-  }
-
-  function userMessageForTurn(session, turn) {
-    const events = sessionEvents(session)
-    const start = turnStartIndex(session, turn)
-    if (start < 0) return null
-    for (let index = Math.max(0, start + 1); index < events.length; index++) {
-      const event = events[index]
-      if (!event || event.type !== 'user/message') continue
-      if (isTurnInput(event.data)) return event.data
-    }
-    return null
-  }
-
   function requestIdOf(message) {
     if (isTavernTriggerInput(message)) return str(message.id).trim()
     const source = message && message.source
     return source && source.kind === 'user' ? str(source.rpcId).trim() : ''
-  }
-
-  function requestIdForTurn(session, turn) {
-    const events = sessionEvents(session)
-    const start = turnStartIndex(session, turn)
-    if (start < 0) return ''
-    for (let index = Math.max(0, start + 1); index < events.length; index++) {
-      const event = events[index]
-      if (!event || event.type !== 'user/message' || !isTurnInput(event.data)) continue
-      return requestIdOf(event.data)
-    }
-    return ''
   }
 
   function requestIdForMessages(messages) {
@@ -4852,6 +4949,8 @@ export async function apply(ctx) {
     const worldInfo = await compatibilityWorldInfo(chat, card, userText, presetDocument)
     const history = openingCommandHistory(chat.messages)
     const startPrompt = openingCommandPrompt(chat)
+    const operation=Object.values(chat.timeline?.operations||{}).findLast(item=>item.kind==='body'&&item.status==='running')
+    const randomSeed=operation?.runtimeRandomSeed||operation?.id
     const compiled = compileSillyTavernRequest({
       card,
       preset,
@@ -4862,6 +4961,7 @@ export async function apply(ctx) {
       inputAttachments:attachments,
       userName: str(chat.macroState && chat.macroState.userName),
       macroState: chat.macroState,
+      randomSeed,frontEntryKeys:(snapshot?.front?.entries||[]).map(entry=>entry.entryKey||entry.id),
       worldInfoBefore: worldInfo.before,
       worldInfoAfter: worldInfo.after,
       worldInfoDepth: worldInfo.depth,
@@ -4869,12 +4969,14 @@ export async function apply(ctx) {
       worldInfoExamplesAfter: worldInfo.examplesAfter,
       resolveMacros: resolveRuntimeMacroText,
       projectPromptText: function (text, context) {
-        return applyTavernRegexText(text, regexScripts, {
+        const projected=applyTavernRegexText(text, regexScripts, {
           placement: context.placement,
           isMarkdown: false,
           isEdit: false,
           depth: context.depth
         })
+        if(projected.changed&&projected.text.includes('{{'))projected.text=resolveRuntimeMacroText(projected.text,{charName:card.name,macroState:chat.macroState,random:seededTavernRandom(randomSeed,'compatibility-regex:'+context.placement+':'+context.depth)}).text
+        return projected
       }
     })
     if (startPrompt) {
@@ -5009,7 +5111,7 @@ export async function apply(ctx) {
     })
   }
 
-  const controlledToolNames = new Set(['bash', 'pwsh', ...dshFileToolNames, 'skill', 'web_search', 'tavern_save_skill', ...cordisToolNames, 'tavern_user_profile_read', 'tavern_user_profile_save_draft', 'tavern_user_profile_confirm', 'tavern_convert_to_mvu', 'tavern_design_mvu_appearance', 'tavern_validate_mvu_conversion', 'tavern_read_card', 'tavern_read_card_raw', 'tavern_read_play_chat', 'tavern_read_script', 'tavern_recall_history', 'worldbook_search', 'tavern_read_worldbook', 'tavern_update_worldbook', 'tavern_read_preset', 'tavern_update_preset', 'tavern_update_card', 'tavern_restore_card', 'tavern_validate_card', 'tavern_test_response'])
+  const controlledToolNames = new Set(['bash', 'pwsh', ...dshFileToolNames, 'skill', 'web_search', 'tavern_save_skill', ...cordisToolNames, 'tavern_user_profile_read', 'tavern_user_profile_save_draft', 'tavern_user_profile_confirm', 'tavern_convert_to_mvu', 'tavern_design_mvu_appearance', 'tavern_validate_mvu_conversion', 'tavern_read_card', 'tavern_read_card_raw', 'tavern_search_card', 'tavern_replace_card_text', 'tavern_read_play_chat', 'tavern_read_script', 'tavern_recall_history', 'worldbook_search', 'tavern_read_worldbook', 'tavern_update_worldbook', 'tavern_read_preset', 'tavern_update_preset', 'tavern_update_card', 'tavern_restore_card', 'tavern_validate_card', 'tavern_test_response'])
   toolRestrictions = createTavernToolRestrictions(ctx, {
     resolveChat: async sessionId => backgroundAgentRunner.owns(sessionId) ? null : chatForSession(sessionId),
     visibleTools: (sessionId, chat) => turnOrchestrator.visibleTools(sessionId, chat),
@@ -5021,6 +5123,7 @@ export async function apply(ctx) {
       writingMessages:async chat=>compatibilityWritingMessages(tavernSkills,chat,await readTavernSettings()),
       beforeTurn: async function (input) {
         await runtimeRecovery?.waitSession(input.sessionId)
+        await clearFailedInputsBeforeTurn(input.sessionId)
         await fullTemplateCommitter.flush(input.sessionId)
         assertMvuCoreUsable(await chatForSession(input.sessionId))
         await awaitForegroundPostCommit(input.sessionId)
@@ -5035,6 +5138,7 @@ export async function apply(ctx) {
         const compiled = input.compiled
         await updateChat(input.chat.id, function (current) {
           if (!current || typeof current !== 'object') return current
+          const templateInput=templateInputView(current).input
           consumeOpeningCommandPrompt(current, compiled.openingCommandPrompt, input)
           current.macroState = compiled.macroState
           if (compiled.promptTemplateState && compiled.promptTemplateState.persist === true) {
@@ -5047,6 +5151,7 @@ export async function apply(ctx) {
                 variables: scopes.message
               })
             }
+            rememberTemplateInputScopes(current,templateInput)
           }
           if (!current.compatibilityTraces || typeof current.compatibilityTraces !== 'object') current.compatibilityTraces = {}
           current.compatibilityTraces[String(input.turn)] = Object.assign({ createdAt: Date.now() }, compiled.trace, { diagnostics: compiled.diagnostics })
@@ -5142,6 +5247,7 @@ export async function apply(ctx) {
     const chat = await chatForSession(sessionId)
     if (chat) performanceDiagnostics.turnStart({chatId:chat.id,sessionId,turn:payload.turn})
     if (chat?.nativeHistoryEdit)throw new Error('历史操作尚未保存完成，请稍后重试')
+    if (chat?.pendingStoryAlignment)throw new Error('剧情对账修复尚未完成，请在状态恢复中重新检查并完成修复')
     if (chat) await synchronizeBodyEdits(payload.agent.session, chat, session => sessionStore.flush(session))
     return await foregroundStrategies.prepareStep({
       sessionId,
@@ -5644,6 +5750,52 @@ export async function apply(ctx) {
       }
     }))
 
+  tools.register(defineTool({
+    name: 'tavern_search_card',
+    description: '在整张人物卡里定位文字：一次搜遍标准字段、开场、内置世界书条目（标题、关键词、正文）、正则和脚本，返回 JSON Pointer、所属条目与上下文片段。要改的内容不确定在哪、或要改多处时先用它定位，再按位置读取或修改：内置世界书条目用 tavern_update_worldbook（entry:N），标准字段用 tavern_update_card 的 fields，其他用 rawOperations。不搜索绑定的独立世界书。',
+    parameters: {
+      path: { type: 'string', description: '可选的人物卡相对路径；省略时搜索当前人物卡' },
+      query: { type: 'string', required: true, description: '要找的文字；默认按字面匹配，不区分大小写' },
+      regex: { type: 'boolean', description: '为 true 时把 query 当作 JavaScript 正则' },
+      limit: { type: 'integer', description: '最多返回的命中位置数，默认 30，最大 100' }
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          query: { type: 'string', required: true },
+          total: { type: 'integer', required: true },
+          occurrences: { type: 'integer', required: true },
+          truncated: { type: 'boolean', required: true },
+          hits: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: {
+            pointer: { type: 'string', required: true }, label: { type: 'string', required: true }, count: { type: 'integer', required: true },
+            chars: { type: 'integer', required: true }, snippets: { type: 'array', required: true, items: { type: 'string' } }
+          } } }
+        }
+      },
+      render: function (_args, value) {
+        if (value.total === 0) return [{ type: 'text', text: '人物卡中没有找到「' + value.query + '」。' }]
+        const lines = ['「' + value.query + '」共 ' + value.occurrences + ' 处，分布在 ' + value.total + ' 个位置' + (value.truncated ? '，仅列出前 ' + value.hits.length + ' 个' : '') + '：']
+        for (const hit of value.hits) {
+          lines.push('', hit.pointer + (hit.label ? ' · ' + hit.label : '') + ' · ' + hit.count + ' 处 / 全文 ' + hit.chars + ' 字')
+          for (const snippet of hit.snippets) lines.push('  ' + snippet.replace(/\n/g, '⏎'))
+        }
+        return [{ type: 'text', text: lines.join('\n') }]
+      }
+    },
+    isConcurrencySafe: function () { return true },
+    async execute(args, exec) {
+      const sessionId = exec && exec.agent && exec.agent.session ? exec.agent.session.id : ''
+      const chat = await chatForSession(sessionId)
+      if (chat === undefined || (chat.mode || 'story') !== 'card') throw new Error('人物卡搜索只能在卡片工作台中使用')
+      const resourcePath = str(args.path).trim() || str(chat.cardPath)
+      if (resourcePath === '') throw new Error('空白工作台还没有正式人物卡')
+      const text = await fileResources.readText(normalizeResourcePath(resourcePath, 'card'))
+      if (text === undefined) throw new Error('人物卡资源不存在: ' + resourcePath)
+      return searchCardRaw(cardPreparation.present({card:JSON.parse(text),as:'raw'}), args)
+    }
+  }))
+
     tools.register(defineTool({
       name: 'tavern_read_card_raw',
       description: '在卡片工作台中按 JSON Pointer 分段读取完整工作 raw。只在标准字段工具无法覆盖正则、脚本、MVU 或未知扩展时使用；pointer 为空可查看根结构。',
@@ -6073,6 +6225,50 @@ export async function apply(ctx) {
         })
       }
     }))
+
+  tools.register(defineTool({
+    name: 'tavern_replace_card_text',
+    description: '仅当用户明确要求修改时，在整张人物卡里批量替换文字并立即保存：标准字段、开场、内置世界书条目（标题、关键词、正文）、正则和脚本一次改完，保存后自动校验。结果列出每个位置替换了几处、全卡剩余几处，以此为准，无需再搜索或用脚本复核。只想改部分位置时用 pointers 限定（可填 tavern_search_card 返回的 pointer 或其上级，如 /data/character_book/entries/8）；填 expectedCount 时实际处数不符则不改；任一范围或格式错误均零写入。path 必须为当前工作台绑定的卡。不处理绑定的独立世界书。',
+    parameters: {
+      path: { type: 'string', description: '可选的人物卡路径；省略时修改当前人物卡' },
+      find: { type: 'string', required: true, description: '要替换的文字；默认按字面匹配，不区分大小写' },
+      replace: { type: 'string', required: true, description: '替换成的文字；regex 为 true 时可用 $1 等引用分组' },
+      regex: { type: 'boolean', description: '为 true 时把 find 当作 JavaScript 正则' },
+      pointers: { type: 'array', items: { type: 'string' }, description: '可选，只替换这些 JSON Pointer 位置及其下级' },
+      expectedCount: { type: 'integer', description: '可选，预期替换的总处数；不符时不保存并返回实际分布' }
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          saved: { type: 'boolean', required: true },
+          warnings: { type: 'array', required: true, items: { type: 'string' } },
+          path: { type: 'string', required: true },
+          replaced: { type: 'integer', required: true },
+          remaining: { type: 'integer', required: true },
+          locations: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: {
+            pointer: { type: 'string', required: true }, label: { type: 'string', required: true }, count: { type: 'integer', required: true } } } },
+          validation: { type: 'json' }
+        }
+      },
+      render: function (_args, value) {
+        const lines = ['已在 ' + value.path + ' 替换 ' + value.replaced + ' 处，全卡剩余 ' + value.remaining + ' 处：']
+        for (const item of value.locations) lines.push('- ' + item.pointer + (item.label ? ' · ' + item.label : '') + ' · ' + item.count + ' 处')
+        if (value.validation) lines.push(JSON.stringify(value.validation))
+        lines.push(...value.warnings)
+        return [{ type: 'text', text: lines.join('\n') }]
+      }
+    },
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      const sessionId = exec?.agent?.session?.id || ''
+      const chat = await chatForSession(sessionId)
+      return replaceCardText(chat, args, { beforeCommit: async () => {
+        const current = await chatForSession(sessionId)
+        if (!current || current.mode !== 'card' || current.cardPath !== chat.cardPath) throw Error('工作台绑定已变化，未保存')
+      } })
+    }
+  }))
 
     tools.register(defineTool({
       name: 'tavern_restore_card',

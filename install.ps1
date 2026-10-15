@@ -42,7 +42,39 @@ if ($InstallHost -eq 'cli') {
     }
   }
   $DshRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DshRoot)
-  if (-not (Test-Path -LiteralPath (Join-Path $DshRoot 'apps/dsh-tavern/.dsh-tavern-local.json') -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $DshRoot '.dsh-tavern-install-root') -PathType Leaf)) {
+  # An explicit Node CLI application can live outside Home. A marker alone is
+  # insufficient: require the installed profile's matching ownership chain.
+  $ExistingExplicitCli = $false
+  if ($env:DSH_TAVERN_APP_DIR) {
+    function Get-CliInstallPath([string]$Value) {
+      if (-not $Value -or -not [IO.Path]::IsPathRooted($Value)) { throw '安装归属路径必须为绝对路径。' }
+      return [IO.Path]::GetFullPath($Value).TrimEnd('\', '/')
+    }
+    try {
+      $ExplicitApp = Get-CliInstallPath $env:DSH_TAVERN_APP_DIR
+      $SelectedHome = Get-CliInstallPath $DshRoot
+      $LocalMarker = Join-Path $ExplicitApp '.dsh-tavern-local.json'
+      if (Test-Path -LiteralPath $LocalMarker -PathType Leaf) {
+        foreach ($OwnedRoot in @($SelectedHome, $ExplicitApp, (Join-Path $SelectedHome 'profiles'), (Join-Path $SelectedHome 'profiles/tavern'))) {
+          $OwnedItem = Get-Item -LiteralPath $OwnedRoot -Force
+          if (-not $OwnedItem.PSIsContainer -or ($OwnedItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw '安装归属目录不是普通目录。' }
+        }
+        $Local = Get-Content -LiteralPath $LocalMarker -Raw | ConvertFrom-Json
+        $Profile = Get-Content -LiteralPath (Join-Path $SelectedHome 'profiles/tavern/package.json') -Raw | ConvertFrom-Json
+        $Owned = $Profile.dshTavern
+        if ($Local.host -ne 'cli' -or $Owned.host -ne 'cli' -or
+            (Get-CliInstallPath $Local.dshHome) -ine $SelectedHome -or
+            (Get-CliInstallPath $Owned.source) -ine $ExplicitApp -or
+            (Get-CliInstallPath $Owned.dataRoot) -ine (Join-Path $SelectedHome 'profile-data/tavern/data') -or
+            $ExplicitApp -ieq $SelectedHome -or
+            $Profile.dependencies.'dsh-tavern-plugin' -ine ('link:' + (Join-Path $ExplicitApp 'tavern-plugin').Replace('\', '/'))) {
+          throw '显式程序目录与 CLI Home/profile 安装归属不一致。'
+        }
+        $ExistingExplicitCli = $true
+      }
+    } catch { throw "无法确认显式程序目录的安装归属：$($_.Exception.Message)" }
+  }
+  if (-not $ExistingExplicitCli -and -not (Test-Path -LiteralPath (Join-Path $DshRoot 'apps/dsh-tavern/.dsh-tavern-local.json') -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $DshRoot '.dsh-tavern-install-root') -PathType Leaf)) {
     foreach ($Entry in @('apps', 'runtime', 'tools', 'profiles', 'profile-data', 'source-cache', 'logs', 'backups', 'settings.yaml')) {
       if (Test-Path -LiteralPath (Join-Path $DshRoot $Entry)) { throw "安装目录存在冲突：$DshRoot\$Entry。请选择空目录，或使用原有安装目录。" }
     }
@@ -126,11 +158,15 @@ try {
     $env:Path = "$RuntimeRoot;$env:Path"
     $env:DSH_TAVERN_BIN_DIR = $CommandBin
     $env:Path = "$CommandBin;$env:Path"
-    $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $UserEntries = @($UserPath -split ';' | Where-Object { $_ -ne '' })
-    if (-not ($UserEntries | Where-Object { $_.TrimEnd('\') -ieq $CommandBin.TrimEnd('\') })) {
-      $NewUserPath = (@($UserEntries) + $CommandBin) -join ';'
-      [Environment]::SetEnvironmentVariable('Path', $NewUserPath, 'User')
+    # The same option skips command shims in profile-installation.mjs. Keep
+    # the process path usable without registering a command for this user.
+    if ($env:DSH_TAVERN_SKIP_COMMAND_INSTALL -ne '1') {
+      $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+      $UserEntries = @($UserPath -split ';' | Where-Object { $_ -ne '' })
+      if (-not ($UserEntries | Where-Object { $_.TrimEnd('\') -ieq $CommandBin.TrimEnd('\') })) {
+        $NewUserPath = (@($UserEntries) + $CommandBin) -join ';'
+        [Environment]::SetEnvironmentVariable('Path', $NewUserPath, 'User')
+      }
     }
   }
 

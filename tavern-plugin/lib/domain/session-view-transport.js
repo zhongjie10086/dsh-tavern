@@ -5,13 +5,29 @@ import {immutableJsonSnapshot} from './json-draft.js'
 import {jsonBytes,isFrozenJson} from './readonly-json.js'
 import {projectionVersion} from './dependency-projection-cache.js'
 
-function compact(view,sharedStrings=false,sharedObjects=false) {
+function compact(view,sharedStrings=false,sharedObjects=false,helperVariables=false) {
  if(!view)return{view,aliases:{helperSwipes:[],replyText:[]}}
  const aliases={helperSwipes:[],replyText:[]},next={...view}
  if(Array.isArray(view.tavernHelper?.messages))next.tavernHelper={...view.tavernHelper,messages:view.tavernHelper.messages.map((row,index)=>{
   if(typeof row.message!=='string'||row.swipes?.length!==1||row.swipes[0]!==row.message)return row
   aliases.helperSwipes.push(index);return{...row,swipes:[]}
  })}
+ if(helperVariables&&Array.isArray(next.tavernHelper?.messages)){
+  aliases.helperVariables=[];aliases.helperData=[]
+  const seen=new WeakMap()
+  next.tavernHelper.messages=next.tavernHelper.messages.map((row,index)=>{
+   let nextRow=row
+   const selected=row.swipes_data?.[row.swipe_id]
+   if(selected&&row.variables===selected){const {variables,...rest}=nextRow;nextRow=rest;aliases.helperVariables.push(index)}
+   if(Array.isArray(row.swipes_data))nextRow={...nextRow,swipes_data:row.swipes_data.map((value,swipe)=>{
+    if(!isFrozenJson(value))return value
+    const source=seen.get(value)
+    if(source){aliases.helperData.push([index,swipe,...source]);return null}
+    seen.set(value,[index,swipe]);return value
+   })}
+   return nextRow
+  })
+ }
  if(Array.isArray(view.replyProjections))next.replyProjections=view.replyProjections.map((row,index)=>{
   if(typeof row.text!=='string'||row.parts?.length!==1||row.parts[0].content!==row.text)return row
   aliases.replyText.push(index);const{ text,...rest}=row;return rest
@@ -51,15 +67,15 @@ function compact(view,sharedStrings=false,sharedObjects=false) {
 
 /** Process-local, session-scoped wire baselines. Eviction always falls back to a full snapshot. */
 export function createSessionViewTransport({maxEntries=8,maxBytes=64*1024*1024}={}) {
- const entries=new Map(),encoded=new WeakMap(),encoded3=new WeakMap(),encoded4=new WeakMap();let bytes=0
+ const entries=new Map(),encoded=new WeakMap(),encoded3=new WeakMap(),encoded4=new WeakMap(),encoded5=new WeakMap();let bytes=0
  function respond(sessionId,view,args={}) {
   const version=projectionVersion(view)
   if(args.ifVersion===version)return{unchanged:true,version}
   const protocol=args.viewProtocol
-  if(protocol!==2&&protocol!==3&&protocol!==4)return{view,version}
-  const cache=protocol===4?encoded4:protocol===3?encoded3:encoded
+  if(protocol!==2&&protocol!==3&&protocol!==4&&protocol!==5)return{view,version}
+  const cache=protocol===5?encoded5:protocol===4?encoded4:protocol===3?encoded3:encoded
   let bundle=isFrozenJson(view)?cache.get(view):null
-  if(!bundle){bundle=compact(view,protocol>=3,protocol===4);if(isFrozenJson(view))cache.set(view,bundle)}
+  if(!bundle){bundle=compact(view,protocol>=3,protocol>=4,protocol>=5);if(isFrozenJson(view))cache.set(view,bundle)}
   const key=JSON.stringify([sessionId,protocol,version]),base=entries.get(JSON.stringify([sessionId,protocol,args.ifVersion])),size=jsonBytes(bundle)
   let result={...bundle,version,viewEncoding:protocol}
   if(base){const patch={baseVersion:args.ifVersion,changes:diffJson(base.bundle,bundle)};if(jsonBytes(patch)<size)result={patch,version,viewEncoding:protocol}}

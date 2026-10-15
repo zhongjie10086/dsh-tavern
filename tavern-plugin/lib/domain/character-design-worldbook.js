@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util'
 import { inspectWorldBookDocument, updateWorldBookDocument } from './worldbook-resource.js'
 import { CHARACTER_DESIGN_PRESENTATION_FIELDS } from './character-design-document.js'
 
@@ -58,4 +59,30 @@ export function characterDesignWorldbookNote(result) {
   if (result.status === 'ambiguous') return '本局世界书里该人物有多个设计条目，未改动；请玩家整理后再保存'
   if (result.status === 'failed') return '写入本局世界书失败：' + str(result.error) + '；设计已存入人物档案'
   return ''
+}
+
+/** Remove only this game's generated addition; public and hand-edited entries survive. */
+export async function removeCharacterDesignWorldbook({ worldBooks, chat, card, name }) {
+  await worldBooks.migrateChat(chat)
+  const record = await worldBooks.boundCard(chat.cardPath, card, chat)
+  if (!record) return { removed: false, edited: false }
+  const matches = inspectWorldBookDocument(record.document).entries.filter(entry => entry.rawEntry?.extensions?.dsh_tavern_helper_extra?.[MARKER]?.name === name)
+  if (!matches.length) return { removed: false, edited: false }
+  if (matches.length !== 1) return { removed: false, edited: true }
+  const entry = matches[0], marker = entry.rawEntry.extensions.dsh_tavern_helper_extra[MARKER]
+  const uid = entry.ref.slice('entry:'.length)
+  const owned = Object.hasOwn(chat.worldbookState?.books?.[record.privateKey]?.additions || {}, uid)
+  const operation = characterDesignEntryOperation({ entries: {} }, { name, aliases: (marker.keys || []).filter(key => key !== name), design: {} }).operation
+  operation.entry.content = marker.content
+  operation.entry.helperExtra = { [MARKER]: marker }
+  const expected = Object.values(updateWorldBookDocument({ entries: {} }, { operations: [operation] }).document.entries)[0]
+  const actual = structuredClone(entry.rawEntry)
+  actual.uid = expected.uid
+  // Any additional metadata or extension belongs to the player, too.
+  const intact = isDeepStrictEqual(actual, expected)
+
+  if (!owned || !intact || entry.content !== marker.content || JSON.stringify(entry.primaryKeys) !== JSON.stringify(marker.keys)
+    || entry.comment !== '人物设计 · ' + name || entry.constant || !entry.enabled || entry.secondaryKeys.length) return { removed: false, edited: true }
+  await worldBooks.replaceForChat(chat, record, updateWorldBookDocument(record.document, { operations: [{ op: 'delete', ref: entry.ref }] }).document)
+  return { removed: true, edited: false }
 }

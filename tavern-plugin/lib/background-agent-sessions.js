@@ -58,6 +58,97 @@ export function createBackgroundAgentSessions(options, task) {
   const residentHandles = new Map()
   const residentSessionByParent = new Map()
   const queues = new Map()
+  const now = typeof options.now === 'function' ? options.now : Date.now
+  const idleMs = Number.isFinite(options.residentIdleMs) && options.residentIdleMs > 0 ? options.residentIdleMs : 5 * 60 * 1000
+  const maxIdleResidents = Number.isSafeInteger(options.maxResidentSessions) && options.maxResidentSessions > 0 ? options.maxResidentSessions : 8
+  let idleTimer, reclaiming, closed = false
+
+  // Reclamation uses the same parent queue as model work. A request arriving
+  // during flush/dispose waits for the native handle to finish unloading.
+  function serialized(parentId, operation) {
+    const previous = queues.get(parentId) || Promise.resolve()
+    const current = previous.catch(() => {}).then(operation)
+    queues.set(parentId, current)
+    return current.finally(() => {
+      if (queues.get(parentId) === current) queues.delete(parentId)
+      scheduleReclamation()
+    })
+  }
+
+  function idleResidents() {
+    return [...residentHandles].filter(([id, resident]) => !resident.retirement && !activeSessions.has(id)
+      && !queues.has(resident.parentSessionId) && (!resident.handle.agent.phase || resident.handle.agent.phase.kind === 'idle'))
+      .sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt)
+  }
+
+  function scheduleReclamation() {
+    clearTimeout(idleTimer)
+    if (closed || reclaiming) return
+    const idle = idleResidents(), time = now()
+    if (!idle.length) return
+    const overCapacity = idle.length > maxIdleResidents
+    const delay = Math.min(...idle.map(([, resident]) => Math.max(0,
+      (resident.retryAt || 0) - time, overCapacity ? 0 : resident.lastUsedAt + idleMs - time)))
+    const schedule = () => {
+      idleTimer = setTimeout(() => { void reclaimResidents().catch(error => console.warn('dsh-tavern: 后台 Agent 回收失败', error)) }, delay)
+      idleTimer.unref?.()
+    }
+    // The real registry carries an Agent through AsyncLocalStorage. A pool
+    // timer must not retain whichever Agent happened to complete this task.
+    if (typeof agents.withoutInitiator === 'function') agents.withoutInitiator(schedule)
+    else schedule()
+  }
+
+  function reclaimResidents() {
+    if (reclaiming) return reclaiming
+    if (closed) return Promise.resolve({ released: [], blocked: [] })
+    clearTimeout(idleTimer)
+    reclaiming = (async () => {
+      const result = { released: [], blocked: [] }
+      for (const [id, resident] of idleResidents()) {
+        if (closed) break
+        const time = now()
+        if ((resident.retryAt || 0) > time || residentHandles.get(id) !== resident || activeSessions.has(id)
+          || queues.has(resident.parentSessionId) || resident.retirement) continue
+        if (idleResidents().length <= maxIdleResidents && time - resident.lastUsedAt < idleMs) continue
+        await serialized(resident.parentSessionId, async () => {
+          try {
+            // Native inject() may enqueue work without waking the driver. Its
+            // phase and whenIdle can both say idle while Inbox still owns input.
+            if (resident.handle.agent.inbox?.hasPending) {
+              resident.retryAt = now() + 1000
+              return
+            }
+            const { ready } = await idleNow(resident.handle.agent)
+            if (!ready || resident.handle.agent.phase && resident.handle.agent.phase.kind !== 'idle') {
+              resident.retryAt = now() + 1000
+              return
+            }
+            if (typeof options.flushSession !== 'function') throw new Error('后台 Agent 回收缺少持久化 flush')
+            if (await options.flushSession(resident.handle.agent.session) === false) throw new Error('后台 Agent 没有持久化 flush 监听器')
+            // Native whenIdle/phase are authoritative; cancellation or an
+            // external maintenance phase must never be turned into teardown.
+            if (resident.handle.agent.inbox?.hasPending || resident.handle.agent.phase && resident.handle.agent.phase.kind !== 'idle') {
+              resident.retryAt = now() + 1000
+              return
+            }
+            await resident.handle.dispose()
+            residentHandles.delete(id)
+            requestContexts.delete(id); requestSessions.delete(id)
+            // Keep the parent -> durable session identity. Next use resumes
+            // that exact session, without retiring it or replaying old input.
+            result.released.push(id)
+          } catch (error) {
+            resident.retryAt = now() + 30000
+            result.blocked.push({ sessionId: id, error: str(error.message) })
+            console.warn('dsh-tavern: 后台 Agent 回收未完成，保留所有权', id, error)
+          }
+        })
+      }
+      return result
+    })().finally(() => { reclaiming = undefined; scheduleReclamation() })
+    return reclaiming
+  }
 
   // Cancellation finishes the request before an uncooperative provider becomes
   // idle. Keep that handle quarantined; native retirement may only run at idle.
@@ -220,7 +311,7 @@ export function createBackgroundAgentSessions(options, task) {
     if (handle === undefined) {
       state = { input: runtimeInput, ctx: null }
       try {
-        if (!abandoned && requestedSessionId !== '') {
+        if (!abandoned && (requestedSessionId !== '' || residentSessionId !== '')) {
           if (typeof agents.resume !== 'function') throw new Error('当前 DSH 不支持恢复持久后台 Agent')
           try {
             handle = await agents.resume({
@@ -276,7 +367,7 @@ export function createBackgroundAgentSessions(options, task) {
         throw wrapped
       }
       if (persistent) {
-        resident = { handle, state, parentSessionId: str(input.sessionId), key }
+        resident = { handle, state, parentSessionId: str(input.sessionId), key, lastUsedAt: now() }
         residentHandles.set(traceSessionId, resident)
         residentSessionByParent.set(key, traceSessionId)
       }
@@ -300,6 +391,7 @@ export function createBackgroundAgentSessions(options, task) {
       throw error
     } finally {
       activeSessions.delete(traceSessionId)
+      if (resident) { resident.lastUsedAt = now(); delete resident.retryAt }
       requestStates.delete(traceSessionId)
       if (state.abandoned) {
         abandonedSessions.add(traceSessionId)
@@ -320,14 +412,9 @@ export function createBackgroundAgentSessions(options, task) {
   }
 
   function run(input) {
+    if (closed) return Promise.reject(new Error('后台 Agent 已停止'))
     if (input.persistent !== true) return execute(input)
-    const key = str(input.sessionId)
-    const previous = queues.get(key) || Promise.resolve()
-    const current = previous.catch(function () {}).then(function () { return execute(input) })
-    queues.set(key, current)
-    return current.finally(function () {
-      if (queues.get(key) === current) queues.delete(key)
-    })
+    return serialized(str(input.sessionId), () => execute(input))
   }
 
   function owns(sessionId) {
@@ -343,7 +430,7 @@ export function createBackgroundAgentSessions(options, task) {
     return requestSessions.get(str(sessionId)) || null
   }
 
-  async function compact(input = {}) {
+  async function executeCompact(input = {}) {
     const sessionId = str(input.sessionId)
     if (sessionId === '') throw new Error('缺少后台 Session ID')
     if (compactAgent === null) throw new Error('当前 DSH 没有提供后台压缩能力')
@@ -370,11 +457,27 @@ export function createBackgroundAgentSessions(options, task) {
         if (handle !== null) await handle.dispose()
       } finally {
         activeSessions.delete(sessionId)
+        if (resident) resident.lastUsedAt = now()
       }
     }
   }
 
+  function compact(input = {}) {
+    if (closed) return Promise.reject(new Error('后台 Agent 已停止'))
+    const id = str(input.sessionId)
+    if (activeSessions.has(id)) return Promise.reject(new Error('后台 Agent 正在执行任务，请等待完成后再压缩'))
+    const resident = residentHandles.get(id)
+    const parentId = resident?.parentSessionId || [...residentSessionByParent].find(([, value]) => value === id)?.[0]
+    // Unloaded sessions have a JSON resident key; keep maintenance on their
+    // parent queue as well, so a continuation cannot mount the same id twice.
+    const parent = resident?.parentSessionId || (parentId ? JSON.parse(parentId)[0] : id)
+    return serialized(parent, () => executeCompact(input))
+  }
+
   async function dispose() {
+    closed = true
+    clearTimeout(idleTimer)
+    await reclaiming
     const settled = await Promise.allSettled(Array.from(residentHandles, async ([id, resident]) => {
       if (resident.retirement) return retryRetirement(id)
       try { await resident.handle.dispose() }
@@ -410,5 +513,5 @@ export function createBackgroundAgentSessions(options, task) {
     }
     return null
   }
-  return Object.freeze({ progress, run, owns, requestContext, requestSession, compact, cancel, dispose, retirementStatus, retryRetirement })
+  return Object.freeze({ progress, run, owns, requestContext, requestSession, compact, cancel, dispose, retirementStatus, retryRetirement, reclaimResidents })
 }

@@ -71,6 +71,46 @@ export function createTavernScriptDispatch(options = {}) {
     return true
   }
 
+  const unloadParticipants=scope=>scope?.participants||[{scriptId:scope?.scriptId,sourceDigest:scope?.sourceDigest}];
+  const sameUnloadScope=(a,b)=>Boolean(a&&b&&a.chatId===b.chatId&&a.lifecycleRevision===b.lifecycleRevision&&a.scriptTreeRevision===b.scriptTreeRevision&&a.sourceDigest===b.sourceDigest&&a.packageDigest===b.packageDigest&&a.extensionRevision===b.extensionRevision&&a.scriptId==='extension-sp-database'&&b.scriptId==='extension-sp-database'&&JSON.stringify(unloadParticipants(a))===JSON.stringify(unloadParticipants(b)));
+  function invalidateUnload(current){if(current?.unload)current.unload.invalid=true;}
+  function admitWork(current){if(!current)return;current.admissionEpoch=(current.admissionEpoch||0)+1;if(current.unload&&(current.unload.reserved||current.unload.votes.some(p=>p.consumed)))invalidateUnload(current);}
+  function issueUnloadTicket(sessionId,runtimeId,scope,random){
+    const current=presence.get(str(sessionId));
+    if(!current||current.owner!==str(runtimeId)||current.owner.startsWith('background:')||current.released||current.resetRequired||current.draining||current.quarantined||!scope||scope.scriptId!=='extension-sp-database')return null;
+    if(current.unload&&!sameUnloadScope(current.unload.scope,scope)){invalidateUnload(current);return null;}
+    const participants=unloadParticipants(scope);
+    if(!participants.length||participants.some(p=>!p.scriptId||!p.sourceDigest)||new Set(participants.map(p=>p.scriptId)).size!==participants.length)return null;
+    if(!current.unload)current.unload={id:random(),scope:clone(scope),votes:participants.map(p=>({...p,token:random(),consumed:false})),voted:false,reserved:false,invalid:false};
+    const ticket=current.unload;if(ticket.invalid||ticket.votes.some(p=>p.consumed))return null;
+    return {unloadId:ticket.id,lifecycleRevision:scope.lifecycleRevision,sourceDigest:scope.sourceDigest,participants:ticket.votes.map(p=>({scriptId:p.scriptId,sourceDigest:p.sourceDigest,token:p.token}))};
+  }
+  function acceptsUnloadTicket(sessionId,token,scope){const current=presence.get(str(sessionId)),ticket=current?.unload;return Boolean(ticket&&!ticket.invalid&&ticket.votes.some(p=>p.token===token&&!p.consumed)&&!current.released&&!current.resetRequired&&!current.quarantined&&sameUnloadScope(ticket.scope,scope)&&(!current.draining||current.drainKind==='unloading')&&(drainLive(current)||now()-current.seenAt<=presenceTtlMs));}
+  function finalizeUnload(id,current){
+    const ticket=current.unload;
+    if(!ticket||ticket.invalid||!ticket.voted||!ticket.reserved||ticket.epoch!==(current.admissionEpoch||0)||current.operations>0||records.has(id)||current.resetRequired||current.quarantined||current.drainKind!=='unloading')return {released:false,pending:true};
+    current.released=true;current.ready=false;current.generalReady=false;current.draining=false;ticket.finished=true;
+    publishSignal(id,{kind:'runtime-work',version:'unload-released:'+ ++sequence});return {released:true,unloadResolved:true};
+  }
+  function voteUnload(sessionId,token,scope){
+    const id=str(sessionId),current=presence.get(id);if(!acceptsUnloadTicket(id,token,scope))return {released:false,invalid:true};
+    const ticket=current.unload;ticket.votes.find(p=>p.token===token).consumed=true;
+    if(current.operations>0||records.has(id)){ticket.invalid=true;return {released:false,pending:true};}
+    if(ticket.epoch!==undefined&&ticket.epoch!==(current.admissionEpoch||0)){ticket.invalid=true;return {released:false,invalid:true};}
+    ticket.voted=ticket.votes.every(p=>p.consumed);ticket.epoch=current.admissionEpoch||0;return finalizeUnload(id,current);
+  }
+  function reserveUnload(sessionId,runtimeId,{unloadId,scope,hostIdle,durationMs}={}){
+    const id=str(sessionId),current=presence.get(id),ticket=current?.unload;
+    if(!current||current.owner!==str(runtimeId))return {reserved:false,superseded:true};
+    if(current.released)return {reserved:false,released:true,...(ticket?.finished&&ticket.id===unloadId?{unloadResolved:true}:{})};
+    const valid=ticket&&!ticket.invalid&&ticket.id===unloadId&&sameUnloadScope(ticket.scope,scope)&&hostIdle===true&&!current.resetRequired&&!current.quarantined&&(!current.draining||current.drainKind==='unloading');
+    // Bad/missing proof never bypasses the existing drain, nor changes its kind.
+    if(!valid)return reserveDrain(id,runtimeId,'',durationMs);
+    if(!ticket.voted)ticket.epoch=current.admissionEpoch||0;
+    if(current.operations>0||records.has(id)||ticket.epoch!==(current.admissionEpoch||0)){invalidateUnload(current);return reserveDrain(id,runtimeId,'',durationMs);}
+    const reserved=reserveDrain(id,runtimeId,'',durationMs,false,'',true);ticket.reserved=true;current.drainKind='unloading';
+    const result=finalizeUnload(id,current);return result.released?{reserved:false,...result}:reserved;
+  }
   const drainLive=current=>current?.draining===true&&now()<current.drainUntil
   function touch(sessionId, runtimeId = 'legacy', ready = false, initializationError = '',leaseProtocol=0,mvuValidation) {
     const id = str(sessionId)
@@ -147,7 +187,7 @@ export function createTavernScriptDispatch(options = {}) {
   function quarantine(sessionId,runtimeId,error){
     const id=str(sessionId),current=presence.get(id)
     if(!current||current.owner!==str(runtimeId)||current.resetRequired)return {quarantined:false,superseded:true}
-    current.quarantined=true;current.draining=true;current.ready=false;current.generalReady=false;current.drainUntil=now();
+    invalidateUnload(current);current.quarantined=true;current.draining=true;current.ready=false;current.generalReady=false;current.drainUntil=now();
     delete current.recoveryToken;delete current.recoveryUntil
     if(error)current.drainError=redactDiagnostic(str(error)).slice(0,2000)
     const record=records.get(id)
@@ -163,7 +203,7 @@ export function createTavernScriptDispatch(options = {}) {
       const record=records.get(id);
       if(!record?.event.displayedMessage||record.event.id!==recovery.eventId||record.phase!=='executing'||record.cancelled)throw new Error('正文显示事件已结束，写入未执行');
     }
-    current.operations=(current.operations||0)+1
+    admitWork(current);current.operations=(current.operations||0)+1
     try{return await work()}finally{current.operations--;
       if(current.displayWork&&!current.operations&&presence.get(id)===current){
         const record=records.get(id);
@@ -179,12 +219,13 @@ export function createTavernScriptDispatch(options = {}) {
           if(state.ready&&!state.busy&&!state.mvuValidationBlocked)publishSettled(id);
         }
       }
-      if(current.released&&!current.operations&&presence.get(id)===current){presence.delete(id);publishSignal(id,{kind:'runtime-work',version:'released:'+ ++sequence})}}
+      if(current.released&&!current.unload?.finished&&!current.operations&&presence.get(id)===current){presence.delete(id);publishSignal(id,{kind:'runtime-work',version:'released:'+ ++sequence})}}
   }
-  function reserveDrain(sessionId,runtimeId,error,durationMs=91000,retry=false,recoveryToken=''){
+  function reserveDrain(sessionId,runtimeId,error,durationMs=91000,retry=false,recoveryToken='',unloading=false){
     const id=str(sessionId),current=presence.get(id);
     if(!current||current.owner!==str(runtimeId)||current.released)return {reserved:false,released:true};
     if(current.resetRequired)return {reserved:false,superseded:true};
+    if(!unloading){invalidateUnload(current);current.drainKind='ordinary';}
     if(current.quarantined&&(!retry||!str(recoveryToken)))return {reserved:false,quarantined:true};
     if(retry&&current.operations>0)return {reserved:false,pending:true};
     if(!drainLive(current)&&now()-current.seenAt>presenceTtlMs&&records.get(id)?.phase!=='executing')throw new Error('SP 原包保存租约已失效');
@@ -193,7 +234,7 @@ export function createTavernScriptDispatch(options = {}) {
     current.draining=true;current.ready=false;current.generalReady=false;current.seenAt=now();if(error)current.drainError=redactDiagnostic(str(error)).slice(0,2000);
     return {reserved:true,remainingMs:Math.max(0,current.drainUntil-now())};
   }
-  function retirePresence(id){const current=presence.get(id);if(current?.operations>0){current.released=true;current.ready=false;current.generalReady=false}else presence.delete(id)}
+  function retirePresence(id){const current=presence.get(id);if(current?.released&&current.unload?.finished)return;if(current?.operations>0){current.released=true;current.ready=false;current.generalReady=false}else presence.delete(id)}
 
   // Transient, tied to the existing execution lease. Never written to a chat or global settings.
   function mvuActivity(chat) {
@@ -248,7 +289,7 @@ export function createTavernScriptDispatch(options = {}) {
     if(record.cancelled)return {started:false};
     if (record.phase === 'executing') return { started: true, alreadyStarted: true }
     if (record.phase !== 'offered') return { started: false }
-    record.phase = 'executing'
+    admitWork(presence.get(id));record.phase = 'executing'
     if (record.offerTimer !== null) clearTimeout(record.offerTimer)
     record.offerTimer = null
     record.executionTimer = setTimeout(function () {
@@ -313,7 +354,7 @@ export function createTavernScriptDispatch(options = {}) {
         if (records.get(id) === record && record.phase === 'queued') retirePresence(id)
         resolveRecord(id, record, { handled: false, unavailable: true, claimTimedOut: true, phase: 'queued', args: clone(event.args) })
       }, claimTimeoutMs)
-      records.set(id, record)
+      admitWork(presence.get(id));records.set(id, record)
       if(event.displayedMessage)presence.get(id).displayWork=event.id;
       publishSignal(id, { kind: 'runtime-work', version: event.id })
     })
@@ -388,6 +429,7 @@ export function createTavernScriptDispatch(options = {}) {
   function dispose(sessionId, runtimeId = '') {
     const id = str(sessionId)
     if (runtimeId !== '' && presence.get(id)?.owner !== str(runtimeId)) return false
+    if(presence.get(id)?.released&&presence.get(id)?.unload?.finished)return true
     retirePresence(id)
     for (const waiter of [...idleWaiters]) if (waiter.id === id) waiter.fail(new Error('脚本执行窗口已释放，未执行事件仍保留'))
     const record = records.get(id)
@@ -416,8 +458,8 @@ export function createTavernScriptDispatch(options = {}) {
   function needsReset(sessionId, runtimeId) { const current = presence.get(str(sessionId)); return current?.owner === str(runtimeId) && current.resetRequired === true }
   function invalidate(sessionId) {
     const id = str(sessionId), current = presence.get(id)
-    if (current) { current.ready = false; current.generalReady = false; current.resetRequired = true }
+    if (current) { invalidateUnload(current);current.ready = false; current.generalReady = false; current.resetRequired = true }
     publishSignal(id, { kind: 'runtime-reset', version: String(++sequence) })
   }
-  return Object.freeze({ touch, available,availableFrontend,heartbeat,subscribeWork,runOwned,reserveDrain,quarantine, mvuActivity, setMvuActivity, claim, takeOver, start, complete, dispatch, enqueueDisplayedMessage,displayedMessageTarget,cancelDisplayedMessage,subscribeReady, subscribeSettled,waitForIdle, dispose, status, invalidate, needsReset })
+  return Object.freeze({ touch, available,availableFrontend,heartbeat,subscribeWork,runOwned,reserveDrain,issueUnloadTicket,acceptsUnloadTicket,voteUnload,reserveUnload,quarantine, mvuActivity, setMvuActivity, claim, takeOver, start, complete, dispatch, enqueueDisplayedMessage,displayedMessageTarget,cancelDisplayedMessage,subscribeReady, subscribeSettled,waitForIdle, dispose, status, invalidate, needsReset })
 }

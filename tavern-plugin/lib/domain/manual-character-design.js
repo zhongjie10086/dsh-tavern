@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { CHARACTER_DESIGN_READ_TOOL, CHARACTER_DESIGN_SAVE_TOOL, CHARACTER_DESIGN_SAVE_TOOL_NAME } from './character-design-document.js'
 
 // Upstream 41ddec09 and follow-ups (an explicit 设计人物 task), adapted locally (user 2026-10-09):
@@ -9,7 +10,9 @@ const str = value => typeof value === 'string' ? value : (value === undefined ||
 
 export const MANUAL_CHARACTER_DESIGN_SYSTEM = '本次是玩家手动发起的人物设计任务，只做人物设计，不写正文、不结算变量、不生成候选项。按玩家写明的人物与要求，先调用 skill 加载 tavern-character-design，用 character_design_read 查看已有档案（已有人物优先补充或修订），再用 character_design_save 保存完整方案；可一次设计多人。全部保存后调用 character_design_finish 结束。'
 
-export function createManualCharacterDesign({ store, tasks, runAgent, selection, designs, ensureSession = async () => {}, assertIdle = () => {}, now = Date.now, onError = error => console.error('dsh-tavern: 人物设计保存状态失败', str(error && error.message || error)) }) {
+export const characterDesignRemovalStamp = chat => createHash('sha256').update(JSON.stringify([chat?.characterDesignDocument, chat?.worldbookState, chat?.openingWorldbookSnapshot])).digest('hex')
+
+export function createManualCharacterDesign({ store, tasks, runAgent, selection, designs, removeWorldbook, ensureSession = async () => {}, assertIdle = () => {}, now = Date.now, onError = error => console.error('dsh-tavern: 人物设计保存状态失败', str(error && error.message || error)) }) {
   // jobs: runs alive in this process; outcomes: how the latest run of each game ended, kept
   // before its final write so a view holding an older snapshot (or a failed write) still shows it.
   const jobs = new Map(), outcomes = new Map()
@@ -100,5 +103,29 @@ export function createManualCharacterDesign({ store, tasks, runAgent, selection,
       await setTask(chat.id, failed, 'character-design.manual-failed')
     }
   }
-  return { start, project, runtime, wait: chatId => jobs.get(chatId) }
+  async function remove({ sessionId, name, expectedStamp }) {
+    const target = str(name).trim()
+    if (!target) throw new Error('缺少要删除的人物')
+    const chat = await store.chatForSession(sessionId)
+    if (!chat || !['story', 'script'].includes(chat.mode || 'story')) throw new Error('人物设计只用于游玩对话')
+    if (jobs.has(chat.id)) throw new Error('人物设计正在进行中，请完成后再删除')
+    if (!expectedStamp || characterDesignRemovalStamp(chat) !== expectedStamp) throw new Error('人物档案或本局世界书已变化，请刷新后重试')
+    assertIdle(chat)
+    jobs.set(chat.id, true)
+    try {
+      let result
+      await store.updateChat(chat.id, async current => {
+        assertIdle(current)
+        if (characterDesignRemovalStamp(current) !== expectedStamp) throw new Error('人物档案或本局世界书已变化，请刷新后重试')
+        const document = current.characterDesignDocument, characters = document?.characters || []
+        if (characters.filter(character => character?.name === target).length !== 1) throw new Error('找不到唯一人物档案：' + target)
+        result = await removeWorldbook(current, target)
+        assertIdle(current)
+        current.characterDesignDocument = { ...document, characters: characters.filter(character => character?.name !== target), revision: (Number(document.revision) || 0) + 1, updatedAt: now() }
+        return current
+      }, { source: 'character-design.remove' })
+      return { name: target, worldbookRemoved: result.removed, worldbookEdited: result.edited }
+    } finally { jobs.delete(chat.id) }
+  }
+  return { start, remove, project, runtime, wait: chatId => jobs.get(chatId) }
 }

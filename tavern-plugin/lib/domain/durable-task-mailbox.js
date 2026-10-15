@@ -8,6 +8,24 @@ const VALID = new Set(['queued', 'running', ...TERMINAL])
 function mailboxOf(chat) {
   const source = chat && chat.taskMailbox
   if (source && typeof source === 'object' && source.tasks && typeof source.tasks === 'object') {
+    if (Array.isArray(source.tasks)) {
+      // Validate before replacing the legacy array. A corrupt entry must remain
+      // available for repair rather than disappearing during normalization.
+      const tasks = Object.create(null)
+      for (const [index, task] of source.tasks.entries()) {
+        const id = task?.taskId
+        if (typeof id !== 'string' || !id.trim() || id !== id.trim()) {
+          throw new Error('旧任务邮箱迁移失败：第 ' + index + ' 项 taskId 非法；原数组已保留，请修复后重试')
+        }
+        if (Object.hasOwn(tasks, id)) {
+          throw new Error('旧任务邮箱迁移失败：第 ' + index + ' 项 taskId 重复 (' + id + ')；原数组已保留，请修复后重试')
+        }
+        tasks[id] = task
+      }
+      source.tasks = tasks
+      source.latestByKind = Object.create(null)
+      for (const task of Object.values(tasks).sort((a, b) => Number(a.createdAt) - Number(b.createdAt))) source.latestByKind[task.kind] = task.taskId
+    }
     if (!source.latestByKind || typeof source.latestByKind !== 'object') source.latestByKind = {}
     source.tasks = Object.assign(Object.create(null), source.tasks)
     source.latestByKind = Object.assign(Object.create(null), source.latestByKind)
@@ -54,6 +72,13 @@ export function createDurableTaskMailbox(options = {}) {
   let sequence = 0
   if (!store || typeof store.readChat !== 'function' || typeof store.writeChat !== 'function') {
     throw new Error('Durable Task Mailbox 缺少存储 adapter')
+  }
+
+  async function loadMailbox(chat) {
+    const legacy = Array.isArray(chat.taskMailbox?.tasks)
+    const mailbox = mailboxOf(chat)
+    if (legacy) await store.writeChat(chat, { source: 'mailbox.migrate' })
+    return mailbox
   }
 
   function serialize(chatId, work) {
@@ -113,7 +138,7 @@ export function createDurableTaskMailbox(options = {}) {
     return await serialize(chatId, async function () {
       const chat = await store.readChat(chatId)
       if (!chat) throw new Error('聊天不存在: ' + chatId)
-      const mailbox = mailboxOf(chat)
+      const mailbox = await loadMailbox(chat)
       const requestId = str(input.requestId).trim().slice(0, 160)
       const kind = str(input.kind).trim()
       if (requestId === '') throw new Error('持久任务缺少 requestId')
@@ -154,7 +179,7 @@ export function createDurableTaskMailbox(options = {}) {
     return await serialize(chatId, async function () {
       const chat = await store.readChat(chatId)
       if (!chat) throw new Error('聊天不存在: ' + chatId)
-      const mailbox = mailboxOf(chat)
+      const mailbox = await loadMailbox(chat)
       const task = findTask(mailbox, { taskId })
       if (!task) throw new Error('持久任务不存在: ' + taskId)
       if (applyPatch(mailbox, task, patch)) {
@@ -169,7 +194,7 @@ export function createDurableTaskMailbox(options = {}) {
     return await serialize(chatId, async function () {
       const chat = await store.readChat(chatId)
       if (!chat) return { mailboxVersion: 0, task: null }
-      const mailbox = mailboxOf(chat)
+      const mailbox = await loadMailbox(chat)
       const task = findTask(mailbox, selector)
       if (!task) return { mailboxVersion: mailbox.version, task: null }
       const repair = await reconcile(chat, publicTask(task))
@@ -182,7 +207,7 @@ export function createDurableTaskMailbox(options = {}) {
     return await serialize(chatId, async function () {
       const chat = await store.readChat(chatId)
       if (!chat) return { mailboxVersion: 0, tasks: [] }
-      const mailbox = mailboxOf(chat)
+      const mailbox = await loadMailbox(chat)
       let changed = false
       for (const task of Object.values(mailbox.tasks)) {
         if (!task || str(task.status) !== 'running') continue

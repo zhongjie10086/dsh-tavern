@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { appendAssistantEvent, syncAuthoredAgentPhase } from './session-surface-edit.js'
-import { clearRegenerationAttemptSurface, regenerationAttemptTurns } from './rollback-surface.js'
+import { clearRegenerationAttemptSurface, regenerationAttemptTurns, applyRegenerationSurface } from './rollback-surface.js'
 import { sessionEvents } from './session-events.js'
 
 const owned = ['messages', 'presentation', 'presentationWarnings', 'macroState', 'tavernScriptPrompts', 'runtimeInputs',
@@ -52,7 +52,7 @@ export async function recoverRoundHistory({ chat, agent, session, update, flush,
   if (record.phase === 'generating' || record.phase === 'aborting') {
     abortedTurns = regenerationAttemptTurns({ events: sessionEvents(session), eventStart: record.eventStart })
     clearRegenerationAttemptSurface({ session, eventStart: record.eventStart, id: () => record.id + ':abort' })
-  } else if (record.surface) appendAssistantEvent(session, record.surface.data, record.surface.intent)
+  } else if (record.surface) applyRegenerationSurface(session, record.surface)
   else throw new Error('历史恢复记录缺少原生消息面计划')
   if (typeof flush === 'function') await flush(session)
   signal?.throwIfAborted()

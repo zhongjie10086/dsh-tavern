@@ -62,7 +62,7 @@ function installTavernScriptStorage(options) {
   Object.defineProperty(win, 'localStorage', { value: storageFor(), configurable: true });
   win.__dshTavernFlushScriptStorage = async (retry = false) => { await Promise.all([...queues.keys()].map(owner => flush(owner,retry))); };
   if (options.token) win.addEventListener('message', event => { if(event.source === win.parent && event.data?.token === options.token && event.data.type === 'dsh-tavern-retry-script-storage') void win.__dshTavernFlushScriptStorage(true).catch(error => win.console.error('设置重试失败',error)); });
-  return { flush };
+  return { flush,isPersisted:()=>[...queues.values()].every(q=>!q.operations.length&&!q.task&&!q.timer&&!q.error) };
 }
 
 function installTavernMessageStorage(token,context,install) {

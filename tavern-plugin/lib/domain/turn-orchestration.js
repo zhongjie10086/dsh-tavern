@@ -12,6 +12,8 @@ import { bindSceneWorldbook } from './scene-worldbook.js'
 import { mergeForegroundChat } from './chat-persistence.js'
 import { projectReplyPresentation } from './reply-presentation.js'
 import {immutableJsonSnapshot} from './json-draft.js'
+import {discardTemplateInput} from './full-prompt-template-input.js'
+import {seededTavernRandom} from './tavern-macro-engine.js'
 
 export const cordisToolNames = Object.freeze([
   'cordis_inspect_list',
@@ -254,7 +256,8 @@ export function createTurnOrchestrator(options) {
 
   async function requestRegexContext(chat, turn, sourceText, projectedText) {
     const extensions = typeof store.readCardExtensions === 'function' ? await store.readCardExtensions(cardPathOf(chat)) : null
-    return { history: chat.messages || [], runtimeInputs: chat.runtimeInputs || {},
+    const operation=Object.values(chat.timeline?.operations||{}).findLast(item=>item.kind==='body'&&Number(item.turn)===turn)
+    return { history: chat.messages || [], runtimeInputs: chat.runtimeInputs || {},macroContext:{charName:chat.cardName,macroState:chat.macroState,randomSeed:operation?.runtimeRandomSeed},
       currentInput: { sourceText, projectedText, unfiltered: chat.runtimeInputs?.[String(turn)]?.unfiltered },
       regexScripts: composeTavernRegexScripts(extensions, (await resolvePresetRegexScripts(chat)) || []) }
   }
@@ -288,6 +291,7 @@ export function createTurnOrchestrator(options) {
     let foregroundOperation = null
     const mode = chat.mode || 'story'
     let chatChanged = clearStaleStages(chat, turn)
+    chatChanged = discardTemplateInput(chat,{exceptTurn:turn}) || chatChanged
     if (chat.foregroundError !== null && chat.foregroundError !== undefined) {
       chat.foregroundError = null
       chatChanged = true
@@ -298,6 +302,8 @@ export function createTurnOrchestrator(options) {
       const begun = timeline.apply({ chat, intent: { kind: 'body.begin', turn, userText } })
       chat = begun.chat
       foregroundOperation = begun.value
+      const operation=chat.timeline.operations[foregroundOperation.operationId]
+      operation.runtimeRandomSeed ||= requestId?JSON.stringify([chat.id,operation.basedOn.branchId,requestId]):operation.id
       const cachedFrame = rememberedFrame(chat, foregroundOperation.operationId)
       if (cachedFrame !== null) {
         // An interrupted request may have restored its once prompt. Reusing the
@@ -321,7 +327,7 @@ export function createTurnOrchestrator(options) {
         runtimeUserText = cachedRuntimeInput
         reusedRuntimeInput = true
       } else {
-        if (renderMacros !== null && userText.includes('{{')) runtimeUserText = renderMacros(userText, chat)
+        if (renderMacros !== null && runtimeUserText.includes('{{')) runtimeUserText = renderMacros(runtimeUserText, chat,{random:seededTavernRandom(operation.runtimeRandomSeed,'player-input')})
       }
     }
 
@@ -336,7 +342,10 @@ export function createTurnOrchestrator(options) {
       const presetRegexScripts = await resolvePresetRegexScripts(chat)
       const regexScripts = composeTavernRegexScripts(extensions, presetRegexScripts)
       const unfiltered = runtimeUserText
-      runtimeUserText = input.inputKind === 'trigger' ? '' : projectBackgroundInput(runtimeUserText, regexScripts, 1).text
+      const permanent=regexScripts.filter(script=>script?.promptOnly!==true),promptOnly=regexScripts.filter(script=>script?.promptOnly===true)
+      runtimeUserText = input.inputKind === 'trigger' ? '' : projectBackgroundInput(runtimeUserText, permanent, 1).text
+      const prompted=input.inputKind==='trigger'?{text:'',changed:false}:projectBackgroundInput(runtimeUserText,promptOnly,1)
+      runtimeUserText=prompted.text.includes('{{')&&renderMacros?renderMacros(prompted.text,chat,{random:seededTavernRandom(chat.timeline.operations[foregroundOperation.operationId].runtimeRandomSeed,'prompt-only-input')}):prompted.text
       rememberRuntimeInput(chat, turn, userText, runtimeUserText, unfiltered)
       chatChanged = true
     }
@@ -390,7 +399,7 @@ export function createTurnOrchestrator(options) {
     if (scriptWorldBook && typeof scriptWorldBook.recordReads === 'function') chat.worldBookReads = scriptWorldBook.recordReads(chat.worldBookReads)
     source.worldBook.templateRefs = Array.isArray(templateWorldBook && templateWorldBook.refs) ? clone(templateWorldBook.refs) : []
     source.worldBook.templateDiagnostics = Array.isArray(templateWorldBook && templateWorldBook.diagnostics) ? clone(templateWorldBook.diagnostics) : []
-    const resolved = resolveGamePreset(chat, runtimeUserText)
+    const resolved = resolveGamePreset(chat, runtimeUserText,{randomSeed:chat.timeline.operations[foregroundOperation.operationId].runtimeRandomSeed})
     if (resolved.snapshot) {
       chat.resolvedRuntimePreset = { turn, snapshot: resolved.snapshot }
       chat.macroState = resolved.macroState
@@ -425,6 +434,7 @@ export function createTurnOrchestrator(options) {
     const turn = Math.max(0, Number(input.turn) || 0)
     const requestId = str(input.requestId).trim()
     const userText = str(input.userText).trim()
+    discardTemplateInput(chat,{exceptTurn:turn})
     const requestCommit = commitForRequest(chat, requestId)
     if (requestCommit !== null) {
       return {
@@ -437,6 +447,7 @@ export function createTurnOrchestrator(options) {
     const begun = timeline.apply({ chat, intent: { kind: 'body.begin', turn, userText } })
     chat = begun.chat
     const operation = chat.timeline.operations[begun.value.operationId]
+    operation.runtimeRandomSeed ||= requestId?JSON.stringify([chat.id,operation.basedOn.branchId,requestId]):operation.id
     if (operation && !Object.hasOwn(operation, 'sceneWorldbook') && typeof options.captureSceneWorldbook === 'function') {
       operation.sceneWorldbook = await options.captureSceneWorldbook(chat, await store.readCard(cardPathOf(chat)))
     }
@@ -736,7 +747,8 @@ export function createTurnOrchestrator(options) {
     let chat = await store.chatForSession(input.sessionId)
     if (chat === undefined) return false
     const turn = Math.max(0, Number(input.turn) || 0)
-    let changed = settleOpeningCommandPrompt(chat, input, true)
+    let changed = discardTemplateInput(chat,{turn})
+    changed = settleOpeningCommandPrompt(chat, input, true) || changed
     const stages = stagedMap(chat)
     if (Object.prototype.hasOwnProperty.call(stages, String(turn))) {
       delete stages[String(turn)]
@@ -774,7 +786,7 @@ export function createTurnOrchestrator(options) {
     const writingTools = Array.isArray(chat.disabledWritingSkills) ? ['skill'] : []
     const webTools = chat.webSearchEnabled === true ? ['web_search'] : []
     if (mode === 'script') return ['tavern_read_script', 'tavern_recall_history', 'worldbook_search', ...writingTools, ...webTools]
-    if (mode === 'card') return [...webTools, shellToolName, ...dshFileToolNames, 'skill', 'tavern_save_skill', ...cordisToolNames, 'tavern_user_profile_read', 'tavern_user_profile_save_draft', 'tavern_user_profile_confirm', 'tavern_convert_to_mvu', 'tavern_design_mvu_appearance', 'tavern_validate_mvu_conversion', 'tavern_read_card', 'tavern_read_card_raw', 'tavern_read_play_chat', 'tavern_read_script', 'tavern_read_worldbook', 'tavern_update_worldbook', 'tavern_read_preset', 'tavern_update_preset', 'tavern_update_card', 'tavern_restore_card', 'tavern_validate_card', 'tavern_test_response']
+    if (mode === 'card') return [...webTools, shellToolName, ...dshFileToolNames, 'skill', 'tavern_save_skill', ...cordisToolNames, 'tavern_user_profile_read', 'tavern_user_profile_save_draft', 'tavern_user_profile_confirm', 'tavern_convert_to_mvu', 'tavern_design_mvu_appearance', 'tavern_validate_mvu_conversion', 'tavern_read_card', 'tavern_read_card_raw', 'tavern_search_card', 'tavern_replace_card_text', 'tavern_read_play_chat', 'tavern_read_script', 'tavern_read_worldbook', 'tavern_update_worldbook', 'tavern_read_preset', 'tavern_update_preset', 'tavern_update_card', 'tavern_restore_card', 'tavern_validate_card', 'tavern_test_response']
     return ['tavern_recall_history', 'worldbook_search', ...writingTools, ...webTools]
   }
 

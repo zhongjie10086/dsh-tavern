@@ -11,10 +11,12 @@ import {readFullPromptTemplateAsset,FULL_PROMPT_TEMPLATE_ASSET_PREFIX} from './f
 const origin='http://dsh-helper.localhost'
 // Present in a visible page only (R8 Z61). The page skips the ones that cannot write;
 // a refusal here names the method instead of a generic scope error.
-const pageOnlyMethods=new Set(['selectTavernFrontendWorldInfo','startTavernFrontendGeneration','startTavernFrontendMainGeneration','tavernHelperComposer','tavernHelperBrowserCache','triggerTavernSlash'])
+const pageOnlyMethods=new Set(['tavernHelperComposer','triggerTavernSlash'])
 const methods=new Set(['setTavernMvuActivity','tavernHelperAudio','getSession','claimTavernScriptWork','startTavernScriptWork','completeTavernHelperEvent','heartbeatTavernScriptRuntime','releaseTavernHelperRuntime','reserveTavernHelperRuntime','quarantineTavernHelperRuntime','tavernHelperWorldbookLibrary','tavernScriptStorage','fillTavernScriptDatabase','getTavernScriptResource','editTavernRuntimeScripts','startTavernHelperGeneration','pollTavernHelperGeneration','stopTavernHelperGeneration','listTavernHelperModels','commitTavernScriptDatabase','tavernScriptFiles','tavernScriptImages','tavernHelperChatFiles','tavernHelperDatabaseTemplates','tavernHelperPresets','tavernHelperIzumiConnection','tavernHelperIzumiAdvice','getTavernScriptLibrary','changeTavernScriptLibrary','generateTavernHelperRaw','updateTavernHelperPrompts','updateTavernHelperVariables','updateTavernHelperMessages','createTavernHelperMessages','mutateTavernHelperHistory','getTavernHelperWorldbook','replaceTavernHelperWorldbook','saveTavernExtensionSettings','loadTavernWorldInfo','saveTavernWorldInfo','saveTavernChatData','recordMvuRuntimeDiagnostic','recordTavernCompatibilityCalls'])
 /** Start the same script/lease implementation only when no visible executor owns the game. */
 for(const method of ['getSpDatabase','beginTavernSpAuthority','chooseTavernSpAuthority','publishTavernSpAuthorityCache','prepareTavernOriginalDatabaseMutation'])methods.add(method)
+const generationMethods=new Set(['startTavernHelperGeneration','startTavernFrontendGeneration','startTavernFrontendMainGeneration'])
+for(const method of [...generationMethods,'selectTavernFrontendWorldInfo','tavernHelperBrowserCache'])methods.add(method)
 export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,networkPolicy=async()=>false,launch=launchBackgroundBrowser,timeoutMs=91000,idleMs=180000,maxInstances=3,maxRetained=3,retryCooldownMs=30000,onRetainedDiscarded,maxQueuedPerSession=16,monotonicNow=()=>performance.now()}) {
  timeoutMs=Math.max(1,Math.min(91000,Number(timeoutMs)||91000))
  const instances=new Map(),admitted=new Set(),pending=new Map(),queues=new Map(),queued=new Map(),metrics=[],discarded=[],browserOwner=createBackgroundBrowserOwner(launch);let closed=false
@@ -169,7 +171,7 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
  // Every automatic retirement checks the live realm, not only the boolean
  // cached at initial boot. New guards can fail after a view refresh/heartbeat.
  async function retireIdle(instance){
-  if(!instance||instance.closed||instance.busy)return {released:false};
+  if(!instance||instance.closed||instance.busy||instance.generations.size)return {released:false};
   if(instance.hasMvu&&instance.engineStarted&&!instance.crashed){
    try{await refreshInitialization(instance)}catch(error){preserveInitialization(instance,error);return {released:false};}
   }
@@ -260,7 +262,8 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
       if(!control&&!recovery)throw new Error('SP 执行已隔离，仅允许当前显式保存重试')
       if(method==='reserveTavernHelperRuntime'&&!(instance.recoveryToken&&args.recoveryToken===instance.recoveryToken&&monotonicNow()<instance.recoveryDeadline))throw new Error('SP 保存重试窗口已失效')
      }
-     let result=await rpc(method,args)
+     let result
+     try{result=await rpc(method,args)}catch(error){if(method==='pollTavernHelperGeneration'){instance.generations.delete(args.id);if(!instance.busy)armIdle(instance)}throw error}
      if(method==='getSession'&&result?.view)result={...result,view:prepareMvuStartupView(result.view)}
      if(method==='getSession'&&(['official','card'].includes(result?.view?.tavernMvuRuntime?.owner)||result?.view?.tavernHelperScripts?.some(script=>['official-mvu','card-mvu'].includes(script.system)))){
       if(!instance.hasMvu&&retainedInstances().length>=maxRetained)throw retainedCapacityError();
@@ -278,12 +281,12 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
       preserveInitialization(instance,args.mvuValidation.reason);
      }
      if(['claimTavernScriptWork','heartbeatTavernScriptRuntime'].includes(method)&&result?.active===false&&dispatch.availableFrontend?.(sessionId))yieldStartup()
-     if(method==='startTavernHelperGeneration'&&result?.id){
+     if(generationMethods.has(method)&&result?.id){
       const stop={sessionId,scriptId:args.scriptId,expectedLifecycleRevision:args.expectedLifecycleRevision,id:result.id}
       instance.generations.set(result.id,stop)
       if(instance.closed||instance.quarantined)void Promise.resolve(rpc('stopTavernHelperGeneration',stop)).catch(()=>{})
      }
-     if(method==='pollTavernHelperGeneration'&&result?.status!=='running')instance.generations.delete(args.id)
+     if(method==='pollTavernHelperGeneration'&&result?.status!=='running'){instance.generations.delete(args.id);if(!instance.busy)armIdle(instance)}
      if(instance.closed)throw new Error('脚本执行器已结束')
      return result
     })
@@ -395,7 +398,11 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
   finally{clearTimeout(timer)}
  }
  async function yieldToFrontend(sessionId,runtimeId,{takeover=false}={}){
-  if(String(runtimeId).startsWith('background:'))return;const instance=instances.get(sessionId);if(!instance||instance.busy)return
+  if(String(runtimeId).startsWith('background:'))return;const instance=instances.get(sessionId);if(!instance||instance.busy||instance.generations.size)return
+  // The last poll is not the script's completion. Its response templates,
+  // callbacks and acknowledged writes still own this original realm.
+  for(const frame of instance.page?.frames?.()||[])if(await frame.evaluate(()=>window.__dshTavernGenerationBusy?.()===true))return
+  if(instance.busy||instance.generations.size)return
   if(instance.hasMvu&&!instance.initializationBlocked)await refreshInitialization(instance);
   if(instance.initializationBlocked){if(takeover&&dispatch.availableFrontend?.(sessionId))await discardRetained(instance,'用户显式接管，初始化失败的后台实例已释放');return}
   if(!instance.drainError){await disposeOne(instance,{drain:true});return}
