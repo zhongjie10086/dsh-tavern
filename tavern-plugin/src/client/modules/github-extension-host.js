@@ -156,7 +156,13 @@ function installTavernGithubExtensionHost(win, {call, context}) {
       win.t=t;
       sync();await import(url);
       await new Promise(resolve=>win.$(resolve));
-      win.__dshOriginalExtensionState.ready=true;
+      // Choice 1.4.0 initializes chat_metadata.choice without requesting a save.
+      // ST's shared metadata can ride another extension's save; this isolated
+      // realm must acknowledge its own initialization before becoming ready.
+      // The retained import predates base in the payload; only its verified
+      // commit may use that legacy shape, and an explicit base must still match.
+      if(owner==='github-888fb00e33c22f474d28924b'&&input.id===owner&&input.name==='Choice'&&input.version==='1.4.0'&&input.commit==='d0b472528beb8d70855965fe4778da44268c9ac4'&&(input.base===undefined||input.base==='https://raw.githubusercontent.com/Junwu-Git/choice/'+input.commit+'/'))await st.saveMetadata();
+      if(!win.__dshOriginalExtensionState.retired)win.__dshOriginalExtensionState.ready=true;
     } catch(error) {dispose();win.__dshOriginalExtensionState.error=String(error.message||error);win.__dshOriginalExtensionState.phase='module-load';throw error;}
     // Keep module URLs alive for delayed import() and lazy UI code; the frame
     // owns them and releases them on pagehide, including normal script reloads.
