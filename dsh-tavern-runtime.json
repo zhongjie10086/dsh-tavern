@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
-  "revision": "a1db73bcf11f91294197ce3c84703edc325da4a3",
-  "releaseSequence": 173,
+  "revision": "3fde07403cb17a2d032441e7bdef4dbe6b795a6b",
+  "releaseSequence": 174,
   "version": "1.7.0",
   "files": [
     {
@@ -1696,8 +1696,8 @@
     },
     {
       "path": "tavern-plugin/lib/domain/session-view-transport.js",
-      "size": 5257,
-      "sha256": "315857fc1aa27109c75de2baa9de3bfe360628bcc8f8e6a779654fd05d453bcc"
+      "size": 7578,
+      "sha256": "dbf09ad50ae8037ab6939f8894df63c7cec28e9e0155c4359245471bc762923e"
     },
     {
       "path": "tavern-plugin/lib/domain/shared-worldbook-search.js",
