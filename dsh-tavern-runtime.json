@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
-  "revision": "4595983bda34f3df69d36fe5fe6ea2d17b3917c5",
-  "releaseSequence": 175,
+  "revision": "d39c90c0efb040e3c6ecadaab7356e89be37b451",
+  "releaseSequence": 176,
   "version": "1.7.0",
   "files": [
     {
@@ -391,8 +391,8 @@
     },
     {
       "path": "tavern-plugin/lib/client.js",
-      "size": 1804781,
-      "sha256": "cff0f61370e9f9cf6510b75426dfb8c841758a4d127f01b15cb2618d8368b5d4"
+      "size": 1805583,
+      "sha256": "8c93d083d98698d89a1a00985bddd52c350987713b96ae8a44d35b2720172433"
     },
     {
       "path": "tavern-plugin/lib/cordis-inspect.js",
@@ -4556,8 +4556,8 @@
     },
     {
       "path": "tavern-plugin/src/client/modules/github-extension-host.js",
-      "size": 14527,
-      "sha256": "6e66fed10ec06ba1cb422af53bae0331e5673c7a1824170418f5a6850e6ec724"
+      "size": 15281,
+      "sha256": "c824352e9f7ba4d62631309e18fd9be7bb261e3cfa95a40504ca91a70bdba40d"
     },
     {
       "path": "tavern-plugin/src/client/modules/helper-audio-bridge.js",
