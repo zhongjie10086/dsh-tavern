@@ -67,6 +67,29 @@ function compact(view,sharedStrings=false,sharedObjects=false,helperVariables=fa
 
 /** Process-local, session-scoped wire baselines. Eviction always falls back to a full snapshot. */
 export function createSessionViewTransport({maxEntries=8,maxBytes=64*1024*1024}={}) {
+ const prepared=new Map();let preparations=0,preparationHits=0
+ // Alias sources/targets must rebuild even when a malformed or legacy value is scalar.
+ const movable=(key,value,helper=false)=>!(helper?key==='worldbook':['tavernHelperWorldbook','tavernStatusView'].includes(key))&&scalar(value)
+ const scalar=value=>value===null||typeof value!=='object'&&(typeof value!=='string'||value.length<256)
+ function compatible(previous,next,helper=false){
+  const content=value=>Object.keys(value).filter(key=>!movable(key,value[key],helper))
+  const left=content(previous),right=content(next)
+  return left.length===right.length&&left.every(key=>Object.hasOwn(next,key)&&!movable(key,next[key],helper)&&
+   (!helper&&key==='tavernHelper'&&!Array.isArray(previous[key])&&!Array.isArray(next[key])
+    ?compatible(previous[key],next[key],true):previous[key]===next[key]))
+ }
+ function overlay(bundle,previous,next){
+  const view={...bundle.view}
+  for(const key of Object.keys(previous))if(movable(key,previous[key]))delete view[key]
+  for(const key of Object.keys(next))if(movable(key,next[key]))Object.defineProperty(view,key,{value:next[key],enumerable:true,writable:true,configurable:true})
+  if(next.tavernHelper&&typeof next.tavernHelper==='object'&&!Array.isArray(next.tavernHelper)){
+   const helper={...view.tavernHelper}
+   for(const key of Object.keys(previous.tavernHelper))if(movable(key,previous.tavernHelper[key],true))delete helper[key]
+   for(const key of Object.keys(next.tavernHelper))if(movable(key,next.tavernHelper[key],true))Object.defineProperty(helper,key,{value:next.tavernHelper[key],enumerable:true,writable:true,configurable:true})
+   view.tavernHelper=helper
+  }
+  return immutableJsonSnapshot({view,aliases:bundle.aliases})
+ }
  const entries=new Map(),encoded=new WeakMap(),encoded3=new WeakMap(),encoded4=new WeakMap(),encoded5=new WeakMap();let bytes=0
  function respond(sessionId,view,args={}) {
   const version=projectionVersion(view)
@@ -75,12 +98,21 @@ export function createSessionViewTransport({maxEntries=8,maxBytes=64*1024*1024}=
   if(protocol!==2&&protocol!==3&&protocol!==4&&protocol!==5)return{view,version}
   const cache=protocol===5?encoded5:protocol===4?encoded4:protocol===3?encoded3:encoded
   let bundle=isFrozenJson(view)?cache.get(view):null
-  if(!bundle){bundle=compact(view,protocol>=3,protocol>=4,protocol>=5);if(isFrozenJson(view))cache.set(view,bundle)}
+  const preparedKey=JSON.stringify([sessionId,protocol])
+  if(!bundle){
+   const old=prepared.get(preparedKey),previous=old?.view.deref(),priorBundle=old?.bundle.deref()
+   if(isFrozenJson(view)&&previous&&priorBundle&&compatible(previous,view)){
+    bundle=overlay(priorBundle,previous,view);preparationHits++
+   }else{bundle=compact(view,protocol>=3,protocol>=4,protocol>=5);preparations++}
+   if(isFrozenJson(view))cache.set(view,bundle)
+  }
   const key=JSON.stringify([sessionId,protocol,version]),base=entries.get(JSON.stringify([sessionId,protocol,args.ifVersion])),size=jsonBytes(bundle)
   let result={...bundle,version,viewEncoding:protocol}
   if(base){const patch={baseVersion:args.ifVersion,changes:diffJson(base.bundle,bundle)};if(jsonBytes(patch)<size)result={patch,version,viewEncoding:protocol}}
-  if(size<=maxBytes&&maxEntries>0){const old=entries.get(key);if(old){bytes-=old.size;entries.delete(key)}while(entries.size&&(entries.size>=maxEntries||bytes+size>maxBytes)){const first=entries.keys().next().value;bytes-=entries.get(first).size;entries.delete(first)}entries.set(key,{bundle,size});bytes+=size}
+  if(size<=maxBytes&&maxEntries>0){const old=entries.get(key);if(old){bytes-=old.size;entries.delete(key)}while(entries.size&&(entries.size>=maxEntries||bytes+size>maxBytes)){const first=entries.keys().next().value;bytes-=entries.get(first).size;entries.delete(first)}entries.set(key,{bundle,size});bytes+=size
+   if(isFrozenJson(view)){prepared.delete(preparedKey);while(prepared.size>=maxEntries)prepared.delete(prepared.keys().next().value);prepared.set(preparedKey,{view:new WeakRef(view),bundle:new WeakRef(bundle)})}
+  }
   return result
  }
- return{respond,stats:()=>({entries:entries.size,bytes})}
+ return{respond,stats:()=>({entries:entries.size,bytes,preparations,preparationHits})}
 }
