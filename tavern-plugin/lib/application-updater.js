@@ -23,7 +23,7 @@ const COMPARE_URL = 'https://api.github.com/repos/zhongjie10086/dsh-tavern/compa
 const execFileAsync = promisify(execFile)
 const UPDATE_CHECK_POLICY = 3
 const CDN_METADATA_URL = 'https://cdn.jsdelivr.net/gh/zhongjie10086/dsh-tavern@release-r15-clean/dsh-tavern-runtime.json'
-const RUNTIME_FILES = new Set(['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'cordis.patch.yml', 'install.ps1', 'install.sh'])
+const RUNTIME_FILES = new Set(['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'cordis.patch.yml', 'install.ps1', 'install.sh', 'scripts/lib/r16-page-home-rehearsal.mjs', 'scripts/lib/r16-page-home-verification.mjs', 'scripts/lib/r5-candidate-tools.mjs', 'scripts/lib/r5-recovery-tools.mjs', 'scripts/r5-recovery-preflight.mjs', 'scripts/r5-recovery-rehearsal.mjs'])
 const RUNTIME_DIRECTORIES = ['bin/', 'config/', 'presets/', 'tavern-plugin/', 'patches/']
 
 async function localCommitRelation(root, current, latest) {

@@ -9,6 +9,7 @@ import {createDurableFilePromotion} from '../durable-file-promotion.js'
 import {canonicalChatId} from './chat-mutation-lock.js'
 import {requiredChatStorageContract} from './chat-journal-store.js'
 import {freezeJson} from './readonly-json.js'
+import {immutableJsonSnapshot} from './json-draft.js'
 
 export const pageDigest=value=>createHash('sha256').update(value).digest('hex')
 const failure=(message,code='DSH_TAVERN_PAGE_CORRUPT')=>Object.assign(Error(message),{code})
@@ -30,6 +31,7 @@ export async function writePageAuthority(files,target,value){
  * contracts. The per-chat route, not pageStore's construction pointer, is the
  * logical authority; a failed mutation can leave only unreachable graph data. */
 export function createPageChatRecords({dataRoot,pageRoot='chats-v4',resourceCodec,promotionOptions={},onMetric,onPageIO}={}){
+ const snapshotProofs=new WeakMap(),changeProofs=new WeakMap()
  const root=path.resolve(dataRoot,pageRoot),codec=resourceCodec===false?null:resourceCodec||createChatResourceCodec({dataRoot})
  const store=createB5ShadowPageStore({root,promotionOptions,onIO:event=>{onPageIO?.(event);onMetric?.(event)}}),files=createDurableFilePromotion(promotionOptions)
  const routePath=id=>path.join(root,canonicalChatId(id),'route.json')
@@ -64,16 +66,46 @@ export function createPageChatRecords({dataRoot,pageRoot='chats-v4',resourceCode
   if(pageDigest(JSON.stringify(encoded))!==pinned.head.metadata.encodedSha256)throw failure('Encoded Chat closure hash mismatch')
   const chat=await decode(pinned,body);requiredChatStorageContract(chat)
   if(chat?._storageRevision!==pinned.storageRevision||canonicalChatId(chat.id)!==pinned.id)throw failure('Decoded Chat identity mismatch')
-  return freezeJson(chat)
+  const snapshot=freezeJson(chat)
+  snapshotProofs.set(snapshot,{id:pinned.id,snapshotId:pinned.snapshotId,encoding:pinned.head.metadata.resourceEncoding,headerRef:pinned.head.state.headerRef,body,messages:messages.map((message,index)=>({digest:pageDigest(JSON.stringify(message)),ref:refs[index]}))})
+  return snapshot
  }
- async function prepare(chatId,value,{beforePublish}={}){
+ function captureChanges(baseSnapshot,value){
+  if(!snapshotProofs.has(baseSnapshot))return undefined
+  const token={};changeProofs.set(token,{baseSnapshot,value:immutableJsonSnapshot(value)});return token
+ }
+ async function prepare(chatId,value,{beforePublish,baseSnapshot,baseSnapshotId,changes}={}){
   const id=canonicalChatId(chatId);requiredChatStorageContract(value)
   if(!value||typeof value!=='object'||Array.isArray(value)||!Number.isSafeInteger(value._storageRevision)||value._storageRevision<0||canonicalChatId(value.id)!==id||Object.hasOwn(value,'messages')&&!Array.isArray(value.messages))throw Error('Invalid complete Chat for page commit')
-  const encoded=codec?await codec.encodeChat(value):clone(value),body=codec?encoded.value:encoded,keys=Object.keys(body),header={}
+  const proof=snapshotProofs.get(baseSnapshot),captured=changeProofs.get(changes)
+  const reuse=proof?.id===id&&proof.snapshotId===baseSnapshotId&&proof.encoding===(codec?3:0)
+  const incremental=reuse&&captured?.baseSnapshot===baseSnapshot&&codec?.encodeChatIncremental
+  const encoded=incremental?await codec.encodeChatIncremental(captured.value,baseSnapshot,proof.body):codec?await codec.encodeChat(value):clone(value),body=codec?encoded.value:encoded,keys=Object.keys(body),header={}
   for(const key of keys)if(key!=='messages')own(header,key,body[key])
   const buffered=createBufferedJsonRecords({read:ref=>store.readRecord(id,ref),writeMany:values=>store.writeRecords(id,values)})
-  const headerRef=await buffered.tree.create(header),refs=[]
-  for(const message of body.messages||[])refs.push(await buffered.tree.create(message))
+  const pointer=key=>'/'+key.replace(/~/g,'~0').replace(/\//g,'~1')
+  function diff(before,next,path,ops){
+   if(before===next)return
+   if(before&&next&&typeof before==='object'&&typeof next==='object'&&Array.isArray(before)===Array.isArray(next)&&JSON.stringify(Object.keys(before))===JSON.stringify(Object.keys(next))){
+    for(const key of Object.keys(next))diff(before[key],next[key],path+pointer(key),ops)
+   }else ops.push({op:'set',path,value:next})
+  }
+  let headerRef
+  if(incremental){
+   const ops=[]
+   for(const key of Object.keys(proof.body))if(key!=='messages'&&!Object.hasOwn(header,key))ops.push({op:'remove',path:pointer(key)})
+   for(const key of Object.keys(header))diff(proof.body[key],header[key],pointer(key),ops)
+   const priorKeys=Object.keys(proof.body).filter(key=>key!=='messages'&&Object.hasOwn(header,key)),nextKeys=Object.keys(header)
+   const order=priorKeys.concat(nextKeys.filter(key=>!Object.hasOwn(proof.body,key)))
+   headerRef=order.some((key,i)=>key!==nextKeys[i])?await buffered.tree.create(header):(await buffered.tree.apply(proof.headerRef,ops)).nextRoot
+  }else headerRef=await buffered.tree.create(header)
+  const refs=[]
+  for(const [index,message]of (body.messages||[]).entries()){
+   const prior=reuse&&proof.messages[index]
+   if(prior&&(incremental&&message===proof.body.messages?.[index]||prior.digest===pageDigest(JSON.stringify(message))))refs.push(prior.ref)
+   else if(incremental&&prior){const ops=[];diff(proof.body.messages[index],message,'',ops);refs.push((await buffered.tree.apply(prior.ref,ops)).nextRoot)}
+   else refs.push(await buffered.tree.create(message))
+  }
   await buffered.flush([headerRef,...refs])
   const metadata={kind:'tavern-chat-records-v1',chatId:id,storageRevision:value._storageRevision,keys,resourceEncoding:codec?3:0,encodedSha256:pageDigest(JSON.stringify(encoded))}
   const previous=await store.readHead(id),verifyBeforePublish=async snapshotId=>{
@@ -90,8 +122,10 @@ export function createPageChatRecords({dataRoot,pageRoot='chats-v4',resourceCode
    result=await store.commit(id,{expectedRevision:previous.revision,state:{headerRef},metadata,edits,truncateTo:common,append:refs.slice(common).map(ref=>({ref}))},{verifyBeforePublish})
   }
   // A construction head is not authoritative until the caller publishes route.
-  await readSnapshot(id,result.snapshotId)
-  return {...result,storageRevision:value._storageRevision}
+  const snapshot=await readSnapshot(id,result.snapshotId)
+  const expected=codec?codec.logical(value):value
+  if(JSON.stringify(snapshot)!==JSON.stringify(expected))throw failure('Page Chat final roundtrip differs')
+  return Object.defineProperty({...result,storageRevision:value._storageRevision},'snapshot',{value:snapshot})
  }
  async function publish(chatId,value){await mkdir(path.dirname(routePath(chatId)),{recursive:true});await writePageAuthority(files,routePath(chatId),value)}
  async function readField(pinned,pointer){
@@ -112,5 +146,9 @@ export function createPageChatRecords({dataRoot,pageRoot='chats-v4',resourceCode
   }
   return rows
  }
- return Object.freeze({root,route,routePath,pin,prepare,publish,readSnapshot,readField,readMessages,store})
+ const api={root,route,routePath,pin,prepare,captureChanges,publish,readSnapshot,readField,readMessages,store}
+ for(const name of ['route','pin','readSnapshot','readField','readMessages']){const operation=api[name];api[name]=(...args)=>store.withRead(async()=>{if(name==='readField'||name==='readMessages')await store.readHead(args[0].id,{snapshotId:args[0].snapshotId});return operation(...args)})}
+ api.publish=(...args)=>store.withMutation(()=>publish(...args))
+ api.prepare=(...args)=>store.withMutation(async()=>{const result=await store.captureCreated(()=>prepare(...args));return Object.defineProperty(result.value,'createdBlocks',{value:result.refs})})
+ return Object.freeze(api)
 }

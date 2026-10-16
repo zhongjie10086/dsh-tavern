@@ -1,3 +1,4 @@
+import {initializeNewPageHomeIfEmpty} from './domain/page-retention-upgrade.js'
 import { createStoryAlignment } from './domain/story-alignment.js'
 import { createCardTextReplacement } from './domain/card-text-replace.js'
 import {assertOriginalSpRollbackReceipt,assertOriginalSpDeletionReceipt} from './domain/tavern-original-extension.js'
@@ -256,7 +257,7 @@ import { createProfileDataStore } from './profile-data-store.js'
 import { createChatPersistence } from './domain/chat-persistence.js'
 import {createVersionedJsonCache} from './domain/versioned-json-cache.js'
 import {mutableJsonDraft} from './domain/json-draft.js'
-import {createDependencyProjectionCache} from './domain/dependency-projection-cache.js'
+import {createDependencyProjectionCache,projectionVersion} from './domain/dependency-projection-cache.js'
 import {createSessionViewTransport} from './domain/session-view-transport.js'
 import { createChatRecordsStore } from './domain/chat-records-store.js'
 import {jsonHttpResponse} from './domain/json-http-response.js'
@@ -323,6 +324,7 @@ export async function apply(ctx) {
   }
   const sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
   const dataRoot = resolveTavernDataRoot()
+  await initializeNewPageHomeIfEmpty(dataRoot)
   const stablePrefixStorage = createSessionStablePrefixStorage(dataRoot + '/session-prefixes')
   const maintenanceGate=createMaintenanceGate(),dataStore=createProfileDataStore({dataRoot})
   const capacityLimits=await readCapacitySettings(dataStore)
@@ -1857,6 +1859,10 @@ export async function apply(ctx) {
   }
   const viewProjectionCache=createDependencyProjectionCache()
   const sessionViewCache=createDependencyProjectionCache()
+  // Component inputs name only the branches read by the projection. External
+  // dependencies stay in the enclosing use() graph and are observed on hits.
+  const replyDisplayCache=createDependencyProjectionCache()
+  const helperRuntimeCache=createDependencyProjectionCache()
   const sessionViewTransport=createSessionViewTransport()
   // Assigned with the background coordinator below; a view built before that reports the stored state.
   let manualCharacterDesign = null
@@ -1885,7 +1891,9 @@ export async function apply(ctx) {
         remoteAssetPins: pinnedExtensions.pins
       })
       const presetRegexScripts = Array.isArray(activePresetSnapshot && activePresetSnapshot.regexScripts) ? activePresetSnapshot.regexScripts : []
-      replyDisplay = projectRuntimeReplyHistory(chat.messages, {
+      replyDisplay = await replyDisplayCache.read(chat.sessionId,
+        [chat.messages,chat.cardName,chat.macroState,chat.presentation,projectionVersion(cardExtensions.regexScripts),projectionVersion(activePresetSnapshot?.regexScripts)],async()=>{
+      let replyDisplay = projectRuntimeReplyHistory(chat.messages, {
         charName: chat.cardName,
         macroState: chat.macroState,
         regexScripts: composeTavernRegexScripts(cardExtensions, presetRegexScripts),
@@ -1903,6 +1911,8 @@ export async function apply(ctx) {
       replyDisplay.statusView = persistentStatus.statusView
       replyDisplay.statusViews = persistentStatus.statusViews
       replyDisplay.projections = withLegacyPresentationProjection(chat, replyDisplay.projections)
+      return replyDisplay
+      })
     }
     let activity = backgroundTasks.activity(chat)
     const recoveryFailure = await use(()=>mvuSettlementReconciler.status(chat.sessionId))
@@ -1978,9 +1988,10 @@ export async function apply(ctx) {
     const pinnedScripts = await use(()=>tavernRemoteAssets.pinExtensions({ helperScripts: [...extensionScripts,...cardOwnedScripts(scriptResolution.scripts)], regexScripts: [] }))
     const mvuSelection = selectMvuRuntime(pinnedScripts.helperScripts, { enabled: chat.mvu?.enabled === true })
     const helperEnabled = hasTavernScriptRuntime(chat, pinnedScripts.helperScripts)
-    const helperRuntime = helperEnabled
-      ? projectTavernHelperScripts(pinnedScripts.helperScripts, chat.tavernHelperScriptVariables)
+    const helperRuntimeSnapshot = helperEnabled
+      ? await helperRuntimeCache.read(chat.sessionId,[projectionVersion(pinnedScripts.helperScripts),chat.tavernHelperScriptVariables],async()=>projectTavernHelperScripts(pinnedScripts.helperScripts, chat.tavernHelperScriptVariables))
       : { scripts: [], diagnostics: [] }
+    const helperRuntime={...helperRuntimeSnapshot,diagnostics:[...helperRuntimeSnapshot.diagnostics]}
     // Capability seeds come from admitted sources, never the script's mutable
     // variables or metadata. Initial source data can itself declare dependencies.
     const sourceDataById = new Map(pinnedScripts.helperScripts.map(script=>[script.id,script.data]))

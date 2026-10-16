@@ -121,7 +121,7 @@ export function createSpStorageStore(journal, { dataRoot, readOnly = false }) {
   }
   async function pruneSnapshots(references,{dryRun=true}={}){
     if(readOnly)denyWrite()
-    if((await createStorageFormat(dataRoot,{maximumVersion:4}).read())?.formatVersion===4)return {dryRun,snapshots:0,bytes:0,status:'protected',reason:'format4-no-gc'}
+    if((await createStorageFormat(dataRoot,{maximumVersion:5}).read())?.formatVersion>=4)return {dryRun,snapshots:0,bytes:0,status:'protected',reason:'format4-no-gc'}
     if(!connection&&!await stat(path.join(dataRoot,'sp-database.sqlite')).catch(e=>{if(e.code==='ENOENT')return null;throw e}))return {dryRun,snapshots:0,bytes:0}
     const sql=await db(),rows=sql.prepare('SELECT hash,length(CAST(data AS BLOB)) AS bytes FROM sp_snapshots').all().filter(row=>!references.has(row.hash))
     if(!dryRun&&rows.length){sql.exec('BEGIN IMMEDIATE');try{for(const row of rows){sql.prepare('DELETE FROM sp_snapshots WHERE hash=?').run(row.hash)}sql.exec('COMMIT')}catch(e){sql.exec('ROLLBACK');throw e}sql.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM')}

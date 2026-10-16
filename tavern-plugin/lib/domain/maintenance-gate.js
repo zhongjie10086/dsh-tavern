@@ -28,7 +28,9 @@ export function createMaintenanceGate(){
     if(owner==='read')throw Error('不能在写入操作中升级为独占清理')
     return new Promise((resolve,reject)=>{queue.push({mode,operation,resolve,reject,maintenance:maintenance.getStore()===true});drain()})
   }
-  return {revision:()=>revision,changes:()=>changes,subscribe:listener=>{listeners.add(listener);return()=>listeners.delete(listener)},
-    runMaintenance:operation=>maintenance.run(true,operation),read:operation=>run('read',operation),write:operation=>run('write',operation),
+  const tryWrite=operation=>readers||writer||queue.length?Promise.resolve({status:'busy',files:[],bytes:0}):run('write',operation)
+  const write=Object.assign(operation=>run('write',operation),{tryWrite})
+  return {tryWrite,revision:()=>revision,changes:()=>changes,subscribe:listener=>{listeners.add(listener);return()=>listeners.delete(listener)},
+    runMaintenance:operation=>maintenance.run(true,operation),read:operation=>run('read',operation),write,
     mutate:operation=>run('read',async()=>{changed();try{return await operation()}finally{changed()}})}
 }

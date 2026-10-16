@@ -3,6 +3,7 @@ import { freezeJson, isFrozenJson } from './readonly-json.js'
 import { immutableJsonSnapshot } from './json-draft.js'
 const readonlyContexts=new WeakMap()
 const readonlyRows=new WeakMap()
+const readonlyMessageLists=new WeakMap()
 export function projectTavernHelperContextReadonly(chat) {
   if (Object.isFrozen(chat) && readonlyContexts.has(chat)) return readonlyContexts.get(chat)
   const value=freezeJson(projectTavernHelperContext(chat,{readonly:true}))
@@ -53,9 +54,12 @@ export function lastTavernHelperVariables(messages) {
 /** Project authoritative Chat state into the synchronous Tavern Helper read API. */
 export function projectTavernHelperContext(chat,{readonly=false}={}) {
   const copy=readonly?immutableJsonSnapshot:clone
-  const messages = []
-  const turnMessageIds = {}
-  for (const source of Array.isArray(chat && chat.messages) ? chat.messages : []) {
+  const listKey=JSON.stringify([chat?.cardName,chat?.macroState?.userName])
+  const sourceMessages=chat?.messages
+  const listCache=readonly&&isFrozenJson(sourceMessages)?readonlyMessageLists.get(sourceMessages)?.get(listKey):null
+  const messages = listCache?.messages || []
+  const turnMessageIds = listCache?.turnMessageIds || {}
+  for (const source of listCache?[]:(Array.isArray(chat && chat.messages) ? chat.messages : [])) {
     if (!source || typeof source !== 'object') continue
     const messageId = messages.length
     const cacheKey=JSON.stringify([messageId,chat.cardName,chat.macroState?.userName])
@@ -105,6 +109,12 @@ export function projectTavernHelperContext(chat,{readonly=false}={}) {
       const turn = Math.max(0, Number(source.turn) || (source.greeting === true ? 1 : 0))
       if (turn > 0) turnMessageIds[String(turn)] = messageId
     }
+  }
+  if(readonly&&!listCache&&isFrozenJson(sourceMessages)){
+    const lists=readonlyMessageLists.get(sourceMessages)||new Map()
+    if(lists.size>=8)lists.delete(lists.keys().next().value)
+    lists.set(listKey,freezeJson({messages,turnMessageIds}))
+    readonlyMessageLists.set(sourceMessages,lists)
   }
   return {
     version: 1,

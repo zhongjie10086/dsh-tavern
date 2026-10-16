@@ -1,0 +1,5 @@
+import {cliOptions} from './lib/r5-candidate-tools.mjs'
+import {recoveryRehearsal} from './lib/r5-recovery-tools.mjs'
+const a=cliOptions(process.argv.slice(2),['--backup','--manifest-sha256','--output','--data-relative','--candidate','--candidate-manifest-sha256','--execution-mode','--acceptance-mode'])
+if(!a['--backup']||!a['--output']||!a['--candidate']||!a['--candidate-manifest-sha256'])throw Error('Usage: run inside verified candidate/source: node scripts/r5-recovery-rehearsal.mjs --candidate DIR --candidate-manifest-sha256 HASH --backup DIR --manifest-sha256 BACKUP_HASH --output NEW_PRIVATE_DIR [--data-relative profile-data/tavern/data] [--execution-mode candidate|git-workspace] [--acceptance-mode synthetic|real-home]')
+console.log(JSON.stringify(await recoveryRehearsal({backup:a['--backup'],manifestSha256:a['--manifest-sha256'],output:a['--output'],dataRelative:a['--data-relative'],candidate:a['--candidate'],candidateManifestSha256:a['--candidate-manifest-sha256'],executionMode:a['--execution-mode'],acceptanceMode:a['--acceptance-mode']}),null,2))

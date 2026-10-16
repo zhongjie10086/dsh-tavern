@@ -1,3 +1,4 @@
+import {createStorageFormat} from './storage-format.js'
 import assert from 'node:assert/strict'
 import path from 'node:path'
 import {randomUUID} from 'node:crypto'
@@ -137,7 +138,10 @@ export async function recoverPageMigration({dataRoot,migrationId,expectedReceipt
  else if(relocateFrom!==undefined)assert.equal(path.resolve(relocateFrom),original.dataRoot,'Relocation root mismatch')
  const receipt=relocated?freezeJson({...original,dataRoot}):original,audit=relocated?{relocatedFrom:original.dataRoot}:{}
  const marker=await readFile(path.join(dataRoot,'storage-format.json')).catch(error=>{if(error.code==='ENOENT')return undefined;throw error}),parsed=marker?JSON.parse(marker):null
- if(parsed?.formatVersion===4){
+ if([4,5].includes(parsed?.formatVersion)){
+  await createStorageFormat(dataRoot,{maximumVersion:5}).read()
+  if(parsed.formatVersion===5){const {retentionPolicy,...baseMarker}=parsed;assert.deepEqual({...baseMarker,formatVersion:4,minimumReader:receipt.nextMarker.minimumReader},receipt.nextMarker,'Another page migration owns authority')}
+  else
   assert.deepEqual(parsed,receipt.nextMarker,'Another page migration owns authority')
   const manifest=await readChatRouteManifest(dataRoot,parsed);assert.deepEqual(manifest,receipt.manifest,'Published migration manifest changed')
   const records=createChatRecordsStore({dataRoot}),pages=createPageChatRecords({dataRoot})

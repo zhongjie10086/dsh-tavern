@@ -19,10 +19,10 @@ function scanCache(root){
 
 /** Mark all retained snapshots, journals, recovery records and library resources before sweeping. */
 export async function profileReferencePlan(dataRoot,{presetVersions=1,exclude=new Set(),onScan}={}){
-  const marker=await createStorageFormat(dataRoot,{maximumVersion:4}).read()
+  const marker=await createStorageFormat(dataRoot,{maximumVersion:5}).read()
   // Page graphs intentionally retain every immutable root and orphan in the
   // first format4 candidate. A legacy resource sweep cannot own their closure.
-  if(marker?.formatVersion===4)return {files:[],references:new Set(),protected:['format4-no-gc']}
+  if(marker?.formatVersion>=4)return {files:[],references:new Set(),protected:['format4-no-gc']}
   const archiveStore=createProfileDataStore({dataRoot}),cachedScan=scanCache(dataRoot),cache=cachedScan.rows
   const all=await retentionFiles(dataRoot),candidates=new Map(),references=new Set(),protectedFiles=[]
   function mark(value,target=references){
@@ -135,7 +135,21 @@ export function createProfileRetention({dataRoot,store,journal,backups,remoteCac
   })
   function run(options={}){
     const job=tail.catch(()=>{}).then(()=>maintenance(async()=>{
-      const marker=await createStorageFormat(dataRoot,{maximumVersion:4}).read()
+      const marker=await createStorageFormat(dataRoot,{maximumVersion:5}).read()
+      if(marker?.formatVersion===5){
+       if(await isBusy())return {version:1,dryRun:options.dryRun!==false,status:'busy',results:[],policy:service.limits}
+       const results=[],chats=(await readIndex()).chats||[]
+       const idleCommit=options.automatic===true&&commit.tryWrite?commit.tryWrite:commit
+       await onPlan?.({version:1,dryRun:true,categories:['snapshots']})
+       if(!options.only||options.only.includes('snapshots'))for(const row of chats){
+        const before=generation()
+        results.push(await journal.prune(typeof row==='string'?row:row.id,{dryRun:options.dryRun!==false,commit:operation=>idleCommit(async()=>generation()!==before||await isBusy()?{dryRun:false,status:'changed',files:[],bytes:0}:operation())}))
+       }
+       const status=results.some(row=>row.status==='busy')?'busy':results.some(row=>row.status==='changed')?'changed':results.some(row=>row.status==='protected')?'protected':'complete'
+       const independent=['remote-cache','diagnostics','model-requests'],only=options.only?options.only.filter(category=>independent.includes(category)):independent,auxiliary=await service.run({...options,only})
+       const summary=results.reduce((total,row)=>{for(const [key,value]of Object.entries(row.summary||{}))total[key]=(total[key]||0)+value;return total},{ordinary:0,protected:0,expired:0,quarantine:0,confirmedFreedFiles:0,confirmedFreedBytes:0})
+       return {version:1,dryRun:options.dryRun!==false,status,summary,results:[{category:'snapshots',results},...auxiliary.results],protected:['shared-resources-closure-unproven','recovery-backups','deleted-chats'],policy:service.limits}
+      }
       if(marker?.formatVersion===4){
         if(await isBusy())return {version:1,dryRun:options.dryRun!==false,status:'busy',results:[],policy:service.limits}
         // Optional request evidence, rolling diagnostics and re-fetchable cache
@@ -174,7 +188,7 @@ export function createProfileRetention({dataRoot,store,journal,backups,remoteCac
   async function removeChatArtifacts(chat,{dryRun=false}={}){
     // A format4 delete only removes live route visibility. Retained immutable
     // roots can still reference images and recovery receipts; there is no GC.
-    const pageMode=(await createStorageFormat(dataRoot,{maximumVersion:4}).read())?.formatVersion===4
+    const pageMode=(await createStorageFormat(dataRoot,{maximumVersion:5}).read())?.formatVersion>=4
     if(await isBusy(chat))throw Error('对话任务尚未停止，未清理附属文件')
     const folders=[...pageMode?[]:['scene-images/'+digest(chat.id)],'model-requests/'+chat.id],rows=[]
     for(const folder of folders)for(const relative of await retentionFiles(dataRoot,folder))rows.push(await retentionFile(dataRoot,relative,'deleted-chat'))

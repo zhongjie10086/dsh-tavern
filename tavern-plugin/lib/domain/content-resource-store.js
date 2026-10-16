@@ -17,14 +17,20 @@ export function createContentResourceStore(store){
   activeReads++
   try{return await store.readReadonly(location)}finally{activeReads--;waiters.shift()?.()}
  }
- async function raw(ref){
+ async function raw(ref,allowMissing=false){
   if(!/^[a-f0-9]{64}$/.test(ref.sha256))throw failure(ref,'Chat 资源引用损坏')
   const value=await readObject(location(ref.sha256))
+  if(value===undefined&&allowMissing)return undefined
   if(value===undefined||!verified.has(value)&&hash(value)!==ref.sha256)throw failure(ref,'Chat 资源缺失或校验失败')
   if(object(value))verified.add(value)
   return value
  }
- const rawOnce=(ref,reads)=>{if(!reads.has(ref.sha256))reads.set(ref.sha256,raw(ref));return reads.get(ref.sha256)}
+ const rawOnce=async(ref,reads,allowMissing=false)=>{
+  if(!reads.has(ref.sha256))reads.set(ref.sha256,raw(ref,allowMissing))
+  const value=await reads.get(ref.sha256)
+  if(value===undefined&&!allowMissing)throw failure(ref,'Chat 资源缺失或校验失败')
+  return value
+ }
  async function visit(ref,ancestors,reads,expand){
   if(!contentReference(ref))return expand?ref:undefined
   if(ancestors.has(ref.sha256)||ancestors.size>=256)throw failure(ref,'Chat 资源循环或层数超限')
@@ -81,8 +87,12 @@ export function createContentResourceStore(store){
   const node={$dshChatObject:2,value:payload,links},text=JSON.stringify(node)
   if(!links.length&&Buffer.byteLength(text)<4096)return value
   const sha256=createHash('sha256').update(text).digest('hex'),ref={$dshChatResource:2,sha256,...(meta.length?{meta}:{})}
-  if(await store.version(location(sha256)))await rawOnce(ref,reads)
-  else await store.updateJson(location(sha256),current=>{if(current!==undefined&&hash(current)!==sha256)throw failure(ref,'Chat 资源内容校验失败');return current===undefined?node:undefined})
+  // The immutable read both establishes existence and validates actual content.
+  // Missing targets still use the store's pending recovery and locked creation.
+  if(await rawOnce(ref,reads,true)===undefined){
+   await store.updateJson(location(sha256),current=>{if(current!==undefined&&hash(current)!==sha256)throw failure(ref,'Chat 资源内容校验失败');return current===undefined?node:undefined})
+   reads.delete(sha256)
+  }
   if(object(value)&&Object.isFrozen(value)){if(!encoded.has(value))encoded.set(value,new Map());encoded.get(value).set(cacheKey,ref)}
   return ref
  }

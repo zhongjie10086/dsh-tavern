@@ -26,7 +26,7 @@ async function encodeJson(value,relativePath) {
 /** Safe relative-path JSON adapter over durable absolute-file promotion. */
 export function createProfileDataStore(options) {
   const dataRoot = path.resolve(options.dataRoot)
-  const files = createDurableFilePromotion(options),storageFormat=createStorageFormat(dataRoot,{maximumVersion:4})
+  const files = createDurableFilePromotion(options),storageFormat=createStorageFormat(dataRoot,{maximumVersion:5})
   const cache = new Map()
   let cacheBytes = 0
   let api

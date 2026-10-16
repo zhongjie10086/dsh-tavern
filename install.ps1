@@ -205,7 +205,7 @@ try {
       $Metadata = Invoke-RestMethod -UseBasicParsing -Uri $CdnMetadataUrl -TimeoutSec 15
       if ($RequestedCommit -and $Metadata.revision -ne $RequestedCommit) { throw '备用源尚未发布已确认提交，改用固定提交归档。' }
       if ([string]$Metadata.revision -notmatch '^[0-9a-fA-F]{40}$') { throw 'jsDelivr 运行清单缺少有效提交号。' }
-      $RuntimePattern = '^(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|cordis\.patch\.yml|install\.ps1|install\.sh|bin/|config/|presets/|tavern-plugin/|patches/)'
+      $RuntimePattern = '^(scripts/(?:lib/(?:r16-page-home-rehearsal|r16-page-home-verification|r5-candidate-tools|r5-recovery-tools)|r5-recovery-preflight|r5-recovery-rehearsal)\.mjs$|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|cordis\.patch\.yml|install\.ps1|install\.sh|bin/|config/|presets/|tavern-plugin/|patches/)'
       $Files = @($Metadata.files | Where-Object { $_.path -match $RuntimePattern -and $_.path -notmatch '(^|/)\.\.(/|$)' -and $_.sha256 -match '^[0-9a-fA-F]{64}$' })
       if ($Files.Count -eq 0) { throw 'jsDelivr 未返回运行文件清单。' }
       foreach ($File in $Files) {

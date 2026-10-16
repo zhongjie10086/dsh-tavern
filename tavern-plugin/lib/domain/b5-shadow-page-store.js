@@ -1,3 +1,6 @@
+import {AsyncLocalStorage} from 'node:async_hooks'
+import {pageProcessActivity} from './page-process-activity.js'
+import {createMaintenanceGate} from './maintenance-gate.js'
 // Adapted from upstream d6dfc93007226ea523a75e3b95f0b580d7aa7f4e: conversation-page-store.js
 // B5 shadow primitives only; no production storage route is installed.
 import {createHash, randomUUID} from 'node:crypto'
@@ -8,6 +11,7 @@ import {createDurableFilePromotion} from '../durable-file-promotion.js'
 // New-format foundation, deliberately not an automatic legacy Chat migration.
 // Only the small head pointer is mutable. Readers pin immutable snapshots;
 // append/point edits copy a bounded page and its radix-tree path.
+const pageLeases=new Map()
 const PAGE_SIZE=64, FANOUT=32, FORMAT=1
 const hash=value=>createHash('sha256').update(value).digest('hex')
 const copy=value=>JSON.parse(JSON.stringify(value))
@@ -18,6 +22,10 @@ function integer(value,min=0){return Number.isSafeInteger(value)&&value>=min}
 export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotionOptions={}}={}) {
  if(!root)throw Error('Conversation store requires root')
  root=path.resolve(root)
+ const leaseKey=process.platform==='win32'?root.toLowerCase():root
+ if(!pageLeases.has(leaseKey))pageLeases.set(leaseKey,createMaintenanceGate())
+ const createdBlocks=new AsyncLocalStorage()
+ const lease=pageLeases.get(leaseKey),activity=pageProcessActivity(root)
  // A live, slow writer must never lose its lock merely due to elapsed time.
  // Dead process recovery and pending head promotion use the existing protocol.
  const promotion=createDurableFilePromotion({...promotionOptions,writeLockStaleMs:Number.MAX_SAFE_INTEGER})
@@ -28,8 +36,13 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
   while(packed.size&&packedBytes+size>8*1024*1024){const oldest=packed.keys().next().value;packedBytes-=packed.get(oldest).size;packed.delete(oldest)}
   if(size<=8*1024*1024){packed.set(key,{value,size});packedBytes+=size}
  }
- function decodeBlock(dir,id,bytes){
-  if(hash(bytes)===id){
+ function decodeBlock(dir,id,bytes,batch){
+  const digest=hash(bytes),remembered=batch?.entries.get(digest)
+  if(remembered&&remembered.bytes.equals(bytes)){
+   if(!remembered.records.has(id))throw Error('Immutable pack is missing requested block')
+   return remembered.records.get(id)
+  }
+  if(digest===id){
    const value=JSON.parse(bytes)
    // Content hashes are immutable across revisions. Keep small index/record
    // blocks warm across field reads; the mutable head pointer is never cached.
@@ -48,6 +61,19 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
   }
   if(!seen.has(id))throw Error('Immutable pack is missing requested block')
   for(const entry of entries)cachePacked(dir,...entry)
+  if(batch){
+   // Only this write batch may reuse verification, and only for equal raw bytes.
+   const size=bytes.length+entries.reduce((total,entry)=>total+entry[2],128)
+   if(size<=8*1024*1024){
+    const prior=batch.entries.get(digest)
+    if(prior){batch.size-=prior.size;batch.entries.delete(digest)}
+    while(batch.entries.size&&batch.size+size>8*1024*1024){
+     const oldest=batch.entries.keys().next().value
+     batch.size-=batch.entries.get(oldest).size;batch.entries.delete(oldest)
+    }
+    batch.entries.set(digest,{bytes,records:new Map(entries.map(entry=>[entry[0],entry[1]])),size});batch.size+=size
+   }
+  }
   return entries.find(entry=>entry[0]===id)[1]
  }
  function directory(id){
@@ -85,6 +111,7 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
     await syncDirectory(dir)
    }
   }finally{if(handle)await handle.close();await rm(staging,{force:true})}
+  createdBlocks.getStore()?.add(id)
   onIO({kind:'write',type:value.kind,bytes:Buffer.byteLength(bytes)})
   return id
  }
@@ -281,7 +308,14 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
  }
  // Header/configuration readers never need a history page, including its
  // potentially large historical receipts. The pointer pins all returned fields.
+ async function assertSnapshot(id,snapshotId){
+  if(!snapshotId)return
+  let route
+  try{route=JSON.parse(await readFile(path.join(directory(id),'route.json'),'utf8'))}catch(error){if(error.code==='ENOENT')return;throw error}
+  if(route.expiredSnapshots?.includes(snapshotId))throw Object.assign(Error('Chat snapshot expired by retention policy'),{code:'DSH_TAVERN_REVISION_EXPIRED'})
+ }
  async function readHead(id,{snapshotId}={}){
+  await assertSnapshot(id,snapshotId)
   const dir=directory(id),read=reader(dir)
   const selected=snapshotId?{head:validateHead(await read(snapshotId,'head'),id),headId:snapshotId}:await current(dir,id,read)
   if(!selected)return undefined
@@ -290,6 +324,7 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
    state:copy((await read(head.stateId,'state')).value),metadata:copy((await read(head.metadataId,'metadata')).value)}
  }
  async function openConversation(id,{limit=50,snapshotId}={}){
+  await assertSnapshot(id,snapshotId)
   pageLimit(limit)
   const dir=directory(id),read=reader(dir)
   const selected=snapshotId?{head:validateHead(await read(snapshotId,'head'),id),headId:snapshotId}:await current(dir,id,read)
@@ -300,6 +335,7 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
  async function readHistoryPage(id,{cursor,limit=50}={}){
   pageLimit(limit)
   if(!record(cursor))throw Error('Invalid history cursor')
+  await assertSnapshot(id,cursor.snapshotId)
   const read=reader(directory(id))
   let head
   try{head=await read(cursor.snapshotId,'head')}catch(error){
@@ -311,6 +347,7 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
   return page(read,head,cursor.snapshotId,cursor.before,limit)
  }
  async function readState(id,{snapshotId}={}){
+  await assertSnapshot(id,snapshotId)
   const dir=directory(id),read=reader(dir)
   const head=snapshotId?validateHead(await read(snapshotId,'head'),id):(await current(dir,id,read))?.head
   return head?copy((await read(head.stateId,'state')).value):undefined
@@ -322,7 +359,7 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
  // directory entries are durable before this returns and BEFORE head publication.
  async function writeRecords(id,values){
   const dir=directory(id),records=copy(values),directories=new Set(),refs=new Array(records.length)
-  const entries=new Map(),groups=[]
+  const entries=new Map(),groups=[],batch={entries:new Map(),size:0}
   for(let i=0;i<records.length;i++){
    const bytes=JSON.stringify({kind:'record',value:records[i]}),ref=hash(bytes)
    refs[i]=ref;entries.set(ref,{ref,value:records[i],bytes})
@@ -330,11 +367,11 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
   let group=[],groupBytes=64
   for(const entry of entries.values()){
    let existing
-   try{existing=await readFile(blobPath(dir,entry.ref),'utf8')}catch(error){if(error.code!=='ENOENT')throw error}
+   try{existing=await readFile(blobPath(dir,entry.ref))}catch(error){if(error.code!=='ENOENT')throw error}
    const parent=path.dirname(blobPath(dir,entry.ref))
    directories.add(parent);directories.add(path.join(dir,'blocks'));directories.add(dir)
    if(existing!==undefined){
-    if(JSON.stringify(decodeBlock(dir,entry.ref,existing))!==entry.bytes)throw Error('Immutable block corruption')
+    if(JSON.stringify(decodeBlock(dir,entry.ref,existing,batch))!==entry.bytes)throw Error('Immutable block corruption')
     onIO({kind:'read',type:'record',bytes:Buffer.byteLength(existing),reason:'deduplication'})
     continue
    }
@@ -363,10 +400,10 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
      for(const entry of group){
       const destination=blobPath(dir,entry.ref)
       await mkdir(path.dirname(destination),{recursive:true})
-      try{await linkFile(target,destination);onIO({kind:'link',type:'record',bytes:0})}
+      try{await linkFile(target,destination);createdBlocks.getStore()?.add(entry.ref);onIO({kind:'link',type:'record',bytes:0})}
       catch(error){
        if(error.code==='EEXIST'){
-        if(JSON.stringify(decodeBlock(dir,entry.ref,await readFile(destination,'utf8')))!==entry.bytes)throw Error('Immutable block corruption')
+        if(JSON.stringify(decodeBlock(dir,entry.ref,await readFile(destination),batch))!==entry.bytes)throw Error('Immutable block corruption')
        }else if(['EXDEV','EPERM','EACCES','ENOTSUP','EOPNOTSUPP','ENOSYS','EMLINK'].includes(error.code)){
         await writeBlock(dir,{kind:'record',value:entry.value},directories)
        }else throw error
@@ -392,6 +429,7 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
  }
  async function readRecord(id,reference){return copy((await reader(directory(id))(reference,'record')).value)}
  async function readEntries(id,keys,{snapshotId}={}){
+  await assertSnapshot(id,snapshotId)
   if(!Array.isArray(keys))throw Error('Invalid record keys')
   const routes=keys.map(recordKey),dir=directory(id),read=reader(dir)
   const head=snapshotId?validateHead(await read(snapshotId,'head'),id):(await current(dir,id,read))?.head
@@ -403,5 +441,9 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
   }
   return Object.fromEntries(entries)
  }
- return Object.freeze({create,commit,readHead,openConversation,readHistoryPage,readState,writeRecord,writeRecords,readRecord,readEntries})
+ async function resetConstructionHead(id,snapshotId){const dir=directory(id);validateHead(await reader(dir)(snapshotId,'head'),id);await promotion.update(path.join(dir,'head.json'),()=>JSON.stringify({format:FORMAT,headId:snapshotId}))}
+ const api={resetConstructionHead,readBlock:async(id,ref)=>{const dir=directory(id);return decodeBlock(dir,ref,await readFile(blobPath(dir,ref),'utf8'))},create,commit,readHead,openConversation,readHistoryPage,readState,writeRecord,writeRecords,readRecord,readEntries}
+ for(const name of ['readBlock','readHead','openConversation','readHistoryPage','readState','readRecord','readEntries']){const operation=api[name];api[name]=async(...args)=>{await activity.register();return lease.read(()=>operation(...args))}}
+ for(const name of ['resetConstructionHead','create','commit','writeRecord','writeRecords']){const operation=api[name];api[name]=async(...args)=>{await activity.register();return lease.mutate(()=>operation(...args))}}
+ return Object.freeze({...api,captureCreated:async operation=>{const refs=new Set(),value=await createdBlocks.run(refs,operation);return {value,refs:[...refs]}},withRead:async operation=>{await activity.register();return lease.read(operation)},withMutation:async operation=>{await activity.register();return lease.mutate(operation)},tryMaintenance:operation=>activity.exclusive(()=>lease.tryWrite(operation))})
 }

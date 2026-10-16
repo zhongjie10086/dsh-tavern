@@ -82,18 +82,21 @@ export function createResourceVersionStorage(store){
   const value=finishJsonDraft(input),parts=split(kind,value),context={objects:new Map(),versions:new Map()}
   const definition=await resources.save(parts.base,{},context.objects),record={$dshResourceVersion:1,kind,definition,reference:definition!==parts.base&&contentReference(definition)}
   const sha256=hash(record),ref={kind,sha256}
-  if(await store.version(location(sha256)))await readVersion(ref,context,false)
-  else await store.updateJson(location(sha256),previous=>{if(previous!==undefined&&hash(previous)!==sha256)throw invalid(ref,'资源版本校验失败');return previous===undefined?record:undefined})
+  if(await readVersion(ref,context,false,true)===undefined){
+   await store.updateJson(location(sha256),previous=>{if(previous!==undefined&&hash(previous)!==sha256)throw invalid(ref,'资源版本校验失败');return previous===undefined?record:undefined})
+   context.versions.delete(sha256)
+  }
   const overrides=await resources.save(parts.overrides,{},context.objects)
   return {$dshResourceOverlay:1,kind,version:sha256,overrides,overrideReference:overrides!==parts.overrides&&contentReference(overrides)}
  }
- async function readVersion(ref,context,expand=true){
+ async function readVersion(ref,context,expand=true,allowMissing=false){
   if(!/^[a-f0-9]{64}$/.test(ref.sha256||''))throw invalid(ref,'资源版本编号无效')
   if(context&&!context.versions.has(ref.sha256))context.versions.set(ref.sha256,store.readReadonly(location(ref.sha256)))
   const row=await (context?context.versions.get(ref.sha256):store.readReadonly(location(ref.sha256)))
+  if(row===undefined&&allowMissing)return undefined
   if(!plain(row)||row.$dshResourceVersion!==1||row.kind!==ref.kind||!own(row,'definition')||!verified.has(row)&&hash(row)!==ref.sha256)throw invalid(ref,'资源版本缺失或校验失败')
   verified.add(row)
-  if(!expand){if(row.reference)await resources.verify(row.definition,new Set(),context?.objects);return}
+  if(!expand){if(row.reference)await resources.verify(row.definition,new Set(),context?.objects);return row}
   return row.reference?await resources.load(row.definition,new Set(),context?.objects):structuredClone(row.definition)
  }
  async function decode(value,kind,context){

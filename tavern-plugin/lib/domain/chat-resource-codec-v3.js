@@ -19,6 +19,11 @@ export function createChatResourceCodecV3({dataRoot,store=createProfileDataStore
  const resources=createContentResourceStore(store),versions=createResourceVersionStorage(store)
  async function visit(value,path,writing,versioned,context){
   if(derivedAt(path))return undefined
+  if(writing&&context?.reuse){
+   let before=context.base,encoded=context.encoded
+   for(const key of path){before=before?.[key];encoded=encoded?.[key]}
+   if(value===before&&(value===null||typeof value!=='object'||Object.isFrozen(value)))return encoded
+  }
   const field=path.at(-1),parent=path.slice(0,-1)
   if(fields.has(field)&&rootAt(parent)||displayFields.has(field)&&messageRoot(parent)){
    const kind=rootAt(parent)?versionKinds[field]:undefined
@@ -79,5 +84,6 @@ export function createChatResourceCodecV3({dataRoot,store=createProfileDataStore
   }
   return visit(value,[],false,false,readContext())
  }
- return Object.freeze({encodeChat,decodeChat,encodeChanges:rows=>changes(rows,true),decodeChanges:rows=>changes(rows,false),logical:value=>{const next={...value};delete next.resolvedRuntimePreset;return immutableJsonSnapshot(next)}})
+ async function encodeChatIncremental(value,base,encoded){return {$dshVersionedChat:1,_storageRevision:value?._storageRevision,value:await visit(value,[],true,true,{reuse:true,base,encoded})}}
+ return Object.freeze({encodeChat,encodeChatIncremental,decodeChat,encodeChanges:rows=>changes(rows,true),decodeChanges:rows=>changes(rows,false),logical:value=>{const next={...value};delete next.resolvedRuntimePreset;return immutableJsonSnapshot(next)}})
 }

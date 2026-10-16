@@ -1,3 +1,4 @@
+import {initializeNewPageHomeIfEmpty} from '../tavern-plugin/lib/domain/page-retention-upgrade.js'
 import { prepareDesktopPackageManager } from './desktop-package-manager.mjs'
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
@@ -238,6 +239,7 @@ export async function installProfile(host = RUNTIME_HOST) {
       backupRoot: path.join(DSH_ROOT, 'backups', 'dsh-tavern-data-upgrade'),
       legacyRoots: legacyDataRoots(),
     })
+    await initializeNewPageHomeIfEmpty(dataRoot)
     for (const directory of ['cards', 'chats', 'scripts', 'sources', 'skills', 'diffs']) {
       mkdirSync(path.join(dataRoot, directory), { recursive: true })
     }

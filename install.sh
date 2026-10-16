@@ -149,7 +149,7 @@ if [ "${USED_GIT}" -eq 0 ]; then
 const { createHash } = require('node:crypto')
 const { mkdir, writeFile } = require('node:fs/promises')
 const path = require('node:path')
-const allowed = /^(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|cordis\.patch\.yml|install\.ps1|install\.sh|bin\/|config\/|presets\/|tavern-plugin\/|patches\/)/
+const allowed = /^(scripts\/(?:lib\/(?:r16-page-home-rehearsal|r16-page-home-verification|r5-candidate-tools|r5-recovery-tools)|r5-recovery-preflight|r5-recovery-rehearsal)\.mjs$|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|cordis\.patch\.yml|install\.ps1|install\.sh|bin\/|config\/|presets\/|tavern-plugin\/|patches\/)/
 async function get(url, timeout = 30000) {
   const response = await fetch(url, { signal: AbortSignal.timeout(timeout) })
   if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`)

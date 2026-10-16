@@ -8003,14 +8003,22 @@ function tavernFrameAssetBootstrap(access) {
 				const key=item.path.at(-1);if(!item.present){delete parent[key];return;}
 				const source=Object.create(null),current=Object.create(null);Object.defineProperty(source,key,{value:item.value,enumerable:true});if(settingOwn(parent,key))Object.defineProperty(current,key,{value:parent[key],enumerable:true,writable:true,configurable:true});reconcileSettings(current,source);Object.defineProperty(parent,key,{value:current[key],enumerable:true,writable:true,configurable:true});
 			}
-			async function saveSettingsPatch(retryCall = call){
+			function settingPaths(){
 				const paths=[];
 				for(const key of new Set(Object.keys(savedExtensionSettings).concat(Object.keys(extensionSettings)))){
 					if(key==='__userscripts'){for(const owner of new Set(Object.keys(savedExtensionSettings[key]||{}).concat(Object.keys(extensionSettings[key]||{}))))paths.push([key,owner]);}
 					else paths.push([key]);
 				}
+				return paths;
+			}
+			function settingsUsePatches(){return context().extensionSettingsProtocol===2&&window.crypto?.subtle&&window.TextEncoder;}
+			function settingsArePersisted(){
+				if(!settingsUsePatches())return settingCanonical(extensionSettings)===settingCanonical(savedExtensionSettings);
+				return settingPaths().every(path=>JSON.stringify(comparableSetting(settingAt(savedExtensionSettings,path),path))===JSON.stringify(comparableSetting(settingAt(extensionSettings,path),path)));
+			}
+			async function saveSettingsPatch(retryCall = call){
 				const patches=[],submitted=new Map();
-				for(const path of paths){
+				for(const path of settingPaths()){
 					const before=comparableSetting(settingAt(savedExtensionSettings,path),path),after=comparableSetting(settingAt(extensionSettings,path),path);
 					if(JSON.stringify(before)===JSON.stringify(after))continue;
 					const stable=copy(after),hash=Array.from(new Uint8Array(await window.crypto.subtle.digest('SHA-256',new window.TextEncoder().encode(settingCanonical(before))))).map(b=>b.toString(16).padStart(2,'0')).join('');
@@ -8038,7 +8046,7 @@ function tavernFrameAssetBootstrap(access) {
 				// time so a burst of legacy fire-and-forget calls saves the newest edits.
 				settingsPending++;reportSaveState();
 				const task = settingsTail.catch(function () {}).then(async function () {
-					if(context().extensionSettingsProtocol===2&&window.crypto?.subtle&&window.TextEncoder)return saveSettingsPatch(retryCall);
+					if(settingsUsePatches())return saveSettingsPatch(retryCall);
 					const submitted = JSON.parse(JSON.stringify(extensionSettings));
                     if (JSON.stringify(submitted) === JSON.stringify(savedExtensionSettings)) return copy(savedExtensionSettings);
 					const result = await retryCall("saveTavernExtensionSettings", { settings: submitted, expectedSettings: savedExtensionSettings });
@@ -8197,7 +8205,7 @@ function tavernFrameAssetBootstrap(access) {
             };
             window.toastr = Object.fromEntries(['success','info','warning','error'].map(level=>[level,function(message,title){window.__dshTavernToast(level,message,title);return console[level==='error'?'error':level==='warning'?'warn':'info'](message)}]));
 			function flushAll(retryCall){return Promise.all([retryCall?chatData.retry(retryCall):chatData.save(),saveExtensionSettings(retryCall)]);}
-			function isPersisted(){try{return !settingsPending&&!settingsFailed&&settingCanonical(extensionSettings)===settingCanonical(savedExtensionSettings)&&chatData.isPersisted()===true;}catch(_){return false;}}
+			function isPersisted(){try{return !settingsPending&&!settingsFailed&&settingsArePersisted()&&chatData.isPersisted()===true;}catch(_){return false;}}
             window.addEventListener('pagehide',()=>{if(!isPersisted())void flushAll().catch(error=>console.error('页面关闭时插件数据尚未保存',error));});
 			if(options.token)window.addEventListener('message',event=>{if(event.source===window.parent&&event.data?.token===options.token&&event.data.type==='dsh-tavern-retry-script-storage')void flushAll().catch(error=>console.error('插件数据重试失败',error));});
 			// An event epilogue waits for the saves already issued. A save that failed

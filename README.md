@@ -34,6 +34,27 @@ dsh-tavern restart
 
 需要排查安装环境时可运行 `dsh-tavern doctor`。不要向他人公开带访问凭据的完整网页地址或未脱敏的诊断文件。
 
+## 存档格式 5 与普通恢复保留
+
+本版本首次安装或首次启动空数据目录时使用 format5。已有 format3/4 数据不会自动切换。format5 保留当前版本、额外最近 3 个非保护普通版本，以及剧情 checkpoint、rollback、regen、recovery、借用读与其他受保护根；无法确认用途或引用闭包的内容继续保留。到期版本的旧游标会明确报告过期。普通 SP 配置和局部世界书保存属于普通版本；剧情恢复点仍受保护。
+
+升级前停止使用该 Home 的所有服务，保留配套代码与完整 Home 备份，以下命令只针对该备份另行恢复出的离线数据副本。不要把原运行目录当作副本。`<data-copy>` 指副本里的 `profile-data/tavern/data`，marker SHA-256 是其中 `storage-format.json` 的文件摘要。
+
+```sh
+# 从零准备一个空的新数据目录；正常首次安装会自动执行等价初始化
+node bin/migrate-page-storage.mjs --initialize-data <new-empty-data-dir> --offline-copy --old-processes-stopped
+# 将已经迁成 format4 的离线副本升级到 format5
+node bin/migrate-page-storage.mjs --upgrade-data <data-copy> --expected-marker-sha256 <marker-sha256> --offline-copy --old-processes-stopped
+# 从已验证完整 Home 备份生成新的 format5 副本
+node bin/migrate-page-storage.mjs --backup <verified-backup> --manifest-sha256 <backup-manifest-sha256> --output <new-output-dir> --boot <native-reader-module> --source-label <label> --retention-format5 --offline-copy --old-processes-stopped
+# 恢复原迁移 prepared receipt 并发布，然后升级 format5
+node bin/migrate-page-storage.mjs --recover-data <data-copy> --migration-id <uuid> --receipt-sha256 <prepared-receipt-sha256> --publish --retention-format5 --offline-copy --old-processes-stopped
+```
+
+受控升级只发布新格式标记并保留原 format4 标记副本；原有版本根、共享 SP/CAS 和 native Session 日志不裁剪。GC 先发布到期清单，再持久隔离、复核活根和文件身份、删除；中断隔离先恢复并重新规划。其他已登记的同 Home 进程仍活着时跳过回收。共享资源闭包不明、文件身份变化或新保护出现时保留并报告，不将硬链接 unlink 计作已释放其共享物理块。
+
+不支持把 format5 原地改回 format4/3，也不能仅替换 marker 或代码来降级。回退须同时恢复升级前的配套代码与完整 Home 备份；已到期且完成回收的普通版本只能从此前独立备份恢复。
+
 ## 开始游玩
 
 1. 打开页面，配置自己的模型服务和 API 凭据。
