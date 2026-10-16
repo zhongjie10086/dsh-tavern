@@ -19,8 +19,9 @@ function marker(record) {
   const {header,events,inheritedEventCount=0}=record
   let found
   for(const raw of events){
-    if(raw.type!=='user/message' || raw.data?.source?.plugin!==plugin || raw.seq<inheritedEventCount)continue
+    if(raw.type!=='user/message' || raw.seq<inheritedEventCount)continue
     const event=decodeTavernEvent(raw),source=event.data.source
+    if(source?.plugin!==plugin)continue
     const descriptor=foldSubagentDescriptor(events)
     if(source.kind!=='plugin' || source.plugin!==plugin || source.version!==1 || source.sessionId!==header.id ||
       typeof source.parentId!=='string' || !source.parentId || source.parentId!==header.parentSession || header.origin!=='subagent' || !providers.has(descriptor?.provider) ||

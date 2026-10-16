@@ -5,7 +5,7 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 		let _deepseek_ai_dsh_api_gateway_client = require("@deepseek-ai/dsh-api-gateway/client");
-		//#region ../../node_modules/zod/v4/core/util.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/util.js
 		function getEnumValues(entries) {
 			const numericValues = Object.values(entries).filter((v) => typeof v === "number");
 			return Object.entries(entries).filter(([k, _]) => numericValues.indexOf(+k) === -1).map(([_, v]) => v);
@@ -547,7 +547,7 @@ window.__ModuleLoader__.load({
 			return fn;
 		}
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/core.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/core.js
 		var _a$1;
 		const _zodDesc = {
 			value: void 0,
@@ -654,7 +654,7 @@ window.__ModuleLoader__.load({
 			return globalConfig;
 		}
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/errors.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/errors.js
 		function _getMessage() {
 			const internals = this._zod;
 			internals.message ?? (internals.message = JSON.stringify(internals.def, jsonStringifyReplacer, 2));
@@ -770,7 +770,7 @@ window.__ModuleLoader__.load({
 			return fieldErrors;
 		}
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/parse.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/parse.js
 		function finalizeParams(callee, params) {
 			return {
 				callee: params?.callee ?? callee,
@@ -973,7 +973,7 @@ window.__ModuleLoader__.load({
 			return _safeParseAsync(_Err)(schema, value, _ctx);
 		};
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/regexes.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/regexes.js
 		/**
 		* @deprecated CUID v1 is deprecated by its authors due to information leakage
 		* (timestamps embedded in the id). Use {@link cuid2} instead.
@@ -1045,7 +1045,7 @@ window.__ModuleLoader__.load({
 		const lowercase = /^[^A-Z]*$/;
 		const uppercase = /^[^a-z]*$/;
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/checks.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/checks.js
 		const $ZodCheck = /*@__PURE__*/ $constructor("$ZodCheck", (inst, def) => {
 			var _a;
 			inst._zod ?? (inst._zod = {});
@@ -1341,7 +1341,7 @@ window.__ModuleLoader__.load({
 			};
 		});
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/doc.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/doc.js
 		var Doc = class {
 			constructor(args = [], closed = {}) {
 				this.content = [];
@@ -1375,14 +1375,14 @@ window.__ModuleLoader__.load({
 			}
 		};
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/versions.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/versions.js
 		const version = {
 			major: 4,
 			minor: 6,
 			patch: 2
 		};
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/schemas.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/schemas.js
 		const $ZodType = /*@__PURE__*/ $constructor("$ZodType", (inst, def) => {
 			var _a;
 			inst ?? (inst = {});
@@ -2749,7 +2749,7 @@ window.__ModuleLoader__.load({
 			}
 		}
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/memoizer.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/memoizer.js
 		var $ZodCyclicError = class extends Error {
 			constructor() {
 				super(`Cannot parse a reference cycle that closes through a transform`);
@@ -3005,7 +3005,7 @@ window.__ModuleLoader__.load({
 			return backEdges !== void 0 && isRef(value) && backEdges.has(value);
 		}
 		//#endregion
-		//#region ../../node_modules/zod/v4/locales/en.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/locales/en.js
 		const error = () => {
 			const Sizable = {
 				string: {
@@ -3112,7 +3112,7 @@ window.__ModuleLoader__.load({
 			return { localeError: error() };
 		}
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/registries.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/registries.js
 		var _a;
 		var $ZodRegistry = class {
 			constructor() {
@@ -3159,7 +3159,7 @@ window.__ModuleLoader__.load({
 		(_a = globalThis).__zod_globalRegistry ?? (_a.__zod_globalRegistry = registry());
 		const globalRegistry = globalThis.__zod_globalRegistry;
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/api.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/api.js
 		// @__NO_SIDE_EFFECTS__
 		function _string(Class, params) {
 			return new Class({
@@ -3664,7 +3664,7 @@ window.__ModuleLoader__.load({
 			return ch;
 		}
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/to-json-schema.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/to-json-schema.js
 		function assignProps(target, ...sources) {
 			for (const source of sources) for (const key of Reflect.ownKeys(source)) if (Object.prototype.propertyIsEnumerable.call(source, key)) assignProp(target, key, source[key]);
 			return target;
@@ -4108,7 +4108,7 @@ Set the \`cycles\` parameter to \`"ref"\` to resolve cyclical schemas with defs.
 			return finalize(ctx, schema);
 		};
 		//#endregion
-		//#region ../../node_modules/zod/v4/core/json-schema-processors.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/core/json-schema-processors.js
 		const narrowMin = (agg, key, value) => {
 			if (agg[key] === void 0 || value > agg[key]) agg[key] = value;
 		};
@@ -4563,7 +4563,7 @@ Set the \`cycles\` parameter to \`"ref"\` to resolve cyclical schemas with defs.
 			seen.ref = innerType;
 		};
 		//#endregion
-		//#region ../../node_modules/zod/v4/classic/errors.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/classic/errors.js
 		const _installedErrorProtos = /* @__PURE__ */ new WeakSet([Object.prototype, Error.prototype]);
 		function _lazyMethod(proto, key, make) {
 			Object.defineProperty(proto, key, {
@@ -4613,7 +4613,7 @@ Set the \`cycles\` parameter to \`"ref"\` to resolve cyclical schemas with defs.
 		};
 		const ZodRealError = /*@__PURE__*/ $constructor("ZodError", initializer, void 0, { Parent: Error });
 		//#endregion
-		//#region ../../node_modules/zod/v4/classic/parse.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/classic/parse.js
 		const parse = /* @__PURE__ */ _parse(ZodRealError);
 		const parseAsync = /* @__PURE__ */ _parseAsync(ZodRealError);
 		const safeParse = /* @__PURE__ */ _safeParse(ZodRealError);
@@ -4627,7 +4627,7 @@ Set the \`cycles\` parameter to \`"ref"\` to resolve cyclical schemas with defs.
 		const safeEncodeAsync = /* @__PURE__ */ _safeEncodeAsync(ZodRealError);
 		const safeDecodeAsync = /* @__PURE__ */ _safeDecodeAsync(ZodRealError);
 		//#endregion
-		//#region ../../node_modules/zod/v4/classic/schemas.js
+		//#region ../../../../../dsh-tavern-rc2/tavern-plugin/node_modules/zod/v4/classic/schemas.js
 		function _ensureDefaultLocale() {
 			if (!globalConfig.localeError) config(en_default());
 		}
@@ -5510,17 +5510,20 @@ Set the \`cycles\` parameter to \`"ref"\` to resolve cyclical schemas with defs.
 		}
 		//#endregion
 		//#region lib/typert.remote-client.js
-		const TavernJsonValueRemoteCodec$schema = union([
+		let TavernJsonValueRemoteCodec$schema$value;
+		const TavernJsonValueRemoteCodec$schema = () => TavernJsonValueRemoteCodec$schema$value ??= union([
 			literal(null),
 			string(),
 			number(),
 			literal(false),
 			literal(true),
-			array(lazy(() => TavernJsonValueRemoteCodec$schema)),
-			record(string(), lazy(() => TavernJsonValueRemoteCodec$schema))
+			array(lazy(() => TavernJsonValueRemoteCodec$schema())),
+			record(string(), lazy(() => TavernJsonValueRemoteCodec$schema()))
 		]);
-		const dsh_tavern_remote_tavernSignals_follow_parameter_0$schema = array(string());
-		const dsh_tavern_remote_tavernSignals_follow_result$schema = union([object({
+		let dsh_tavern_remote_tavernSignals_follow_parameter_0$schema$value;
+		const dsh_tavern_remote_tavernSignals_follow_parameter_0$schema = () => dsh_tavern_remote_tavernSignals_follow_parameter_0$schema$value ??= array(string());
+		let dsh_tavern_remote_tavernSignals_follow_result$schema$value;
+		const dsh_tavern_remote_tavernSignals_follow_result$schema = () => dsh_tavern_remote_tavernSignals_follow_result$schema$value ??= union([object({
 			"type": literal("snapshot").readonly(),
 			"signals": array(object({
 				"id": string().readonly(),
@@ -5540,10 +5543,10 @@ Set the \`cycles\` parameter to \`"ref"\` to resolve cyclical schemas with defs.
 						number(),
 						literal(false),
 						literal(true),
-						array(lazy(() => TavernJsonValueRemoteCodec$schema)),
-						record(string(), lazy(() => TavernJsonValueRemoteCodec$schema))
+						array(lazy(() => TavernJsonValueRemoteCodec$schema())),
+						record(string(), lazy(() => TavernJsonValueRemoteCodec$schema()))
 					])),
-					record(string(), lazy(() => TavernJsonValueRemoteCodec$schema))
+					record(string(), lazy(() => TavernJsonValueRemoteCodec$schema()))
 				]).readonly().optional()
 			})).readonly()
 		}), object({
@@ -5566,10 +5569,10 @@ Set the \`cycles\` parameter to \`"ref"\` to resolve cyclical schemas with defs.
 						number(),
 						literal(false),
 						literal(true),
-						array(lazy(() => TavernJsonValueRemoteCodec$schema)),
-						record(string(), lazy(() => TavernJsonValueRemoteCodec$schema))
+						array(lazy(() => TavernJsonValueRemoteCodec$schema())),
+						record(string(), lazy(() => TavernJsonValueRemoteCodec$schema()))
 					])),
-					record(string(), lazy(() => TavernJsonValueRemoteCodec$schema))
+					record(string(), lazy(() => TavernJsonValueRemoteCodec$schema()))
 				]).readonly().optional()
 			}).readonly()
 		})]);
@@ -5589,14 +5592,14 @@ Set the \`cycles\` parameter to \`"ref"\` to resolve cyclical schemas with defs.
 					codec: {
 						mode: "strict",
 						typeSymbol: "dsh-tavern-remote#tavernSignals/follow:sessionIds",
-						schema: dsh_tavern_remote_tavernSignals_follow_parameter_0$schema
+						create: dsh_tavern_remote_tavernSignals_follow_parameter_0$schema
 					}
 				}],
 				cancellation: { parameter: "signal" },
 				result: {
 					mode: "strict",
 					typeSymbol: "dsh-tavern-remote/types#TavernSessionSignalFrame",
-					schema: dsh_tavern_remote_tavernSignals_follow_result$schema
+					create: dsh_tavern_remote_tavernSignals_follow_result$schema
 				},
 				sourceLocation: {
 					"file": "packages/dsh-tavern-remote/src/index.ts",

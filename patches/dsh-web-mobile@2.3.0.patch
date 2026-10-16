@@ -1,0 +1,52 @@
+diff --git a/lib/client.js b/lib/client.js
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -1210,7 +1210,7 @@
+  * Hidden entirely on wide screens (CSS media query).
+  */
+ function MobileDrawerFooter({ useSessions, downloadSessionLog, toggleSidebar, t }) {
+-    const sessionId = useSessions((state) => state.current);
++    const sessionId = useSessions((state) => state.current ?? Object.values(state.byId || {}).find((session) => (session.retainedBy?.mainView ?? 0) > 0)?.id);
+     const openExplorer = () => {
+         // Yield the preview sheet first (compat.css gives preview precedence
+         // over explorer), then open the explorer and close the drawer.
+diff --git a/src/client/components/MobileDrawerFooter.tsx b/src/client/components/MobileDrawerFooter.tsx
+--- a/src/client/components/MobileDrawerFooter.tsx
++++ b/src/client/components/MobileDrawerFooter.tsx
+@@ -22,7 +22,7 @@
+  * Hidden entirely on wide screens (CSS media query).
+  */
+ export function MobileDrawerFooter({ useSessions, downloadSessionLog, toggleSidebar, t }: MobileDrawerFooterProps) {
+-  const sessionId = useSessions((state) => state.current)
++  const sessionId = useSessions((state) => state.current ?? Object.values(state.byId || {}).find((session) => (session.retainedBy?.mainView ?? 0) > 0)?.id)
+   const openExplorer = (): void => {
+     // Yield the preview sheet first (compat.css gives preview precedence
+     // over explorer), then open the explorer and close the drawer.
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -69,15 +69,15 @@
+   },
+   "peerDependencies": {
+     "@deepseek-ai/cordis": "^4.0.1",
+-    "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0",
+-    "@deepseek-ai/dsh-client-runtime": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0",
+-    "@deepseek-ai/dsh-client-ui-conversation": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0",
+-    "@deepseek-ai/dsh-client-ui-layout": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0",
+-    "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0",
+-    "@deepseek-ai/dsh-client-ui-settings": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0",
+-    "@deepseek-ai/dsh-client-ui-sidebar": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0",
+-    "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0",
+-    "@deepseek-ai/dsh-session-log-export": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0",
++    "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-runtime": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-ui-conversation": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-ui-layout": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-ui-settings": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-ui-sidebar": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-session-log-export": "^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || 0.2.0-rc.2",
+     "react": "^18.2.0"
+   },
+   "devDependencies": {

@@ -4520,6 +4520,119 @@ function IzumiFloatingPanel(props){
 			};
 		}
 
+		// Navigation belongs to the native UI owner; operation references belong to
+		// their caller. Never project a synthetic `current` into the Session catalog.
+		function tavernCurrentSessionId(sessions, snapshot = sessions.list.getSnapshot()) {
+		    if (Object.prototype.hasOwnProperty.call(snapshot, 'current')) return snapshot.current || '';
+		    return Object.values(snapshot.byId || {}).find(row => (row.retainedBy?.mainView || 0) > 0)?.id || '';
+		}
+
+		function tavernSubagentCatalog(sessions, parentId, snapshot = sessions.list.getSnapshot()) {
+		    if (snapshot.subagentsByParent) return snapshot.subagentsByParent[parentId];
+		    const projection = snapshot.projectionsBySession?.[parentId];
+		    if (!projection) return undefined;
+		    return { state: projection.state === 'idle' ? projection.values?.subagentCatalog === undefined ? 'loading' : 'ready' : projection.state,
+		        error: projection.error, entries: projection.values?.subagentCatalog || [] };
+		}
+
+		function createTavernHostNavigation({ sessions, uiWorkspace, workspaces }) {
+		    const retained = typeof sessions.retain === 'function';
+		    const lifetime = new AbortController(), references = new Set();
+		    let opening;
+		    const signalFor = signal => signal ? AbortSignal.any([lifetime.signal, signal]) : lifetime.signal;
+		    async function waitListed(id, { signal } = {}) {
+		        signal = signalFor(signal); signal.throwIfAborted();
+		        if (!sessions.list.getSnapshot().byId[id]) await sessions.refresh();
+		        signal.throwIfAborted();
+		        if (!sessions.list.getSnapshot().byId[id]) throw new Error('DSH Session 不在原生目录中：' + id);
+		    }
+		    async function acquire(target, { signal } = {}) {
+		        signal = signalFor(signal); signal.throwIfAborted();
+		        if (typeof target === 'string') await waitListed(target, { signal });
+		        signal.throwIfAborted();
+		        if (!retained && typeof target === 'string') {
+		            await createSessionListRecoveryModule({
+		                summary: id => sessions.list.getSnapshot().byId[id], binding: id => sessions.binding(id),
+		                refresh: () => sessions.refresh(), open: id => sessions.open(id)
+		            }).wait(target);
+		            signal.throwIfAborted();
+		        }
+		        if (!retained) return { sessionId: typeof target === 'string' ? target : target.childSessionId,
+		            binding: sessions.binding(typeof target === 'string' ? target : target.childSessionId), release() {} };
+		        const native = sessions.retain(target, { source: 'controllerOperation', signal });
+		        let released = false;
+		        const lease = { sessionId: native.sessionId,
+		            get binding() { return native.binding; },
+		            release() { if (!released) { released = true; references.delete(lease); native.release(); } } };
+		        references.add(lease);
+		        try { await native.ready; signal.throwIfAborted(); return lease; }
+		        catch (error) { lease.release(); throw error; }
+		    }
+		    async function using(target, operation, options) {
+		        const reference = await acquire(target, options);
+		        try { return await operation(reference); }
+		        finally { reference.release(); }
+		    }
+		    async function open(target, { signal, isCurrent } = {}) {
+		        opening?.abort();
+		        const attempt = new AbortController(); opening = attempt;
+		        signal = signalFor(signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal);
+		        try {
+		            return await using(target, () => {
+		                signal.throwIfAborted();
+		                if (isCurrent && !isCurrent()) throw new Error('Navigation request superseded');
+		                if (retained) {
+		                    if (!uiWorkspace || typeof uiWorkspace.openSession !== 'function') throw new Error('缺少原生主窗口导航服务');
+		                    uiWorkspace.openSession(target);
+		                } else if (typeof target === 'string') sessions.open(target);
+		                else sessions.openSubagent(target);
+		            }, { signal });
+		        } finally { if (opening === attempt) opening = undefined; }
+		    }
+		    async function refreshCatalog(parentId) {
+		        lifetime.signal.throwIfAborted();
+		        if (retained) await sessions.refreshProjections(parentId);
+		        else await sessions.refreshSubagents(parentId);
+		        lifetime.signal.throwIfAborted();
+		        const catalog = tavernSubagentCatalog(sessions, parentId);
+		        if (catalog?.state !== 'ready') throw new Error('原生子会话目录尚不可读取');
+		        return catalog;
+		    }
+		    async function openChild(address, options) {
+		        const catalog = await refreshCatalog(address.parentSessionId);
+		        const entry = catalog.entries.find(row => row.id === address.childSessionId &&
+		            (retained || row.kind === 'child'));
+		        if (!entry || !['continuable', 'one-shot'].includes(entry.mode) ||
+		            address.mode && address.mode !== entry.mode) throw new Error('原生子会话身份或模式已变化');
+		        return open({ parentSessionId: address.parentSessionId, childSessionId: entry.id, mode: entry.mode }, options);
+		    }
+		    return Object.freeze({
+		        currentId: snapshot => tavernCurrentSessionId(sessions, snapshot), waitListed, acquire, using, open, openChild, refreshCatalog,
+		        catalog: (id, snapshot) => tavernSubagentCatalog(sessions, id, snapshot),
+		        create: async options => { const id = await sessions.create(options); await waitListed(id); return id; },
+		        fork: (id, atSeq) => using(id, () => sessions.fork({ sessionId: id, atSeq, increaseTitle: true })),
+		        archive: id => retained ? uiWorkspace.archiveSession(id) : workspaces.archiveSession(id),
+		        clear() {
+		            if (!retained) return sessions.clear();
+		            // V4 owns selection. Archive clears deleted targets through archiveSession;
+		            // a resource/mode picker keeps the live view until replacement.
+		            // Starting a Session here would create an unrelated record.
+		        },
+		        dispose() { lifetime.abort(); opening?.abort(); for (const reference of [...references]) reference.release(); }
+		    });
+		}
+
+		const tavernHostNavigationOwners = new WeakMap();
+		function tavernHostNavigationFor(ctx) {
+		    let navigation = tavernHostNavigationOwners.get(ctx);
+		    if (!navigation) {
+		        navigation = createTavernHostNavigation({ sessions: ctx.sessions, uiWorkspace: ctx.get('uiWorkspace'), workspaces: ctx.workspaces });
+		        tavernHostNavigationOwners.set(ctx, navigation);
+		        ctx.effect(() => () => { navigation.dispose(); tavernHostNavigationOwners.delete(ctx); }, 'Tavern host navigation');
+		    }
+		    return navigation;
+		}
+
 		function createSessionListRecoveryModule(options) {
 			for (const method of ["summary", "binding", "refresh", "open"]) {
 				if (!options || typeof options[method] !== "function") throw new Error("Session List Recovery 缺少 " + method + " adapter");
@@ -4529,12 +4642,12 @@ function IzumiFloatingPanel(props){
 			const timeoutMs = Math.max(100, Number(options.timeoutMs || 8000));
 			const retryDelays = Array.isArray(options.retryDelays) && options.retryDelays.length ? options.retryDelays : [0, 150, 350, 700, 1200, 1800, 2500];
 			const isUnknownSession = typeof options.isUnknownSession === "function" ? options.isUnknownSession : function (error) {
-				return /sessions\.select: unknown session/i.test(String(error && error.message || error || ""));
+				return /sessions\.(?:select|retain): unknown session/i.test(String(error && error.message || error || ""));
 			};
 			const active = new Map();
 
 			function ready(sessionId) {
-				return Boolean(options.summary(sessionId) && options.binding(sessionId));
+				return typeof options.addressable === "function" ? options.addressable(sessionId) : Boolean(options.summary(sessionId) && options.binding(sessionId));
 			}
 
 			async function synchronize(sessionId) {
@@ -4565,10 +4678,10 @@ function IzumiFloatingPanel(props){
 			}
 
 			async function open(sessionId) {
-				try { options.open(sessionId); return; }
+				try { await options.open(sessionId); return; }
 				catch (error) { if (!isUnknownSession(error)) throw error; }
 				await wait(sessionId);
-				options.open(sessionId);
+				await options.open(sessionId);
 			}
 
 			return Object.freeze({ ready: ready, wait: wait, open: open });
@@ -4594,10 +4707,10 @@ function IzumiFloatingPanel(props){
 				},
 				// uiWorkspace.connectWorkspace may reuse a blank Session that already has a
 				// Tavern opening and a locked preset. New conversations must have their own Session.
-				connectWorkspace: function (workspaceId) { return ctx.sessions.create({ workspaceId: workspaceId }); },
+				connectWorkspace: function (workspaceId) { return typeof ctx.sessions.retain === "function" ? tavernHostNavigationFor(ctx).create({ workspaceId: workspaceId }) : ctx.sessions.create({ workspaceId: workspaceId }); },
 				forkSession: function (sessionId, atSeq) {
 					if (!ctx.sessions || typeof ctx.sessions.fork !== "function") throw new Error("当前 DSH 版本不支持原生分叉，请升级 DSH 后重试");
-					return ctx.sessions.fork({ sessionId: sessionId, atSeq: atSeq, increaseTitle: true });
+					return typeof ctx.sessions.retain === "function" ? tavernHostNavigationFor(ctx).fork(sessionId, atSeq) : ctx.sessions.fork({ sessionId: sessionId, atSeq: atSeq, increaseTitle: true });
 				},
 				ensurePreset: async function (sessionId, request) {
 					// Select before writing the opening; the Session stream publishes preset state.
@@ -4646,6 +4759,7 @@ function IzumiFloatingPanel(props){
 						}
 						phase = "等待 DSH Session 就绪";
 						await options.waitForSession(sessionId);
+                        const run = async function () {
 						phase = "切换到酒馆模式";
 						await options.ensurePreset(sessionId, request);
 						phase = request.kind === "card" ? "创建卡片工作台对话" : "写入人物卡开场白";
@@ -4655,6 +4769,8 @@ function IzumiFloatingPanel(props){
 						options.rememberPending(pending);
 						await options.finishOpen(pending);
 						return { sessionId: sessionId, pending: pending };
+                        };
+                        return await (options.usingSession ? options.usingSession(sessionId, run) : run());
 					} catch (error) {
 						const failure = error instanceof Error ? error : new Error(String(error || "创建对话失败"));
 						failure.phase = phase;
@@ -4673,19 +4789,28 @@ function IzumiFloatingPanel(props){
 			let active = null;
 
 			function clean(record) {
-				if (!record || record.cleanupScheduled) return;
+				if (!record) return;
+                if (record.cleanupScheduled) return record.cleanupTask;
 				record.cleanupScheduled = true;
-				record.promise.then(async function (lease) {
+				record.controller?.abort();
+				record.cleanupTask = record.promise.then(async function (lease) {
+                    lease.release?.();
 					if (!lease.created) return;
 					try { await options.archiveSession(lease.sessionId); }
 					catch (error) { report({ phase: "cleanup-failed", key: record.key, sessionId: lease.sessionId, error: error }); }
-				}, function () {});
+				}, async function () {
+                    if (record.created && record.sessionId) {
+                        try { await options.archiveSession(record.sessionId); }
+                        catch (error) { report({ phase: "cleanup-failed", key: record.key, sessionId: record.sessionId, error }); }
+                    }
+                });
+                return record.cleanupTask;
 			}
 
 			function cancel() {
 				const record = active;
 				active = null;
-				clean(record);
+				return clean(record);
 			}
 
 			function begin(request) {
@@ -4693,24 +4818,28 @@ function IzumiFloatingPanel(props){
 				const key = String(request && request.key || "");
 				const known = new Set(options.sessionIds());
 				const startedAt = now();
-				const record = { key: key, cleanupScheduled: false, promise: null };
+				const record = { key: key, cleanupScheduled: false, promise: null, controller: options.prepareSession ? new AbortController() : null };
 				record.promise = (async function () {
 					const workspaceId = await options.resolveWorkspace(request || {});
 					const sessionId = await options.connectWorkspace(workspaceId);
-					const lease = { sessionId: sessionId, created: !known.has(sessionId) };
+					record.sessionId = sessionId; record.created = !known.has(sessionId);
+                    const reference = options.prepareSession ? await options.prepareSession(sessionId, { signal: record.controller.signal }) : null;
+                    const lease = { sessionId: sessionId, created: record.created, ...(reference ? { release: () => reference.release() } : {}) };
 					report({ phase: "ready", key: key, sessionId: sessionId, created: lease.created, elapsedMs: Math.max(0, now() - startedAt) });
 					return lease;
 				})();
-				record.promise.catch(function (error) { report({ phase: "failed", key: key, elapsedMs: Math.max(0, now() - startedAt), error: error }); });
+				record.promise.catch(function (error) { report({ phase: "failed", key: key, elapsedMs: Math.max(0, now() - startedAt), error: error }); clean(record); });
 				active = record;
 				return record.promise;
 			}
 
-			async function claim(key) {
+			async function claim(key, retainLease) {
 				const record = active;
 				if (!record || record.key !== String(key || "")) return "";
 				active = null;
-				return (await record.promise).sessionId;
+				const lease = await record.promise;
+                if (retainLease) return lease;
+                try { return lease.sessionId; } finally { lease.release?.(); }
 			}
 
 			return Object.freeze({ begin: begin, claim: claim, cancel: cancel });
@@ -6479,7 +6608,7 @@ function IzumiFloatingPanel(props){
 		// The header counts session summaries; its popup reads the lazy catalog.
 		// Refresh an opened catalog when membership/activity changes in the summary feed.
 		function syncTavernSubagentCatalogs(sessions) {
-		  if (!sessions || !sessions.list || typeof sessions.refreshSubagents !== 'function') return function () {};
+		  if (!sessions || !sessions.list || typeof sessions.refreshSubagents !== 'function' && typeof sessions.refreshProjections !== 'function') return function () {};
 		  const signatures = new Map();
 		  let disposed = false;
 		  function reconcile() {
@@ -6490,13 +6619,15 @@ function IzumiFloatingPanel(props){
 		      if (!groups.has(row.parentId)) groups.set(row.parentId, []);
 		      groups.get(row.parentId).push(row.id + ':' + String(row.running === true));
 		    }
-		    for (const [parentId, catalog] of Object.entries(snapshot.subagentsByParent || {})) {
+		    const parentIds = new Set([...Object.keys(snapshot.subagentsByParent || {}), ...Object.keys(snapshot.projectionsBySession || {})]);
+		    for (const parentId of parentIds) {
+		      const catalog = tavernSubagentCatalog(sessions, parentId, snapshot);
 		      if (!catalog || catalog.state !== 'ready') continue;
 		      const signature = (groups.get(parentId) || []).sort().join('|');
 		      if (signatures.get(parentId) === signature) continue;
 		      signatures.set(parentId, signature);
 		      Promise.resolve().then(function () {
-		        if (!disposed) return sessions.refreshSubagents(parentId);
+		        if (!disposed) return typeof sessions.refreshProjections === 'function' ? sessions.refreshProjections(parentId) : sessions.refreshSubagents(parentId);
 		      }).catch(function (error) { console.warn('[DSH Tavern] 子代理目录刷新失败', error); });
 		    }
 		  }
@@ -6509,7 +6640,7 @@ function IzumiFloatingPanel(props){
 		function createTavernRetirementNoticeFeature(options) {
 		    const React = options.React, h = React.createElement;
 		    const listeners = new Set();
-		    let state = { phase: 'idle', notices: [] }, sessions, active = false;
+		    let state = { phase: 'idle', notices: [] }, sessions, navigation, active = false;
 		    let epoch = 0, pending = null, repeat = false, controller;
 		    function publish(next) { state = next; for (const listener of listeners) listener(); }
 		    function getSnapshot() { return state; }
@@ -6536,13 +6667,13 @@ function IzumiFloatingPanel(props){
 		            });
 		        return pending;
 		    }
-		    function connect(nextSessions) {
-		        sessions = nextSessions; active = true; epoch++;
+		    function connect(nextSessions, nextNavigation) {
+		        navigation = nextNavigation; sessions = nextSessions; active = true; epoch++;
 		        function signature() {
 		            const snapshot = sessions.list.getSnapshot();
-		            return JSON.stringify([snapshot.current,
+		            return JSON.stringify([tavernCurrentSessionId(sessions, snapshot),
 		                Object.values(snapshot.byId || {}).map(function (row) { return [row.id, row.parentId, row.origin, row.displayTitle, row.running]; }),
-		                Object.entries(snapshot.subagentsByParent || {}).map(function ([id, catalog]) { return [id, catalog.state, catalog.entries]; })]);
+		                [...new Set([...Object.keys(snapshot.subagentsByParent || {}), ...Object.keys(snapshot.projectionsBySession || {})])].map(function (id) { const catalog = tavernSubagentCatalog(sessions, id, snapshot); return [id, catalog?.state, catalog?.entries]; })]);
 		        }
 		        let previous = signature();
 		        const stop = sessions.list.subscribe(function () {
@@ -6575,12 +6706,8 @@ function IzumiFloatingPanel(props){
 		            const ticket = life.current, connection = epoch;
 		            setError('');
 		            try {
-		                await sessions.refreshSubagents(row.parentSessionId);
-		                if (!active || epoch !== connection || life.current !== ticket) return;
-		                const catalog = sessions.list.getSnapshot().subagentsByParent?.[row.parentSessionId];
-		                const entry = catalog?.state === 'ready' && catalog.entries.find(function (entry) { return entry.id === row.sessionId && entry.kind === 'child'; });
-		                if (!entry || !['continuable', 'one-shot'].includes(entry.mode)) throw new Error('unavailable');
-		                sessions.openSubagent({ parentSessionId: row.parentSessionId, childSessionId: row.sessionId, mode: entry.mode });
+		                await navigation.openChild({ parentSessionId: row.parentSessionId, childSessionId: row.sessionId },
+		                    { isCurrent: () => active && epoch === connection && life.current === ticket });
 		            } catch (_) {
 		                if (active && epoch === connection && life.current === ticket) setError('子会话暂不可打开，请刷新原生子会话目录后重试');
 		            }
@@ -6605,7 +6732,7 @@ function IzumiFloatingPanel(props){
 		    function Row(props) { return NoticeList(props); }
 		    function Header(props) { return NoticeList({ sessionId: props.sessionId, header: true }); }
 		    function register(input) {
-		        input.ctx.effect(function () { return connect(input.ctx.sessions); }, 'dsh-tavern: retirement notice reads');
+		        input.ctx.effect(function () { return connect(input.ctx.sessions, tavernHostNavigationFor(input.ctx)); }, 'dsh-tavern: retirement notice reads');
 		        input.ctx.effect(function () {
 		            return input.slots.inject('conversation.session.header.actions', function () {
 		                return input.slots.register({ name: 'conversation.session.header.actions', id: 'dsh-tavern-retirement-notices', order: 20 }, Header);
@@ -11387,7 +11514,7 @@ function tavernFrameAssetBootstrap(access) {
 				listeners.forEach(function (listener) { listener(); });
 			}
 			function selectedOwner() {
-				let id = String(sessions.list.getSnapshot().current || "");
+				let id = String(tavernCurrentSessionId(sessions) || "");
 				const seen = new Set();
 				while (id) {
 					if (seen.has(id) || seen.size >= 32) return "";
@@ -13427,7 +13554,7 @@ function tavernFrameAssetBootstrap(access) {
 			}
 
 			const collapsed = props.collapsed;
-			const current = props.useSessions(function (state) { return state.current; });
+			const current = props.useSessions(function (state) { return props.navigation.currentId(state); });
 			const summaries = props.useSessions(function (state) { return state.byId; });
 			const workspaceId = props.useWorkspaces(function (state) { return props.conversationHost.workspaceId(state, current); });
 			const [cards, setCards] = React.useState([]);
@@ -13496,7 +13623,7 @@ function tavernFrameAssetBootstrap(access) {
 					setDeleteNotice("已删除 " + removed.length + " 个" + (failures.length ? "，" + failures.length + " 个失败，可重试" : ""));
 					if (failures.length) setError(failures.map(function (result) { const item = items.find(function (item) { return item.chatId === result.chatId; }); return (item && (item.title || item.cardName) || result.chatId) + "：" + result.error; }).join("\n"));
 					if (items.some(function (item) { return item.sessionId === current && removed.includes(item.chatId); })) {
-						props.sessions.clear();
+						props.navigation.clear();
 						const next = visibleHistory.find(function (item) { return !removed.includes(item.chatId); });
 						if (next) await openSessionWhenReady(next.sessionId);
 						else openPicker("cards");
@@ -13529,8 +13656,9 @@ function tavernFrameAssetBootstrap(access) {
 					sessionIds: function () { return Object.keys(props.sessions.list.getSnapshot().byId || {}); },
 					resolveWorkspace: playWorkspaceResolverRef.current,
 					connectWorkspace: function (targetWorkspaceId) { return props.conversationHost.connectWorkspace(targetWorkspaceId); },
+                    prepareSession: (id, options) => props.navigation.acquire(id, options),
 					archiveSession: async function (sessionId) {
-						try { await props.workspaces.archiveSession(sessionId); }
+						try { await props.navigation.archive(sessionId); }
 						catch (error) { if (!isMissingSessionArchiveError(error)) throw error; }
 					},
 					report: function (timing) {
@@ -13545,7 +13673,8 @@ function tavernFrameAssetBootstrap(access) {
 					summary: function (sessionId) { return props.sessions.list.getSnapshot().byId[sessionId]; },
 					binding: function (sessionId) { return props.sessions.binding(sessionId); },
 					refresh: function () { return typeof props.sessions.refresh === "function" ? props.sessions.refresh() : Promise.resolve(); },
-					open: function (sessionId) { props.sessions.open(sessionId); },
+					addressable: function (sessionId) { return Boolean(props.sessions.list.getSnapshot().byId[sessionId] && (typeof props.sessions.retain === "function" || props.sessions.binding(sessionId))); },
+					open: function (sessionId) { return props.navigation.open(sessionId); },
 					isUnknownSession: isUnknownSessionSelectError
 				});
 			}
@@ -13786,14 +13915,14 @@ function tavernFrameAssetBootstrap(access) {
 				if (current === protectedSessionId) return;
 				// DSH's blank flag does not mean an existing Tavern opening can be discarded.
 				if (history.some(function (entry) { return entry.sessionId === current; })) return;
-				try { await props.workspaces.archiveSession(current); }
+				try { await props.navigation.archive(current); }
 				catch (archiveError) { if (!isMissingSessionArchiveError(archiveError)) throw archiveError; }
 			}
 			async function waitForSessionSummary(sessionId) {
 				await sessionListRecoveryRef.current.wait(sessionId);
 			}
 			function isUnknownSessionSelectError(error) {
-				return /sessions\.select: unknown session/i.test(String(error && error.message || error || ""));
+				return /sessions\.(?:select|retain): unknown session/i.test(String(error && error.message || error || ""));
 			}
 			async function openSessionWhenReady(sessionId) {
 				await sessionListRecoveryRef.current.open(sessionId);
@@ -13801,7 +13930,25 @@ function tavernFrameAssetBootstrap(access) {
 				await refresh();
 				setError("");
 			}
-            React.useEffect(function(){function navigate(event){const detail=event.detail||{};if(detail.sessionId)void openSessionWhenReady(detail.sessionId).then(()=>{setUiMode(groupOfMode(detail.mode||'story'));publishSessionMode(detail.sessionId,detail.mode||'story')}).catch(error=>setError(String(error.message||error)))}window.addEventListener('dsh-tavern-helper-navigate',navigate);return()=>window.removeEventListener('dsh-tavern-helper-navigate',navigate)},[]);
+            React.useEffect(function () {
+                function navigate(event) {
+                    const detail = event.detail || {};
+                    if (!detail.sessionId) return;
+                    const acknowledge = (status, error) => window.dispatchEvent(new CustomEvent('dsh-tavern-helper-navigation-result', {
+                        detail: { sessionId: detail.sessionId, requestId: detail.requestId, status, ...(error ? { error } : {}) }
+                    }));
+                    void openSessionWhenReady(detail.sessionId).then(() => {
+                        setUiMode(groupOfMode(detail.mode || 'story'));
+                        publishSessionMode(detail.sessionId, detail.mode || 'story');
+                        acknowledge('opened');
+                    }).catch(error => {
+                        const message = String(error.message || error);
+                        setError(message); acknowledge('failed', message);
+                    });
+                }
+                window.addEventListener('dsh-tavern-helper-navigate', navigate);
+                return () => window.removeEventListener('dsh-tavern-helper-navigate', navigate);
+            }, []);
 			async function finishPendingOpen(pending) {
 				await openSessionWhenReady(pending.sessionId);
 				setPendingOpen(null);
@@ -13831,6 +13978,7 @@ function tavernFrameAssetBootstrap(access) {
 				},
 				connectWorkspace: function (targetWorkspaceId) { return props.conversationHost.connectWorkspace(targetWorkspaceId); },
 				waitForSession: waitForSessionSummary,
+                usingSession: (id, operation) => props.navigation.using(id, operation),
 				ensurePreset: ensureTavernPreset,
 				createChat: function (request, sessionId) {
 					return call("startChat", {
@@ -13893,12 +14041,14 @@ function tavernFrameAssetBootstrap(access) {
 						localStorage.setItem(key, JSON.stringify(attempt));
 					}
 					await waitForSessionSummary(attempt.sessionId);
+                    await props.navigation.using(attempt.sessionId, async function () {
 					await ensureTavernPreset(attempt.sessionId, { kind: "play" });
 					const imported = await call("importChatHistory", Object.assign({}, attempt, { cardPath: chatImport.cardPath, text: chatImport.text, fileName: chatImport.fileName, userName: chatImport.userName, textOnly: chatImport.textOnly }));
 					const pending = { sessionId: attempt.sessionId, targetMode: imported.mode || "story" };
 					setPendingOpen(pending);
 					localStorage.removeItem(key);
 					await finishPendingOpen(pending);
+                    });
 					setChatImport(null);
 				} catch (error) { setError("导入失败：" + String(error.message || error)); }
 				finally { setBusy(false); }
@@ -13927,10 +14077,11 @@ function tavernFrameAssetBootstrap(access) {
                         return initialMessage ? { input: initialMessage, triggerOnly: false } : null;
                     },
                     create: async function () {
-                        let preparedSessionId = "";
-                        try { preparedSessionId = await playPrewarmRef.current.claim(card && card.path); }
+                        let preparedSessionId = "", preparedLease;
+                        try { preparedLease = await playPrewarmRef.current.claim(card && card.path, true); preparedSessionId = preparedLease && preparedLease.sessionId || ""; }
                         catch (prewarmError) { console.warn("dsh-tavern: 预热 Session 不可用，改为正常创建", prewarmError); }
-                        return conversationLifecycle.start({ kind: "play", targetMode: targetMode, card: card, preparationId: previousOpeningPicker && previousOpeningPicker.preparationId || "", openingId: openingId || "", userName: resolvedUserName, requestMode: compatibilityAvailable && requestMode === "sillytavern" ? "sillytavern" : "dsh", preparedSessionId: preparedSessionId, pending: { retainOpeningPreview: Boolean(previousOpeningPicker) } });
+                        try { return await conversationLifecycle.start({ kind: "play", targetMode: targetMode, card: card, preparationId: previousOpeningPicker && previousOpeningPicker.preparationId || "", openingId: openingId || "", userName: resolvedUserName, requestMode: compatibilityAvailable && requestMode === "sillytavern" ? "sillytavern" : "dsh", preparedSessionId: preparedSessionId, pending: { retainOpeningPreview: Boolean(previousOpeningPicker) } }); }
+                        finally { preparedLease && preparedLease.release && preparedLease.release(); }
                     },
                     send: async function (created, command) {
                         if (command) await props.executeSlash(command.triggerOnly ? "/trigger" : "/send " + substituteTavernIdentityMacros(command.input, { playerName: resolvedUserName, characterName: card && card.name }) + "|/trigger", created.sessionId, { verifyResult: true });
@@ -14049,7 +14200,7 @@ function tavernFrameAssetBootstrap(access) {
 					const target = history.filter(function (item) {
 						return isPlayMode(item.mode) && (item.requestMode === "sillytavern" ? "sillytavern" : "dsh") === nextRequestMode;
 					})[0];
-					if (!target) { props.sessions.clear(); openPicker(); return; }
+					if (!target) { props.navigation.clear(); openPicker(); return; }
 					if (target.sessionId !== current) await openSessionWhenReady(target.sessionId);
 				} catch (err) { setError("切换对话列表失败：" + String(err && err.message || err)); }
 				finally { setBusy(false); }
@@ -14068,11 +14219,13 @@ function tavernFrameAssetBootstrap(access) {
                         localStorage.setItem(key, JSON.stringify(attempt));
                     }
                     await waitForSessionSummary(attempt.sessionId);
+                    await props.navigation.using(attempt.sessionId, async function () {
                     await ensureTavernPreset(attempt.sessionId, { kind: "play" });
                     const result = await call("rescueChatHistory", { ...attempt, sourceChatId: item.chatId });
                     const pending = { sessionId: result.sessionId, targetMode: result.mode || "story" };
                     setPendingOpen(pending); localStorage.removeItem(key);
                     await finishPendingOpen(pending);
+                    });
                 } catch (err) { setError("存档救援未完成，旧存档未修改：" + String(err.message || err)); }
                 finally { setBusy(false); }
             }
@@ -14102,7 +14255,7 @@ function tavernFrameAssetBootstrap(access) {
 							return (entry.requestMode === "sillytavern" ? "sillytavern" : "dsh") === requestMode;
 						})[0];
 						if (next) await openSessionWhenReady(next.sessionId);
-						else { props.sessions.clear(); openPicker("cards"); }
+						else { props.navigation.clear(); openPicker("cards"); }
 					}
 					await refresh();
 				} catch (err) { setError(String(err && err.message || err)); }
@@ -14116,6 +14269,7 @@ function tavernFrameAssetBootstrap(access) {
 				try {
 					const plan = await call("prepareConversationFork", { chatId: item.chatId, sessionId: item.sessionId, turn: Number(turn) || 0 });
 					targetSessionId = await props.conversationHost.forkSession(item.sessionId, plan.atSeq);
+                    await props.navigation.using(targetSessionId, async function () {
 					await call("forkChat", {
 						chatId: item.chatId,
 						sessionId: item.sessionId,
@@ -14129,6 +14283,7 @@ function tavernFrameAssetBootstrap(access) {
 					const pending = { sessionId: targetSessionId, targetMode: item.mode };
 					setPendingOpen(pending);
 					await finishPendingOpen(pending);
+                    });
 				} catch (err) {
 					if (targetSessionId && !forkCreated) {
 						try { await props.archiveSession(targetSessionId); }
@@ -14189,7 +14344,7 @@ function tavernFrameAssetBootstrap(access) {
 			// A chat removed with its card never stays on screen, also while collapsed (upstream ba65bd02).
 			removedChatsHandler.current = function (sessionIds) {
 				if (!sessionIds.includes(current)) return;
-				props.sessions.clear();
+				props.navigation.clear();
 				const next = history.find(function (item) {
 					if (sessionIds.includes(item.sessionId) || groupOfMode(item.mode) !== uiMode) return false;
 					return uiMode !== "play" || (item.requestMode === "sillytavern" ? "sillytavern" : "dsh") === requestMode;
@@ -14215,7 +14370,7 @@ function tavernFrameAssetBootstrap(access) {
 				const title = item.title || (summary && summary.displayTitle ? summary.displayTitle : (item.cardName + "的新对话"));
 				return h(React.Fragment, { key: item.sessionId }, h("div", { className: "dsh-tavern-side-row" + (current === item.sessionId ? " active" : "") },
 					managing ? h("input", { type: "checkbox", checked: selectedChats.includes(item.chatId), disabled: busy, "aria-label": "选择对话：" + title, onChange: function () { toggleChatSelection(item.chatId); } }) : null,
-					h("button", { className: "dsh-tavern-side-row-main", disabled: busy, onClick: async function () {
+					h("button", { className: "dsh-tavern-side-row-main", "data-tavern-session-id": item.sessionId, disabled: busy, onClick: async function () {
 					if (managing) { toggleChatSelection(item.chatId); return; }
 					try {
 						if (summary && summary.blank) await call("ensureOpening", { sessionId: item.sessionId });
@@ -14441,18 +14596,20 @@ function tavernFrameAssetBootstrap(access) {
 					collapsed: !props.wide,
 					embedded: true,
 					sessions: ctx.sessions,
+                    navigation: tavernHostNavigationFor(ctx),
 					workspaces: ctx.workspaces,
 					conversationHost: createConversationHostAdapter(ctx),
                     executeSlash: createTavernFrameSlashExecutor(ctx),
 					renameSession: async function (sessionId, title) {
-						const session = ctx.sessions.binding(sessionId)?.session;
-						if (session === undefined) throw new Error("找不到该对话");
-						const result = await session.rename(title);
+						const result = await tavernHostNavigationFor(ctx).using(sessionId, reference => {
+                            if (!reference.binding?.session) throw new Error("找不到该对话");
+                            return reference.binding.session.rename(title);
+                        });
 						if (!result.ok) throw new Error(result.error.message);
 						await rpc("renameConversation", { sessionId, title }, sessionId);
 						notifyTavernDataChanged(["sessions"], "conversation.rename");
 					},
-					archiveSession: function (sessionId) { return ctx.workspaces.archiveSession(sessionId); },
+					archiveSession: function (sessionId) { return tavernHostNavigationFor(ctx).archive(sessionId); },
 					toggleSidebar: function () { if (props.wide) ctx.layout.toggleSidebar(); else props.expandSidebar(); },
 					openStatusTab: function (sessionId) { ctx.betterSidebar.openTab({ type: "dsh-tavern:status" }, { sessionId: sessionId }); },
 					openCardLibraryTab: function (sessionId) { ctx.betterSidebar.openTab({ type: "dsh-tavern:cards" }, { sessionId: sessionId }); ctx.betterSidebar.updateTab("dsh-tavern:cards", { meta: null }); },
@@ -16720,7 +16877,7 @@ function tavernFrameAssetBootstrap(access) {
 				component: function (props) {
 					return React.createElement(CardLibraryTab, Object.assign({}, props, {
 						appendMention: function (path, label) { appendMention(props.scope.sessionId, "card", path, label); },
-						archiveSession: function (sessionId) { return ctx.workspaces.archiveSession(sessionId); },
+						archiveSession: function (sessionId) { return tavernHostNavigationFor(ctx).archive(sessionId); },
 						openWorldBook: function (source) {
 							ctx.betterSidebar.openTab({ type: "dsh-tavern:worldbooks" }, { sessionId: props.scope.sessionId });
 							ctx.betterSidebar.updateTab("dsh-tavern:worldbooks", { meta: { worldBookSource: source, worldBookRequest: ++worldBookRequest } });
@@ -18349,8 +18506,7 @@ function tavernFrameAssetBootstrap(access) {
 				} }, "✎ 自由行动（直接在下方输入）") : null,
 				expanded && panel.phase === "ready" && panel.traceSessionId ? h("button", { className: "dsh-tavern-question-free", title: panel.traceMode === "continuable" ? "打开持续存在的后台 Agent" : "打开后台候选任务的推理与工具调用记录", onClick: async function () {
 					try {
-						await props.sessions.refreshSubagents(panel.sessionId);
-						props.sessions.openSubagent({ parentSessionId: panel.sessionId, childSessionId: panel.traceSessionId, mode: panel.traceMode });
+						await props.navigation.openChild({ parentSessionId: panel.sessionId, childSessionId: panel.traceSessionId, mode: panel.traceMode });
 					} catch (err) {
 						tavernErrorHub.report("后台 Agent 轨迹", "无法打开后台 Agent 轨迹：" + String(err && err.message || err));
 					}
@@ -18519,7 +18675,7 @@ function tavernFrameAssetBootstrap(access) {
 				function (props) { return React.createElement(React.Fragment, null,
 					React.createElement(SupersededTurnErrors, Object.assign({}, props, { key: props.sessionId })),
 					React.createElement(TurnHistoryProjection, Object.assign({}, props, { key: "history:" + props.sessionId })),
-					React.createElement(CandidateQuestion, Object.assign({}, props, { sessions: ctx.sessions }))
+					React.createElement(CandidateQuestion, Object.assign({}, props, { sessions: ctx.sessions, navigation: tavernHostNavigationFor(ctx) }))
 				); }
 			)), "dsh-tavern: candidate question panel");
 			ctx.effect(() => slots.inject("conversation.input.dock", () => slots.register(
@@ -18701,7 +18857,7 @@ function tavernFrameAssetBootstrap(access) {
 		            );
 				}
 
-		const inject = ["slots", "sessions", "workspaces", "layout", "connection", "conversation", "betterSidebar", "remote", "remote.commands", "tavernSessionSignals"];
+		const inject = ["slots", "sessions", "uiWorkspace", "workspaces", "layout", "connection", "conversation", "betterSidebar", "remote", "remote.commands", "tavernSessionSignals"];
 
 		function apply(ctx) {
 			ctx.effect(() => displayPreferences.start(), "dsh-tavern: global display preferences");
@@ -18932,6 +19088,9 @@ function tavernFrameAssetBootstrap(access) {
 		exports.groupTavernHistory = groupTavernHistory;
 		exports.createPlayWorkspaceResolver = createPlayWorkspaceResolver;
 		exports.createSessionListRecoveryModule = createSessionListRecoveryModule;
+        exports.createTavernHostNavigation = createTavernHostNavigation;
+        exports.tavernCurrentSessionId = tavernCurrentSessionId;
+        exports.tavernSubagentCatalog = tavernSubagentCatalog;
 		exports.installOpeningHostComposer = installOpeningHostComposer;
         exports.installFrameHostComposer = installFrameHostComposer;
 		exports.createConversationLifecycleModule = createConversationLifecycleModule;

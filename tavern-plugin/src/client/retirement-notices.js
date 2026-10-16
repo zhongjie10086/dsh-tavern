@@ -3,7 +3,7 @@
 function createTavernRetirementNoticeFeature(options) {
     const React = options.React, h = React.createElement;
     const listeners = new Set();
-    let state = { phase: 'idle', notices: [] }, sessions, active = false;
+    let state = { phase: 'idle', notices: [] }, sessions, navigation, active = false;
     let epoch = 0, pending = null, repeat = false, controller;
     function publish(next) { state = next; for (const listener of listeners) listener(); }
     function getSnapshot() { return state; }
@@ -30,13 +30,13 @@ function createTavernRetirementNoticeFeature(options) {
             });
         return pending;
     }
-    function connect(nextSessions) {
-        sessions = nextSessions; active = true; epoch++;
+    function connect(nextSessions, nextNavigation) {
+        navigation = nextNavigation; sessions = nextSessions; active = true; epoch++;
         function signature() {
             const snapshot = sessions.list.getSnapshot();
-            return JSON.stringify([snapshot.current,
+            return JSON.stringify([tavernCurrentSessionId(sessions, snapshot),
                 Object.values(snapshot.byId || {}).map(function (row) { return [row.id, row.parentId, row.origin, row.displayTitle, row.running]; }),
-                Object.entries(snapshot.subagentsByParent || {}).map(function ([id, catalog]) { return [id, catalog.state, catalog.entries]; })]);
+                [...new Set([...Object.keys(snapshot.subagentsByParent || {}), ...Object.keys(snapshot.projectionsBySession || {})])].map(function (id) { const catalog = tavernSubagentCatalog(sessions, id, snapshot); return [id, catalog?.state, catalog?.entries]; })]);
         }
         let previous = signature();
         const stop = sessions.list.subscribe(function () {
@@ -69,12 +69,8 @@ function createTavernRetirementNoticeFeature(options) {
             const ticket = life.current, connection = epoch;
             setError('');
             try {
-                await sessions.refreshSubagents(row.parentSessionId);
-                if (!active || epoch !== connection || life.current !== ticket) return;
-                const catalog = sessions.list.getSnapshot().subagentsByParent?.[row.parentSessionId];
-                const entry = catalog?.state === 'ready' && catalog.entries.find(function (entry) { return entry.id === row.sessionId && entry.kind === 'child'; });
-                if (!entry || !['continuable', 'one-shot'].includes(entry.mode)) throw new Error('unavailable');
-                sessions.openSubagent({ parentSessionId: row.parentSessionId, childSessionId: row.sessionId, mode: entry.mode });
+                await navigation.openChild({ parentSessionId: row.parentSessionId, childSessionId: row.sessionId },
+                    { isCurrent: () => active && epoch === connection && life.current === ticket });
             } catch (_) {
                 if (active && epoch === connection && life.current === ticket) setError('子会话暂不可打开，请刷新原生子会话目录后重试');
             }
@@ -99,7 +95,7 @@ function createTavernRetirementNoticeFeature(options) {
     function Row(props) { return NoticeList(props); }
     function Header(props) { return NoticeList({ sessionId: props.sessionId, header: true }); }
     function register(input) {
-        input.ctx.effect(function () { return connect(input.ctx.sessions); }, 'dsh-tavern: retirement notice reads');
+        input.ctx.effect(function () { return connect(input.ctx.sessions, tavernHostNavigationFor(input.ctx)); }, 'dsh-tavern: retirement notice reads');
         input.ctx.effect(function () {
             return input.slots.inject('conversation.session.header.actions', function () {
                 return input.slots.register({ name: 'conversation.session.header.actions', id: 'dsh-tavern-retirement-notices', order: 20 }, Header);

@@ -46,8 +46,8 @@ export function planNativeHistoryEdit(session, items, { id=randomUUID() }={}) {
     if(item.floorKey)bindings[item.floorKey]=message.id
     if(message.role==='user' && item.event?.type!=='tool/result') {
       closeStep();add('user/message',message,{surfaceOp:'append'})
-    } else if(message.role==='system') {
-      openStep();add('system/message',{turn,step,message},{surfaceOp:'append'})
+    } else if(message.role==='system'||message.role==='developer') {
+      openStep();add(message.role==='developer'?'developer/message':'system/message',{turn,step,message,...message.role==='developer'&&item.event?.data?.headerSeq!==undefined?{headerSeq:item.event.data.headerSeq}:{}},{surfaceOp:'append'})
     } else if(message.role==='assistant') {
       closeStep();openStep()
       const toolCalls=[]
@@ -64,6 +64,7 @@ export function planNativeHistoryEdit(session, items, { id=randomUUID() }={}) {
       const oldCall=message.source?.callId, callId=calls.get(oldCall)
       if(!open||!callId)throw new Error('历史工具结果没有对应调用: '+oldId)
       message.source={...message.source,callId}
+      if(session.header?.version>=4)message.toolCallId=callId
       for(const block of message.content)if(block.type==='tool-result')block.toolCallId=callId
       calls.delete(oldCall)
       add('tool/result',{...item.event?.data,turn,step,message},{surfaceOp:'append'})

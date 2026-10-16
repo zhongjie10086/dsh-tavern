@@ -287,6 +287,10 @@ export async function apply(ctx) {
 
   await clearLegacyTavernDefault(ctx.get('settings'))
   const llm = ctx.get('llm')
+  // V4 settings exposes active entry values through describe(), keyed by ns.
+  const modelSettings = { get(ns) {
+    return ctx.get('settings').describe().find(entry => entry.ns === ns)?.value
+  } }
   const agentRegistry = ctx.get('agents')
   let toolRestrictions
   const sessionStore = ctx.get('sessions')
@@ -469,16 +473,20 @@ export async function apply(ctx) {
   ctx.on('fs/observed',(target)=>filesystemSkills.observeHostMutation(target.displayPath))
   async function writingSkillsFor(chat){return (await tavernSkills.list()).filter(skill=>skill.purpose==='writing').map(skill=>({name:skill.name,description:skill.description,enabled:Array.isArray(chat?.disabledWritingSkills)&&!chat.disabledWritingSkills.includes(skill.name)}))}
 
-  // ---------- profile 私有 preset ----------
-  // rc.6 启动器会固定系统 roots，因此在独立 Tavern 进程内追加 profile 自带目录。
-  // 不写入全局 `.agent-presets`，避免 Tavern 出现在普通 Web profile 的模式列表。
-  const agentPresetsProxy = ctx.get('agentPresets')
-  if (agentPresetsProxy === undefined) throw new Error('dsh-tavern: 缺少 agentPresets 服务')
-  const agentPresets = agentPresetsProxy[Symbol.for('cordis.original')] || agentPresetsProxy
-  const presetSourceDir = fileURLToPath(new URL('../../presets/', import.meta.url))
-  if (!agentPresets.resolvedRoots.some(function (root) { return root.path === presetSourceDir })) {
-    agentPresets.resolvedRoots.unshift({ path: presetSourceDir, trust: 'user' })
-  }
+  // The native include requires a literal path. Resolve it from this shipped
+  // module, preserving the preset file's own base for its relative imports.
+  ctx.effect(async function* () {
+    for (const [id, name] of [['tavern', '酒馆模式'], ['tavern-background', '酒馆后台任务']]) {
+      yield await ctx.get('agentPresets').register({
+        id, name,
+        plugins: [{
+          id: id + '-composition',
+          name: '@deepseek-ai/cordis-plugin-include',
+          config: { path: new URL('../../presets/' + id + '/agent.cordis.yml', import.meta.url).href }
+        }]
+      })
+    }
+  }, 'Tavern native preset definitions')
 
   // ---------- 基础工具 ----------
   function uid(prefix) {
@@ -601,7 +609,7 @@ export async function apply(ctx) {
     const sel = opts.modelSelection || modelSelection(opts.sessionId)
     if (sel === null) throw new Error('没有可用的模型配置，请先在当前会话的模型选择器中选择模型')
     if (needsHelperWireOptions(opts)) {
-      const api=opts.customApi||{},dependencies={llm,settings:ctx.get('settings'),credentials:ctx.get('credentials')};
+      const api=opts.customApi||{},dependencies={llm,settings:modelSettings,credentials:ctx.get('credentials')};
       const wire=await configuredPresetWire(sel,{},dependencies);
       if(wire || opts.jsonSchema || opts.toolChoice&&!['auto','none'].includes(opts.toolChoice) || unsupportedPresetSampling(api).length || ['custom_include_body','custom_exclude_body','custom_include_headers'].some(key=>api[key]!==undefined)) return callConfiguredHelperApi(opts,sel,dependencies);
     }
@@ -934,7 +942,7 @@ export async function apply(ctx) {
   function configuredModelOrigins() {
     const origins = []
     for (const descriptor of llm.listConfigurableProviders()) {
-      let profile = ctx.get('settings')?.get(descriptor.settingsNs)
+      let profile = modelSettings.get(descriptor.settingsNs)
       for (const key of descriptor.settingsPath || []) profile = profile?.[key]
       if (typeof profile?.baseURL === 'string') { try { origins.push(new URL(profile.baseURL).origin) } catch {} }
     }
@@ -974,7 +982,7 @@ export async function apply(ctx) {
   const playManagement=createPlayManagement({settings:readTavernSettings,validateModel:selection=>llm.resolveCallConfig(selection),store:profileData,chats:{forSession:chatForSession,update:updateChat},presets:presetLibrary,builtinSnapshot:async()=>scriptLibrary.snapshot(await migrationSettings.snapshot(null)),snapshotDatabase:databaseState,readScripts:async chat=>scriptScopeTrees(chat,(await readCardExtensions(chat.cardPath))?.helperScripts||[]),isBusy:chat=>backgroundTasks.activity(chat).busy||Boolean(chat.regenInProgress)||agentRegistry.get(chat.sessionId)?.phase?.kind==='running'})
   const helperPresets=createHelperPresetLibrary({presets:presetLibrary,chats:{forSession:chatForSession,update:updateChat},store:profileData,assertOwner:assertHelperOwner,isBusy:chat=>backgroundTasks.activity(chat).busy||Boolean(chat.regenInProgress)||agentRegistry.get(chat.sessionId)?.phase?.kind==='running'})
   const nativePresets=createNativePresetLibrary({presets:presetLibrary,chats:{forSession:chatForSession},store:profileData,assertOwner:assertHelperOwner,remove:path=>deletePreset(path),isBusy:chat=>backgroundTasks.activity(chat).busy||Boolean(chat.regenInProgress)||agentRegistry.get(chat.sessionId)?.phase?.kind==='running'})
-  const izumiConnection=createIzumiConnection({networkPolicy:async(sessionId,id)=>({trustedResource:(await scriptPolicy(await chatForSessionReadonly(sessionId),id)).capabilities.includes('network')}),store:profileData,allowedModelOrigins:configuredModelOrigins,chats:{forSession:chatForSession,update:updateChat},llm,settings:{get:(...args)=>ctx.get('settings')?.get(...args)},credentials:{resolve:(...args)=>ctx.get('credentials')?.resolve(...args)},selection:modelSelection,selectModel:request=>ctx.get('sessionController').selectModel(request),assertOwner:assertHelperOwner,isBusy:chat=>backgroundTasks.activity(chat).busy||Boolean(chat.regenInProgress)||agentRegistry.get(chat.sessionId)?.phase?.kind==='running'})
+  const izumiConnection=createIzumiConnection({networkPolicy:async(sessionId,id)=>({trustedResource:(await scriptPolicy(await chatForSessionReadonly(sessionId),id)).capabilities.includes('network')}),store:profileData,allowedModelOrigins:configuredModelOrigins,chats:{forSession:chatForSession,update:updateChat},llm,settings:modelSettings,credentials:{resolve:(...args)=>ctx.get('credentials')?.resolve(...args)},selection:modelSelection,selectModel:request=>ctx.get('sessionController').selectModel(request),assertOwner:assertHelperOwner,isBusy:chat=>backgroundTasks.activity(chat).busy||Boolean(chat.regenInProgress)||agentRegistry.get(chat.sessionId)?.phase?.kind==='running'})
   let resourceGraph
   const resourceIdentities=createResourceVersionRegistry(profileData)
   const gameResourceBindings=createGameResourceBindings({chats:{forSession:chatForSessionReadonly,update:updateChat},presets:presetLibrary,identities:resourceIdentities,
@@ -5221,13 +5229,13 @@ export async function apply(ctx) {
     let config=await next()
     // The host has resolved this request's actual model. Background work must
     // not inherit the parent's preset, Izumi connection, or foreground cap.
-    if(backgroundAgentRunner.owns(sessionId))return configuredBackgroundOutput(config,{llm,settings:ctx.get('settings')})
+    if(backgroundAgentRunner.owns(sessionId))return configuredBackgroundOutput(config,{llm,settings:modelSettings})
     const chat=sessionId?await chatForSessionReadonly(sessionId):null;
     if(chat&&!backgroundAgentRunner.owns(sessionId))config={...config,...nativePresetSampling(presetSampling(chat.resolvedRuntimePreset?.snapshot||effectiveGamePreset(chat)),config.provider)};
     let route
     if(chat?.izumiApiApplied){const current=await izumiConnection.read(sessionId);route=current.apiUrl;config={...config,...(current.temperature!==''?{temperature:current.temperature}:{}),...(current.maxTokens!==''?{maxTokens:current.maxTokens}:{})}}
     if(chat&&!backgroundAgentRunner.owns(sessionId)){
-      const limit=configuredOutputLimit(config,{llm,settings:ctx.get('settings')},route)
+      const limit=configuredOutputLimit(config,{llm,settings:modelSettings},route)
       if(limit&&Number.isSafeInteger(config.maxTokens)&&config.maxTokens>limit.maxTokens){await recordModelOutputNotice(chat,{parameter:'max_tokens',requested:config.maxTokens,applied:limit.maxTokens,source:limit.source,model:config.model,provider:config.provider});config={...config,maxTokens:limit.maxTokens}}
     }
     return config
@@ -5289,7 +5297,7 @@ export async function apply(ctx) {
     assertOutboundEnabled()
     const sessionId = str(options && options.sessionId)
     if(backgroundAgentRunner.owns(sessionId)){
-      const capped=configuredBackgroundOutput(options,{llm,settings:ctx.get('settings')})
+      const capped=configuredBackgroundOutput(options,{llm,settings:modelSettings})
       if(capped!==options)return ctx.llm.stream(capped)
     }
     const coordinates = requestCoordinates.get(sessionId)
@@ -5359,11 +5367,11 @@ export async function apply(ctx) {
         if(!wire&&chat&&!backgroundContext&&!options.purpose){
           const sampling=presetSampling(chat.resolvedRuntimePreset?.snapshot||effectiveGamePreset(chat));
           if(Object.keys(sampling).length){
-            wire=await configuredPresetWire(options,sampling,{llm,settings:ctx.get('settings'),credentials:ctx.get('credentials')});
+            wire=await configuredPresetWire(options,sampling,{llm,settings:modelSettings,credentials:ctx.get('credentials')});
             if(!wire&&unsupportedPresetSampling(sampling).length)throw Error('当前模型适配器不能传递预设参数：'+unsupportedPresetSampling(sampling).join('、')+'；可选择已配置的 OpenAI 兼容连接');
           }
         }
-        if(wire){wire={...wire,outputLimit:configuredOutputLimit(options,{llm,settings:ctx.get('settings')},wire.config.apiUrl),onLimit:notice=>chat?recordModelOutputNotice(chat,notice):undefined}}
+        if(wire){wire={...wire,outputLimit:configuredOutputLimit(options,{llm,settings:modelSettings},wire.config.apiUrl),onLimit:notice=>chat?recordModelOutputNotice(chat,notice):undefined}}
         const stream = wire ? streamIzumiConnection(options, wire, { attachments: ctx.get('attachments'), allowedModelOrigins: configuredModelOrigins }) : next()
         for await (const chunk of stream) {
           if (chunk?.type==='text-delta') responseText += str(chunk.text)

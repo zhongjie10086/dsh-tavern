@@ -1,6 +1,6 @@
 # DSH Tavern · 社区修复版
 
-基于 DSH 的文字游戏项目，支持导入 SillyTavern 人物卡、世界书、预设、正则和已兼容的脚本。此分支提供安装与游玩所需的代码和资源，适配的 DSH 内核为 **0.1.5-rc.2**。
+基于 DSH 的文字游戏项目，支持导入 SillyTavern 人物卡、世界书、预设、正则和已兼容的脚本。此分支提供安装与游玩所需的代码和资源，适配的 DSH 内核为 **0.2.0-rc.2**。
 
 本分支维护于 [zhongjie10086/dsh-tavern](https://github.com/zhongjie10086/dsh-tavern/tree/release-r15-clean)，源自 [flizzywine/dsh-tavern](https://github.com/flizzywine/dsh-tavern)。第三方组件保留各自的来源和许可证。
 

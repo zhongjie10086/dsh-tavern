@@ -82,7 +82,7 @@ export function readSessionStablePrefix(session) {
 }
 
 function legacyEventText(session) {
-  const event = sessionEvents(session).find(item => item.type === EVENT && item.data?.version === 1 && item.data.id === 'tavern-session-prefix:' + session.id)
+  const event = sessionEvents(session).find(item => (item.type === EVENT || item.type === 'plugin:' + EVENT && item.ignorable === true) && item.data?.version === 1 && item.data.id === 'tavern-session-prefix:' + session.id)
   return str(event && event.data && event.data.text).trim()
 }
 

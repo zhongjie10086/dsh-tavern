@@ -15,7 +15,7 @@ export function createTavernTrigger({ foreground, resolveAgent }) {
     if (chat.id !== chatId) throw new Error('当前对话绑定已变化，请重新打开后再生成')
     const id = randomUUID(), before = agent.session.seq
     agent.followup(encodeTavernMessage({ id, role: 'user', content: text === undefined ? [] : [{ type: 'text', text }],
-      source: text === undefined ? { kind: 'plugin', plugin: 'dsh-tavern-trigger' } : { kind: 'user', rpcId: id } }))
+      source: text === undefined ? { kind: 'plugin', plugin: 'dsh-tavern-trigger' } : { kind: 'user', rpcId: id } },agent.session.header?.version))
     await agent.whenIdle()
     let turn = 0, ownTurn = 0, ended = null
     for (const event of sessionEvents(agent.session)) {

@@ -283,7 +283,7 @@ export function createRoundHistory({ chats, sessions, scripts, timeline, queueSe
         role: 'user',
         content: inputKind==='trigger'?[]:projectPlayerContent(msgs0[oldAssistantIndex - 1].inputAttachments, syntheticText),
         source: { kind: 'plugin', plugin: 'dsh-tavern-regen',regenerationId:regenerationRecord.id,...inputKind==='trigger'?{inputKind,targetAssistantId,guidance:guide}:{} }
-      }))
+      },agent.session.header?.version))
       await agent.whenIdle()
     } catch (error) {
       await restoreFailedRegen()

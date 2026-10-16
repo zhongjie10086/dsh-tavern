@@ -9,3 +9,4 @@ minimumReleaseAgeExclude:
   - dsh-better-sidebar@0.17.1
 patchedDependencies:
   dsh-better-sidebar@0.17.1: patches/dsh-better-sidebar@0.17.1.patch
+  dsh-web-mobile@2.3.0: patches/dsh-web-mobile@2.3.0.patch

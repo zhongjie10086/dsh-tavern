@@ -1,7 +1,7 @@
 diff --git a/lib/client.js b/lib/client.js
 --- a/lib/client.js
 +++ b/lib/client.js
-@@ -10649,6 +10649,11 @@ window.__ModuleLoader__.load({
+@@ -10649,6 +10649,11 @@
  			sidechatDispose: (childId) => call("sidechat.dispose", { childId }),
  			/** Live state + agent identity (provider/model/preset) of a thread. */
  			sidechatInfo: (childId) => call("sidechat.info", { childId }),
@@ -13,7 +13,7 @@ diff --git a/lib/client.js b/lib/client.js
  			/** The effective terminal shell and its display name (plugin-global). */
  			shellGet: () => call("shell.get", {}),
  			/** Read the side card preferences (plugin-global, no session scope). */
-@@ -16618,26 +16623,25 @@ Mode: this is a continuable side conversation. Your answers stay in this side th
+@@ -16618,26 +16623,25 @@
  				try {
  					if (cache.seedBoundary === null) {
  						const walk = await collectOwnEvents(async (beforeSeq) => {
@@ -53,7 +53,14 @@ diff --git a/lib/client.js b/lib/client.js
 diff --git a/lib/index.js b/lib/index.js
 --- a/lib/index.js
 +++ b/lib/index.js
-@@ -8,11 +8,22 @@ import { once } from "node:events";
+@@ -2,17 +2,28 @@
+ import { mkdir, open, opendir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+ import { WebSocket, WebSocketServer } from "ws";
+-import z from "schemastery";
++import z from "@deepseek-ai/schemastery";
+ import { createHash, randomUUID } from "node:crypto";
+ import { once } from "node:events";
  import { chmodSync, createWriteStream, existsSync, readFileSync, realpathSync } from "node:fs";
  import { fileURLToPath } from "node:url";
  import { spawn } from "node:child_process";
@@ -77,7 +84,26 @@ diff --git a/lib/index.js b/lib/index.js
  //#region src/prefs-shared.ts
  /**
  * Shared "Side card" preference vocabulary (types + constants), consumed by
-@@ -3027,7 +3038,7 @@ function buildJobsApi(ctx, outputLimit) {
+@@ -63,7 +74,7 @@
+ * @module dsh-better-sidebar/config
+ */
+ /** Schemastery schema for the plugin configuration. */
+-const Config = z.object({
++const HostConfig = z.object({
+ 	readLimit: z.number().step(1).min(1).default(524288),
+ 	mediaLimit: z.number().step(1).min(1).default(20971520),
+ 	uploadLimit: z.number().step(1).min(1).default(134217728),
+@@ -127,6 +138,9 @@
+ 	viewersEnabled: z.dict(z.boolean()).default({}),
+ 	pluginSettings: z.dict(z.dict(z.any())).default({})
+ });
++// New core exposes live preferences through the owning plugin Config.
++const Config = z.object({...HostConfig.dict,...Object.fromEntries(Object.entries(PrefsSchema.dict).map(([key,schema])=>[key,typeof schema.volatile === "function" ? schema.volatile() : schema]))});
++
+ //#endregion
+ //#region src/wire.ts
+ /** One API failure with its wire code and HTTP status. */
+@@ -3027,7 +3041,7 @@
  			const sessionId = requireString(payload, "sessionId");
  			const id = requireString(payload, "id");
  			const bySeq = /* @__PURE__ */ new Map();
@@ -86,7 +112,7 @@ diff --git a/lib/index.js b/lib/index.js
  				const trace = traceOf(event);
  				if (trace !== void 0) bySeq.set(trace.seq, trace);
  			}
-@@ -3422,7 +3433,7 @@ function buildSubagentLiveApi(ctx) {
+@@ -3422,7 +3436,7 @@
  			if (entry.kind !== "child" || entry.activity !== "running") continue;
  			if (entry.label?.startsWith("Side: ") ?? false) continue;
  			try {
@@ -95,7 +121,7 @@ diff --git a/lib/index.js b/lib/index.js
  				if (activity.text !== void 0 || activity.tool !== void 0) live[entry.id] = activity;
  			} catch {}
  		}
-@@ -3491,6 +3502,29 @@ async function composePersistedSetup(ctx, childId) {
+@@ -3491,6 +3505,29 @@
  		await presets.mount(agentCtx, resolved.id);
  	};
  }
@@ -125,7 +151,16 @@ diff --git a/lib/index.js b/lib/index.js
  /** One text-block prompt (the thread boundary + question, or a follow-up). */
  function textPrompt(text) {
  	return [{
-@@ -3544,8 +3578,8 @@ function buildSidechatApi(ctx) {
+@@ -3521,7 +3558,7 @@
+ function admitFirstContact(agent, injectionText, question) {
+ 	agent.inject(createUserMessage({
+ 		content: textPrompt(injectionText),
+-		source: {
++		source: agent.session.header?.version >= 4 ? { kind: "plugin:" + SIDE_INJECTION_PLUGIN } : {
+ 			kind: "plugin",
+ 			plugin: SIDE_INJECTION_PLUGIN
+ 		}
+@@ -3544,8 +3581,8 @@
  			const parent = liveThreadAgent(ctx, sessionId);
  			if (parent === void 0) throw new SidebarError("sidechat-error", `parent session "${sessionId}" is not running`, 409);
  			const parentSession = parent.session;
@@ -136,7 +171,7 @@ diff --git a/lib/index.js b/lib/index.js
  			const childId = `session-${randomUUID()}`;
  			const label = question === "" ? SIDE_NEW_THREAD_TITLE : sideLabel(question);
  			const descriptor = snapshotSubagentDescriptor({
-@@ -3613,10 +3647,12 @@ function buildSidechatApi(ctx) {
+@@ -3613,10 +3650,12 @@
  				const agents = ctx.get("agents");
  				if (agents?.resume === void 0) throw new SidebarError("sidechat-error", "the agents service is unavailable", 503);
  				const setup = await composePersistedSetup(ctx, childId);
@@ -150,7 +185,7 @@ diff --git a/lib/index.js b/lib/index.js
  					});
  					threadDisposers.set(childId, () => handle.dispose());
  					agent = handle.agent;
-@@ -3624,7 +3660,7 @@ function buildSidechatApi(ctx) {
+@@ -3624,7 +3663,7 @@
  					throw new SidebarError("sidechat-error", `thread resume failed: ${error instanceof Error ? error.message : String(error)}`, 500);
  				}
  			}
@@ -159,10 +194,11 @@ diff --git a/lib/index.js b/lib/index.js
  			else {
  				const parts = [SIDE_BOUNDARY_PROMPT];
  				const snapshot = pendingSnapshots.get(childId);
-@@ -3655,6 +3691,66 @@ function buildSidechatApi(ctx) {
+@@ -3654,6 +3693,66 @@
+ 				} catch {}
  			}
  			return { accepted: true };
- 		},
++		},
 +		/** One aligned history page of a side thread, served by this plugin itself.
 +		*  DSH 0.1.2-rc.1 exposes no client-visible session-history remote, and its
 +		*  session/page needs a throughSeq cursor the client cannot know, so the tab
@@ -222,19 +258,25 @@ diff --git a/lib/index.js b/lib/index.js
 +				events: page.filter((event) => event.type !== "session/end-seed" || event.seq === seedBoundary).map((event) => ({ event })),
 +				hasMore: cut > 0
 +			};
-+		},
+ 		},
  		"sidechat.info": async (payload) => {
  			const childId = requireString(payload, "childId");
- 			const agent = liveThreadAgent(ctx, childId);
-@@ -4130,7 +4226,7 @@ function apply(ctx, config) {
+@@ -4130,8 +4229,13 @@
  		}
  	};
  	ctx.inject(["settings"], (sctx) => {
 -		const ns = settingsNamespace(SIDEBAR_PREFS_NS);
-+		const ns = SIDEBAR_PREFS_NS;
- 		const scope = sctx.settings.register(ns, PrefsSchema);
+-		const scope = sctx.settings.register(ns, PrefsSchema);
++		const legacy = typeof sctx.settings.register === "function";
++		const ns = legacy ? SIDEBAR_PREFS_NS : ctx.fiber.entry?.options.id;
++		if (!ns) throw new Error("Sidebar settings require an owning profile entry");
++		const scope = legacy ? sctx.settings.register(ns, PrefsSchema) : {
++			get: () => Object.assign({}, SIDEBAR_PREFS_DEFAULTS, ...Object.keys(PrefsSchema.dict).map(key => ({[key]: config[key]?.get()})).filter(row=>Object.values(row)[0]!==undefined)),
++			watch: callback => sctx.on("settings/document-updated", changed => { if (changed === ns) callback(); })
++		};
  		const viewOf = () => {
  			const descriptor = sctx.settings.describe({ redactSecrets: true }).find((candidate) => candidate.ns === ns);
+ 			return descriptor === void 0 ? {
 diff --git a/package.json b/package.json
 --- a/package.json
 +++ b/package.json
@@ -246,3 +288,151 @@ diff --git a/package.json b/package.json
          "@deepseek-ai/dsh-client-locale",
          "@deepseek-ai/dsh-client-ui-slots",
          "@deepseek-ai/dsh-client-ui-conversation",
+@@ -74,22 +73,23 @@
+   "license": "MIT",
+   "peerDependencies": {
+     "@deepseek-ai/cordis": "^4.0.1",
+-    "@deepseek-ai/dsh-agent": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-client-ui-conversation": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-client-ui-settings": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-host-webserver": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-session": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-subagent": "^0.1.0-rc.8",
+-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.8",
++    "@deepseek-ai/dsh-agent": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-ui-conversation": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-ui-settings": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-host-webserver": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-llm": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-session": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-settings": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-subagent": "^0.1.0-rc.8 || 0.2.0-rc.2",
++    "@deepseek-ai/dsh-tools": "^0.1.0-rc.8 || 0.2.0-rc.2",
+     "@huanlin/dsh-plugin-better-locale": "^0.1.0",
+     "react": "^18.2.0",
+-    "react-dom": "^18.2.0"
++    "react-dom": "^18.2.0",
++    "@deepseek-ai/schemastery": ">=3.18.0 <4"
+   },
+   "peerDependenciesMeta": {
+     "@huanlin/dsh-plugin-better-locale": {
+@@ -171,4 +171,4 @@
+     "test:mount": "bash scripts/e2e-mount.sh",
+     "check:consumer-types": "bash scripts/check-consumer-types.sh"
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/cordis.patch.yml b/cordis.patch.yml
+--- a/cordis.patch.yml
++++ b/cordis.patch.yml
+@@ -22,7 +22,7 @@
+ # non-empty they replace the automatic POSIX `-l` login flag:
+ #
+ #   - insert:
+-#       - id: better-sidebar
++#       - id: dsh-better-sidebar
+ #         name: 'dsh-better-sidebar'
+ #         config:
+ #           shell: /bin/zsh
+@@ -44,6 +44,6 @@
+ # it, and no runtime singleton guard is added. Same-id manual duplicates still
+ # fail loudly at the loader as before.
+ - insert:
+-    - id: better-sidebar
++    - id: dsh-better-sidebar
+       name: 'dsh-better-sidebar'
+-      disabled: !!js "[...ctx.loader.entries()].some((e) => e.options.name === 'dsh-better-sidebar' && e.options.id !== 'better-sidebar' && !e.disabled)"
++      disabled: !!js "[...ctx.loader.entries()].some((e) => e.options.name === 'dsh-better-sidebar' && e.options.id !== 'dsh-better-sidebar' && !e.disabled)"
+
+diff --git a/lib/client.js b/lib/client.js
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -10436,6 +10436,7 @@
+ 		function registerTurnTailInterception(ctx, store) {
+ 			return ctx.slots.inject("conversation.chat.turnTail", () => ctx.slots.register({
+ 				name: "conversation.chat.turnTail",
++				id: "dsh-better-sidebar-produced-files",
+ 				select: (owner) => {
+ 					if (store.getSuspended()) return null;
+ 					if (store.getPrefs().tabsEnabled["editor"] === false) return null;
+@@ -10453,7 +10454,14 @@
+ 						revealInExplorer(ctx, store, sessionId, files);
+ 					}
+ 				})
+-			}, SidebarProducedFiles));
++			}, (props) => {
++                // V4 turnTail is a list: selectors are only invoked for chain slots.
++                if (store.getSuspended() || store.getPrefs().tabsEnabled["editor"] === false) return null;
++                const matched = selectProducedFiles(props);
++                if (matched === null) return null;
++                lastProduced = matched;
++                return SidebarProducedFiles({ ...props, matched });
++            }));
+ 		}
+ 		/**
+ 		* Register the chat file-open interception: wraps `ctx.workspaces.openPath`
+diff --git a/lib/client-registry.js b/lib/client-registry.js
+--- a/lib/client-registry.js
++++ b/lib/client-registry.js
+@@ -10436,6 +10436,7 @@
+ 		function registerTurnTailInterception(ctx, store) {
+ 			return ctx.slots.inject("conversation.chat.turnTail", () => ctx.slots.register({
+ 				name: "conversation.chat.turnTail",
++				id: "dsh-better-sidebar-produced-files",
+ 				select: (owner) => {
+ 					if (store.getSuspended()) return null;
+ 					if (store.getPrefs().tabsEnabled["editor"] === false) return null;
+@@ -10453,7 +10454,14 @@
+ 						revealInExplorer(ctx, store, sessionId, files);
+ 					}
+ 				})
+-			}, SidebarProducedFiles));
++			}, (props) => {
++                // V4 turnTail is a list: selectors are only invoked for chain slots.
++                if (store.getSuspended() || store.getPrefs().tabsEnabled["editor"] === false) return null;
++                const matched = selectProducedFiles(props);
++                if (matched === null) return null;
++                lastProduced = matched;
++                return SidebarProducedFiles({ ...props, matched });
++            }));
+ 		}
+ 		/**
+ 		* Register the chat file-open interception: wraps `ctx.workspaces.openPath`
+diff --git a/src/client/intercept.tsx b/src/client/intercept.tsx
+--- a/src/client/intercept.tsx
++++ b/src/client/intercept.tsx
+@@ -130,6 +130,7 @@
+ export function registerTurnTailInterception(ctx: Context, store: SidebarStore): () => void {
+   return ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
+     name: 'conversation.chat.turnTail',
++    id: 'dsh-better-sidebar-produced-files',
+     // Decline the takeover while the editor tab type is disabled in the side
+     // card settings: the produced-files row falls back to the default
+     // deliverables behavior instead of offering chips that cannot open. Also
+@@ -147,7 +148,14 @@
+       openInSidebar: (path: string) => { openSidebarFile(ctx, store, sessionId, path) },
+       onShowInFolder: (files: readonly string[]) => { revealInExplorer(ctx, store, sessionId, files) },
+     }),
+-  }, SidebarProducedFiles))
++  }, (props: Parameters<typeof SidebarProducedFiles>[0]) => {
++    // V4 turnTail is a list: selectors are only invoked for chain slots.
++    if (store.getSuspended() || store.getPrefs().tabsEnabled['editor'] === false) return null
++    const matched = selectProducedFiles(props)
++    if (matched === null) return null
++    lastProduced = matched
++    return SidebarProducedFiles({ ...props, matched })
++  }))
+ }
+ 
+ /**

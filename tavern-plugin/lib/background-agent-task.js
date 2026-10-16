@@ -1,3 +1,4 @@
+import {encodeTavernMessage} from './domain/session-message-source.js'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import { prependSystemInstruction } from './domain/system-append.js'
 import { createBackgroundProgress } from './domain/background-progress.js'
@@ -413,12 +414,12 @@ export function createBackgroundAgentTask(options) {
       state.currentWorldbook = typeof options.resolveCurrentWorldbook === 'function'
         ? await options.resolveCurrentWorldbook(input) : undefined
       const eventStart = sessionEvents(agent.session).length
-      agent.followup({
+      agent.followup(encodeTavernMessage({
         id: randomUUID(),
         role: 'user',
         content: [{ type: 'text', text: backgroundPrompt(input.messages, input.turnContext, input.task, input.system, input) }],
         source: { kind: 'plugin', plugin: 'dsh-tavern' }
-      })
+      },agent.session.header?.version))
       await progress.wait(agent.whenIdle())
       runtimeInput.signal.throwIfAborted()
       const rawResult = finalMessage(sessionEvents(agent.session), eventStart)

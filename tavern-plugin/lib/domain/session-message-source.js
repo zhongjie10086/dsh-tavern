@@ -9,21 +9,24 @@ function freezeDeep(value) {
   }
   return value
 }
-export function encodeTavernSource(source) {
+export function encodeTavernSource(source, version = 4) {
   if (source?.kind !== 'plugin' || !source.plugin?.startsWith('dsh-tavern')) return source
-  if (source.form === 'notice' && typeof source.summary === 'string' && source.summary.startsWith(MARKER)) return source
-  // The native notice field is the supported text metadata envelope. Content is
-  // unchanged; this record never adds the metadata text to the model prompt.
-  return { kind: 'plugin', plugin: source.plugin, form: 'notice', summary: MARKER + JSON.stringify(source) }
+  const encoded = source.form === 'notice' && typeof source.summary === 'string' && source.summary.startsWith(MARKER)
+    ? source : { kind: 'plugin', plugin: source.plugin, form: 'notice', summary: MARKER + JSON.stringify(source) }
+  if (version < 4) return encoded
+  const {plugin, ...owned} = encoded
+  return {...owned, kind: 'plugin:' + plugin}
 }
 export function decodeTavernSource(source) {
-  if (source?.kind !== 'plugin' || !source.plugin?.startsWith('dsh-tavern') ||
-      source.form !== 'notice' || !source.summary?.startsWith(MARKER)) return source
   if (decodedSources.has(source)) return decodedSources.get(source)
+  const producer = source?.kind?.startsWith('plugin:dsh-tavern') ? source.kind.slice(7) : undefined
+  const logical = producer ? {...source,kind:'plugin',plugin:producer} : source
+  if (logical?.kind !== 'plugin' || !logical.plugin?.startsWith('dsh-tavern')) return source
+  if (logical.form !== 'notice' || !logical.summary?.startsWith(MARKER)) return logical
   let value
   try {
-    value = JSON.parse(source.summary.slice(MARKER.length))
-    if (value?.kind !== 'plugin' || value.plugin !== source.plugin) throw new Error('invalid source')
+    value = JSON.parse(logical.summary.slice(MARKER.length))
+    if (value?.kind !== 'plugin' || value.plugin !== logical.plugin) throw new Error('invalid source')
   } catch {
     invalidSources.add(source)
     if (Object.isFrozen(source)) decodedSources.set(source, source)
@@ -44,9 +47,9 @@ export function tavernSourceDiagnostics(events) {
   }
   return diagnostics
 }
-export function encodeTavernMessage(message) {
+export function encodeTavernMessage(message, version = 4) {
   if (!message || typeof message !== 'object') return message
-  const source = encodeTavernSource(message.source)
+  const source = encodeTavernSource(message.source, version)
   return source === message.source ? message : { ...message, source }
 }
 export function decodeTavernMessage(message) {
@@ -55,6 +58,10 @@ export function decodeTavernMessage(message) {
   return source === message.source ? message : { ...message, source }
 }
 export function decodeTavernEvent(event) {
+  if (event?.data?.message) {
+    const message = decodeTavernMessage(event.data.message)
+    if (message !== event.data.message) return {...event,data:{...event.data,message}}
+  }
   if (event && decodedEvents.has(event)) return decodedEvents.get(event)
   if (event?.type === 'user/message') {
     const data = decodeTavernMessage(event.data)
@@ -65,7 +72,8 @@ export function decodeTavernEvent(event) {
   return event
 }
 export function appendTavernEvent(session, type, data, intent) {
-  if (type === 'user/message') data = encodeTavernMessage(data)
+  if (type === 'user/message') data = encodeTavernMessage(data, session?.header?.version)
+  else if (session?.header?.version >= 4 && data?.message) data = {...data,message:encodeTavernMessage(data.message,session.header.version)}
   const event = intent ? session.append(type, data, intent) : session.append(type, data)
   return decodeTavernEvent(event)
 }

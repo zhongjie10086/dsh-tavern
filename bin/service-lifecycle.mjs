@@ -5,8 +5,6 @@ import { resolveDshCliEntry } from './plugin-dependencies.mjs'
 import path from 'node:path'
 import { newServiceControl, requestServiceStop } from './service-control.mjs'
 import { createDurableFilePromotion } from '../tavern-plugin/lib/durable-file-promotion.js'
-import { migrateSessionPrefixEvents } from './session-prefix-migration.mjs'
-import { upgradeNativeTavernSessions } from './native-session-upgrade.mjs'
 import { ensureSidebarDefaults } from './launcher-settings.mjs'
 import { startupTimeoutMs, waitForServiceStartup } from './service-startup.mjs'
 import { PROFILE_DIR, PID_FILE, SERVICE_FILE, PROFILE, SOURCE_ROOT, CLI_PORT, CLI_HOST, LOG_DIR, LOG_FILE, DSH_ROOT, FRONTEND_BOOTSTRAP_FILE, FRONTEND_BOOTSTRAP_VERSION, commandExists, runtimeEnvironment, RUNTIME_HOST, findDshCommand, resolveDshInvocation, sleep } from './launcher-environment.mjs'
@@ -316,17 +314,8 @@ async function startServiceLocked() {
 
   await ensureSidebarDefaults()
 
-  const prefixRepairs = await migrateSessionPrefixEvents({
-    sessionsRoot: path.join(DSH_ROOT, 'profile-data', PROFILE, 'sessions'),
-    backupRoot: path.join(DSH_ROOT, 'backups', 'tavern-stable-prefix-v1'),
-    quarantineRoot: path.join(DSH_ROOT, 'recovery', 'session-prefix'),
-  })
-  if (prefixRepairs.length) console.log(`已兼容修复 ${prefixRepairs.length} 份旧会话的固定背景事件，原文件已备份。`)
-
   const runtimeHost = RUNTIME_HOST
   const dsh = findDshCommand(runtimeHost)
-  const nativeUpgrade = await upgradeNativeTavernSessions({ root: path.join(DSH_ROOT, 'profile-data', PROFILE), dshEntry: () => resolveDshCliEntry({ dsh }) })
-  if (nativeUpgrade.upgraded) console.log('已升级 ' + nativeUpgrade.upgraded + ' 份旧会话至 DSH v3，原存档备份：' + nativeUpgrade.backup)
   const invocation = resolveDshInvocation(
     dsh,
     ['--profile', PROFILE, '--host', CLI_HOST, '--port', String(state.port), '--no-open'],
