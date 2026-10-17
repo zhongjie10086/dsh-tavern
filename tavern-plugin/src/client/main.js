@@ -2195,7 +2195,7 @@ window.__ModuleLoader__.load({
 			}
 			function coreOf(message) {
 				const core = copy(message); delete core.pluginData;
-				core.mes = String(message.message || ""); core.is_user = message.role === "user";
+				core.mes = String(message.message || ""); core.is_user = message.role === "user"; core.is_system = message.role === "system";
 				core.variables = copy(message.swipes_data || []);
 				return core;
 			}
@@ -2512,6 +2512,7 @@ window.__ModuleLoader__.load({
 				},
 				get characterId() { return context().character && typeof context().character === "object" ? 0 : undefined; },
 				chatCompletionSettings: {},
+                getChatCompletionModel: function () { const model = context().mainModel; return model && typeof model.model === 'string' ? model.model : ''; },
 				ToolManager: Object.freeze({ isToolCallingSupported: function () { return false; } }),
 				isToolCallingSupported: function () { return false; },
 				canPerformToolCalls: function () { return false; },
@@ -2747,7 +2748,11 @@ window.__ModuleLoader__.load({
 					releaseMvuOpening();
                     if(audioBridge&&(result.helperAudio||incoming?.helperAudio||result.contextUpdate&&state.helperAudio))audioBridge.sync(result.helperAudio||incoming?.helperAudio||state.helperAudio);
                     if (result.database) state.database = result.database;
-                    if (databaseBridge && state.database) databaseBridge.sync(state.database);if(presetBridge)presetBridge.sync();if(nativePresetBridge)nativePresetBridge.sync();
+                    if (databaseBridge && state.database) databaseBridge.sync(state.database);
+                    // Persistence-only drain cannot admit auxiliary preset reads in
+                    // its quarantined realm. Keep their revision stamps unchanged;
+                    // the next ordinary context update will refresh both catalogs.
+                    if(activeHostEventName!=="DSH_SP_DRAIN"){if(presetBridge)presetBridge.sync();if(nativePresetBridge)nativePresetBridge.sync();}
 					if (result.worldbook) state.worldbook = copy(result.worldbook);
                     for(const name of ["globalVariables","presetVariables","characterVariables","extensionSettings"])if(result[name])state[name]=copy(result[name]);
 					// Chat-data saves acknowledge their own submitted snapshot separately.
@@ -2762,7 +2767,7 @@ window.__ModuleLoader__.load({
                         const eventBody=window.document&&window.document.body, previousInert=eventBody&&eventBody.inert;
                         if(eventBody)eventBody.inert=true;
 						activeHostEventId = String(data.eventId || "");activeHostEventName=String(data.name||"");
-                        let finishOriginalHydration,originalHydrationError;
+                        let finishOriginalHydration,originalHydrationError,awaitOriginalStartup=false;
 						try {
                             if(data.name === "CHAT_CHANGED" && window.__dshOriginalExtensionState?.id === "sp-database")finishOriginalHydration=window.__dshBeginOriginalDatabaseHydration?.();
 							if (data.name === "mag_variable_update_ended" && suppliedArgs.length === 0) {
@@ -2784,6 +2789,13 @@ window.__ModuleLoader__.load({
 								const original = window.AutoCardUpdaterAPI;
 								if (typeof original?.refreshDataAndWorldbook !== "function") throw new Error("SP 原包缺少聊天数据刷新接口，当前仅可查看缓存。");
                                 if (await original.refreshDataAndWorldbook() !== true) throw Object.assign(new Error("SP 原包聊天数据初始化未完成，当前仅可查看缓存。"), { code: "DSH_TAVERN_SP_INITIALIZING" });
+                                // Keep subscriptions and companion startup parallel. Only the
+                                // final initialization receipt waits for SP's finite startup
+                                // restore, never for this event or the global work ledger.
+                                if(typeof original.__dshAwaitStartupReady === "function") {
+                                    awaitOriginalStartup=true;
+                                    await original.__dshAwaitStartupReady();
+                                }
 							}
 							return suppliedArgs;
 						} catch(error) { originalHydrationError=error;throw error; } finally {
@@ -2808,7 +2820,7 @@ window.__ModuleLoader__.load({
                                     // settings saves to this event; elsewhere a save reports its own failure.
                                     if(window.__dshOriginalExtensionState)await facade?.flush(recoveryCall);
                                 };
-                                if(releasing)await persistOriginal();
+                                if(releasing||awaitOriginalStartup)await persistOriginal();
                                 else await persistOriginal().catch(function(error){console.error(error);});
                                 await transport.drainEvent(String(data.eventId||''));
                             }
@@ -4165,7 +4177,9 @@ window.__ModuleLoader__.load({
                 if(value?.extensionSettings&&Object.hasOwn(value.extensionSettings,'regex'))context.extensionSettings={...context.extensionSettings,regex:clone(value.extensionSettings.regex)};
                 if(value?.regexScripts&&Object.hasOwn(value.regexScripts,'global'))context.regexScripts={...context.regexScripts,global:clone(value.regexScripts.global)};
 				const previous = fallback && typeof fallback === "object" ? fallback : {};
-				for (const key of ["character", "characterVariables", "chatId", "playerName", "characterName", "worldbook", "mvuExtraAnalysis"]) {
+				// Save acknowledgements project chat fields, not the full preset catalog
+				// revision. Retain its composite stamp until an actual view replaces it.
+				for (const key of ["character", "characterVariables", "chatId", "playerName", "characterName", "worldbook", "mvuExtraAnalysis", "helperPresetRevision"]) {
 					if (context[key] === undefined && previous[key] !== undefined) context[key] = clone(previous[key]);
 				}
 				if (!context.scriptVariables || typeof context.scriptVariables !== "object") context.scriptVariables = clone(previous.scriptVariables || {});
@@ -5332,7 +5346,7 @@ window.__ModuleLoader__.load({
 				const currentLease = lease;
 				runtime = createRuntime({
                     window: hostWindow, background:options?.background===true, rpc: (method,args,id,requestOptions)=>{
-                        if(currentLease.quarantined&&!(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline&&args.spRecoveryToken===currentLease.recoveryToken&&args.scriptId==='extension-sp-database'&&['saveTavernChatData','saveTavernExtensionSettings','publishTavernSpAuthorityCache'].includes(method)))return Promise.reject(new Error('SP 执行已隔离，仅允许显式保存重试'));
+                        if(currentLease.quarantined&&!(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline&&args.spRecoveryToken===currentLease.recoveryToken&&args.scriptId==='extension-sp-database'&&['saveTavernChatData','saveTavernExtensionSettings','publishTavernSpAuthorityCache'].includes(method)))return Promise.reject(new Error('SP 执行已隔离，仅允许显式保存重试（RPC: '+method+'; recoveryToken: '+(args.spRecoveryToken?'present':'missing')+'; recoveryWindow: '+(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline?'valid':'expired')+'）'));
                         return invoke(method,{...args,runtimeId:currentLease.id},id,requestOptions);
                     }, onMutation: invalidate,
 					onMvuLoadState: function (state) {

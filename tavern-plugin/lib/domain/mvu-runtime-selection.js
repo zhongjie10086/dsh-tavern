@@ -3,23 +3,45 @@ import { OFFICIAL_MVU_VERSION } from './official-mvu-assets.js'
 
 const text = value => typeof value === 'string' ? value : ''
 const hash = value => createHash('sha256').update(value).digest('hex')
+// Cache only byte-derived facts. Names, IDs and authored declarations can change
+// independently of content, and every public result remains caller-owned.
+const sourceMemo = new Map(), sourceMemoLimit = 16 * 1024 * 1024
+let sourceMemoBytes = 0
+function inspectSource(source) {
+  const previous = sourceMemo.get(source)
+  if (previous) { sourceMemo.delete(source); sourceMemo.set(source, previous); return previous }
+  const facts = { repository: /MagicalAstrogy\/MagVarUpdate/i.test(source), bundled: /(?:window|globalThis)\s*\.\s*Mvu\s*=/.test(source) }
+  const bytes = Buffer.byteLength(source, 'utf8') + 256
+  if (bytes <= sourceMemoLimit) {
+    while (sourceMemo.size && (sourceMemo.size >= 128 || sourceMemoBytes + bytes > sourceMemoLimit)) {
+      const oldest = sourceMemo.keys().next().value
+      sourceMemoBytes -= sourceMemo.get(oldest).bytes; sourceMemo.delete(oldest)
+    }
+    facts.bytes = bytes; sourceMemo.set(source, facts); sourceMemoBytes += bytes
+  }
+  return facts
+}
 
 /** Inspect executable resource declarations only, never mutable script variables. */
 export function inspectCardMvuDeclaration(script) {
   if (!script || script.type !== 'script') return null
   if (script.mvuRuntimeDeclaration && typeof script.mvuRuntimeDeclaration === 'object') return { ...script.mvuRuntimeDeclaration }
   const source = text(script.content)
-  const repository = /MagicalAstrogy\/MagVarUpdate/i.test(source)
+  const facts = inspectSource(source)
   const named = /^mvu(?:$|\b|脚本|核心)/i.test(text(script.name).trim())
   const declared = text(script.mvuVersion) || text(script.mvu?.version)
-  const bundled = /(?:window|globalThis)\s*\.\s*Mvu\s*=/.test(source)
-  if (!repository && !named && !declared && !bundled) return null
-  const reference = source.match(/MagicalAstrogy\/MagVarUpdate@([^/\s'"`?#]+)/i)?.[1]
+  if (!facts.repository && !named && !declared && !facts.bundled) return null
+  if (!facts.details) facts.details = {
+    reference: source.match(/MagicalAstrogy\/MagVarUpdate@([^/\s'"`?#]+)/i)?.[1],
+    remoteLoader: /\bimport\s*(?:\(|['"{*])|\brequire\s*\(/.test(source) && /https?:\/\//.test(source),
+    nonempty: Boolean(source.trim())
+  }
+  const {reference, remoteLoader, nonempty} = facts.details
   // An unversioned remote loader requests the host default. A supplied bundle
   // is itself a version, identified by its bytes even without a release label.
-  const remoteLoader = /\bimport\s*(?:\(|['"{*])|\brequire\s*\(/.test(source) && /https?:\/\//.test(source)
-  const explicit = Boolean(reference || declared || !remoteLoader && source.trim())
-  return { scriptId: text(script.id), explicit, requestedVersion: reference || declared || (explicit ? 'embedded-sha256:' + hash(source) : 'host-default'), sourceSha256: hash(source) }
+  const explicit = Boolean(reference || declared || !remoteLoader && nonempty)
+  const sourceSha256 = facts.sha256 ?? (facts.sha256 = hash(source))
+  return { scriptId: text(script.id), explicit, requestedVersion: reference || declared || (explicit ? 'embedded-sha256:' + sourceSha256 : 'host-default'), sourceSha256 }
 }
 
 /** Pure read projection: opening a game never resolves latest or writes pins. */

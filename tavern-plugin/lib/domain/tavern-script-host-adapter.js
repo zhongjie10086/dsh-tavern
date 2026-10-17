@@ -410,7 +410,10 @@ export function createTavernScriptHostAdapter(options = {}) {
     }
     if (!options.readChatRevision || !options.updateChat) throw new Error('插件聊天存储未连接')
     if(str(eventId).startsWith('mvu:')){assertTransactionEvent(settlementTransactions.get(str(sessionId)),eventId);throw new Error('临时 MVU 结算期间不能保存聊天插件数据，请稍后重试')}
-    const baselines = new Map(await Promise.all(revisions.map(async revision => [revision, await options.readChatRevision(chat.id, revision)])))
+    // resolveChat already read this persisted revision. Reuse it only within
+    // this request; historical revisions still pass through retention checks.
+    const baselines = new Map(await Promise.all(revisions.map(async revision => [revision,
+      revision === chat._storageRevision ? chat : await options.readChatRevision(chat.id, revision)])))
     const saved = await options.updateChat(chat.id, async function (latest) {
       await assertScriptEnabled(latest)
       if (latest.sessionId && str(latest.sessionId) !== str(sessionId)) throw new Error('聊天绑定已变化，插件数据未保存')

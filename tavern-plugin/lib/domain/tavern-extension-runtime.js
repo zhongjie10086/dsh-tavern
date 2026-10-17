@@ -2,6 +2,8 @@ import {fetchOriginalExtension,validateOriginalExtension,originalExtensionScript
 import {createHash} from 'node:crypto'
 import {parse} from 'acorn'
 import {safeOutboundFetch} from './outbound-network-policy.js'
+import {projectOriginalSp129} from './tavern-original-extension-129.js'
+import {immutableJsonSnapshot,mutableJsonDraft} from './json-draft.js'
 const clone=structuredClone,hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
 export const SP_EXTENSION_PACKAGE=Object.freeze({format:'dsh-tavern-extension',formatVersion:1,id:'sp-database',name:'SP·数据库',version:'9.2.4-dsh.5',hostApi:'sp-database/1',description:'数据库、填表工作台、召回推进、模板、隔离空间和数据管理。',serverCode:'export default function(host) { return host.createDatabase(); }',updateUrl:''})
 export function validateTavernExtension(document){
@@ -37,7 +39,7 @@ export async function createTavernExtensionRuntime({store,createDatabase,externa
  async function change(command,expectedRevision){const work=tail.catch(()=>{}).then(async()=>{
   if(Number(expectedRevision)!==registry.revision)throw new Error('扩展列表已变化，请刷新');if(busy())throw new Error('数据库任务正在执行，请等待结束后更新扩展')
   const previous=registry.installed;let next=clone(registry),candidate=current,candidateOriginal=currentOriginal
-  if(command.kind==='install'||command.kind==='restore'){const document=command.kind==='restore'?await store.readJson('extension-packages/'+command.digest+'.json'):command.package,pkg=validateTavernExtension(document);if(command.digest&&pkg.digest!==command.digest)throw new Error('扩展包与预览不一致');candidate=await instantiate(pkg);candidateOriginal=pkg.original||null;if(busy())throw new Error('数据库任务已开始，请稍后重试');await persistPackage(pkg);next.installed={id:pkg.id,name:pkg.name,version:pkg.version,digest:pkg.digest,enabled:true,installedAt:Date.now(),updateUrl:pkg.updateUrl,...(pkg.original?{source:'sillytavern',repository:pkg.original.repository,commit:pkg.original.commit,scopeSessionId:String(command.scopeSessionId??previous?.scopeSessionId??'')}: {})}}
+  if(command.kind==='install'||command.kind==='restore'){const document=command.kind==='restore'?await store.readJson('extension-packages/'+command.digest+'.json'):command.package,pkg=validateTavernExtension(document);if(command.digest&&pkg.digest!==command.digest)throw new Error('扩展包与预览不一致');if(pkg.original?.manifest.version==='1.2.9')projectOriginalSp129(pkg.original);candidate=await instantiate(pkg);candidateOriginal=pkg.original||null;if(busy())throw new Error('数据库任务已开始，请稍后重试');await persistPackage(pkg);next.installed={id:pkg.id,name:pkg.name,version:pkg.version,digest:pkg.digest,enabled:true,installedAt:Date.now(),updateUrl:pkg.updateUrl,...(pkg.original?{source:'sillytavern',repository:pkg.original.repository,commit:pkg.original.commit,scopeSessionId:String(command.scopeSessionId??previous?.scopeSessionId??'')}: {})}}
   else if(command.kind==='scope'){if(!previous||!currentOriginal)throw new Error('只有已安装的原仓库扩展可以切换试用范围');if(typeof command.scopeSessionId!=='string'||command.scopeSessionId.length>200)throw new Error('扩展试用范围无效');next.installed.scopeSessionId=command.scopeSessionId}
   else if(command.kind==='uninstall'){next.installed=null;candidate=null;candidateOriginal=null}
   else if(command.kind==='toggle'){if(!previous)throw new Error('扩展未安装');if(command.enabled===true&&!current)candidate=await instantiate(validateTavernExtension(await store.readJson('extension-packages/'+previous.digest+'.json')));next.installed.enabled=command.enabled===true}
@@ -47,6 +49,12 @@ export async function createTavernExtensionRuntime({store,createDatabase,externa
  });tail=work;return work}
  async function check(){if(!registry.installed?.updateUrl)return {available:false,message:'此扩展未配置发布者更新地址。可导入新版 DSH 扩展包，或安装当前随附版本。'};const response=await safeOutboundFetch(registry.installed.updateUrl,{redirect:'error',signal:AbortSignal.timeout(30000)});if(!response.ok)throw new Error('检查更新失败：HTTP '+response.status);let text='',size=0;const decoder=new TextDecoder();for await(const chunk of response.body){size+=chunk.length;if(size>2500000)throw new Error('更新包超过大小限制');text+=decoder.decode(chunk,{stream:true})}text+=decoder.decode();const result=preview(JSON.parse(text));return {available:!result.preview.unchanged,...result}}
  async function checkOriginal(ref='main'){const original=await fetchOriginalExtension(SP_ORIGINAL_REPOSITORY,ref);const result=preview({...SP_EXTENSION_PACKAGE,name:original.manifest.display_name,version:original.manifest.version,description:'从原仓库加载 SP·数据库，通过统一兼容层提供宿主接口。',original});return {available:!result.preview.unchanged,...result}}
- function scripts(sessionId){if(!installed()||!currentOriginal||registry.installed.scopeSessionId&&registry.installed.scopeSessionId!==sessionId)return [];return [originalExtensionScript(currentOriginal)]}
+ const scriptSnapshots=new WeakMap()
+ function scripts(sessionId){
+  if(!installed()||!currentOriginal||registry.installed.scopeSessionId&&registry.installed.scopeSessionId!==sessionId)return []
+  const script=originalExtensionScript(currentOriginal)
+  if(!scriptSnapshots.has(script))scriptSnapshots.set(script,immutableJsonSnapshot([script]))
+  return mutableJsonDraft(scriptSnapshots.get(script))
+ }
  return {database,readCache:sessionId=>createDatabase().read(sessionId),status,installed,usesOriginal,preview,change,check,checkOriginal,scripts,builtin:()=>clone(builtin),export:async()=>registry.installed?await store.readJson('extension-packages/'+registry.installed.digest+'.json'):clone(builtin)}
 }

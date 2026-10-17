@@ -2,6 +2,9 @@ import {createRemoteCacheBudget} from './remote-cache-budget.js'
 import { isHostOwnedMvu } from './tavern-helper-scripts.js'
 import { inspectCardMvuDeclaration } from './mvu-runtime-selection.js'
 import {safeOutboundFetch,readBoundedResponse} from './outbound-network-policy.js'
+import {isDeepStrictEqual} from 'node:util'
+import {immutableJsonSnapshot,mutableJsonDraft} from './json-draft.js'
+import {jsonBytes} from './readonly-json.js'
 
 function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
@@ -93,6 +96,8 @@ export function createTavernRemoteAssetPinStore(options = {}) {
   const memory = new Map()
   const assetsByUrl = new Map()
   const assetsByHash = new Map()
+  const extensionResults = []
+  let extensionResultBytes = 0
   const timeoutMs = options.timeoutMs || 8000
   const retryDelayMs = options.retryDelayMs ?? 30000
   const now = options.now || Date.now
@@ -363,7 +368,20 @@ export function createTavernRemoteAssetPinStore(options = {}) {
     }
     const uniquePins = Array.from(new Map(pins.map(function (pin) { return [pin.owner + '/' + pin.repo + '@' + pin.ref, pin] })).values())
     report({ stage: 'resources', durationMs: performance.now() - started, helperCount: helperScripts.length, regexCount: regexScripts.length, skippedCount: jobs.filter(job => job.script.enabled === false).length, failedCount: diagnostics.length })
-    return { helperScripts, regexScripts, diagnostics, pins: uniquePins }
+    const result = { helperScripts, regexScripts, diagnostics, pins: uniquePins }
+    // Observe all resources above on every call. Only the completed projection
+    // is shared, so eviction, deletion, failed loads and recovery remain visible.
+    const match = extensionResults.findIndex(row => isDeepStrictEqual(row.value, result))
+    if (match !== -1) {
+      const [row] = extensionResults.splice(match, 1); extensionResults.unshift(row)
+      return mutableJsonDraft(row.value)
+    }
+    const value = immutableJsonSnapshot(result), bytes = jsonBytes(value)
+    if (bytes <= 64 * 1024 * 1024) {
+      while (extensionResults.length && (extensionResults.length >= 4 || extensionResultBytes + bytes > 64 * 1024 * 1024)) extensionResultBytes -= extensionResults.pop().bytes
+      extensionResults.unshift({value,bytes}); extensionResultBytes += bytes
+    }
+    return mutableJsonDraft(value)
   }
 
 

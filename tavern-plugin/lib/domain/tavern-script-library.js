@@ -70,7 +70,7 @@ function updateOrigin(script) {
 export function flattenScriptTrees(trees, enabled = true, folder = '') {
   return (trees || []).flatMap(item => item.type === 'folder'
     ? flattenScriptTrees(item.scripts, enabled && item.enabled !== false, folder ? folder + '/' + item.name : item.name)
-    : [{ ...clone(item), enabled: enabled && item.enabled !== false, folder }])
+    : [{ ...cloneScriptFields(item), enabled: enabled && item.enabled !== false, folder }])
 }
 
 /** A frame can inspect its own presence without receiving other scripts or secrets. */

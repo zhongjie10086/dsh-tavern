@@ -12,7 +12,10 @@ function catalog(settings) {
  for(const row of Object.values(value.presets))if(typeof row?.templateStr!=='string'||!JSON.parse(row.templateStr))throw Error('原版 SP 模板内容损坏，原件已保留')
  return value
 }
-/** Storage adapter verified against SP 9.2.4/9.2.5's preset service. It only
+/** SP 1.2.9 retains 9.2.4/9.2.5's shujuku_v120 namespace and version-1
+ * {presets:{name:{templateStr,updatedAt}}} storage. Genuine preset-service tests
+ * cover both reads of migrated data and writes/deletions by the new service.
+ * This adapter only
  * appends named templates at migration; all subsequent management stays in SP. */
 export function createOriginalSpCatalog({store,legacy,status,fault=async()=>{}}) {
  let migrationError=''
@@ -21,7 +24,7 @@ export function createOriginalSpCatalog({store,legacy,status,fault=async()=>{}})
  async function migrate() {
   if(!owns())return null
   const version=status().installed.version
-  if(!['9.2.4','9.2.5'].includes(version))throw Error('原版 SP '+version+' 模板存储尚未验证，已保留旧库并停止迁移')
+  if(!['9.2.4','9.2.5','1.2.9'].includes(version))throw Error('原版 SP '+version+' 模板存储尚未验证，已保留旧库并停止迁移')
   let manifest=await store.readJson(manifestFile)
   if(manifest?.status==='completed')return manifest
   if(!manifest){

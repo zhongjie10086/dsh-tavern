@@ -1,3 +1,4 @@
+import {originalSpTableFields,originalSp129MaterialFields,originalSp129RecoveryFields} from './sp-original-fields.js'
 import {createHash,randomUUID} from 'node:crypto'
 import {publicSpTables,validateTableData} from './sp-database.js'
 
@@ -8,7 +9,7 @@ const empty=value=>value&&typeof value==='object'&&!Array.isArray(value)&&!Objec
 const validated=value=>empty(value)?clone(value):validateTableData(value)
 // SP 9.2.5 MESSAGE_TABLE_FIELDS_ACU / FIRST_MESSAGE_SCOPE_GUIDE_FIELDS_ACU.
 // These are original-package persistence, not a projection of the DSH cache.
-const tableFields=['TavernDB_ACU_IsolatedData','TavernDB_ACU_IndependentData','TavernDB_ACU_Data','TavernDB_ACU_SummaryData','TavernDB_ACU_Identity','TavernDB_ACU_LocalMessageAnchor','TavernDB_ACU_ModifiedKeys','TavernDB_ACU_UpdateGroupKeys','_acu_local_template_base_state_seeded']
+const tableFields=originalSpTableFields
 const scopeFields=['TavernDB_ACU_ScopedConfig','TavernDB_ACU_InternalSheetGuide','TavernDB_ACU_TableHeaderGuide']
 const metadataFields=scopeFields.flatMap(key=>[key,key+'__chatId'])
 const select=(value,keys)=>Object.fromEntries(keys.filter(key=>Object.hasOwn(value||{},key)).map(key=>[key,clone(value[key])]))
@@ -25,20 +26,23 @@ export function originalSpRollbackNeedsMaterialization(chat){
  return Object.values(slots).some(slot=>slot?.storageFrame?.version!==2||slot.storageFrame.checkpoint?.kind!=='full'||!slot.storageFrame.checkpoint.data||typeof slot.storageFrame.checkpoint.data!=='object'||Array.isArray(slot.storageFrame.checkpoint.data)||!Array.isArray(slot.storageFrame.logEntries))
 }
 export function captureOriginalSpPersistence(chat){
- return {messages:(chat.messages||[]).map(message=>({id:message.id,role:message.role,turn:message.turn,greeting:message.greeting,fields:select(message.tavernPluginData,[...tableFields,...scopeFields])})),metadata:select(chat.tavernPluginMetadata,metadataFields),extension:clone(chat.tavernPluginMetadata?.dsh_original_extensions?.['sp-database'])}
+ return {messages:(chat.messages||[]).map(message=>({id:message.id,role:message.role,turn:message.turn,greeting:message.greeting,fields:select(message.tavernPluginData,[...originalSp129RecoveryFields,...scopeFields])})),metadata:select(chat.tavernPluginMetadata,metadataFields),extension:clone(chat.tavernPluginMetadata?.dsh_original_extensions?.['sp-database'])}
 }
 // Same canonical form as the original's rollback-deletion receipt (key order free).
 export const originalSpFieldsDigest=value=>JSON.stringify(value,(key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.keys(item).sort().map(name=>[name,item[name]])):item)
-export const originalSpFloorFields=Object.freeze([...tableFields])
-export function originalSpFloorCarries(message){return tableFields.slice(0,4).some(key=>Object.hasOwn(message?.tavernPluginData||{},key))}
+export const originalSpFloorFields=originalSp129RecoveryFields
+export function originalSpFloorCarries(message){return [...tableFields.slice(0,4),...originalSp129MaterialFields].some(key=>Object.hasOwn(message?.tavernPluginData||{},key))}
 export function restoreOriginalSpPersistence(chat,saved,{deletion}={}){
+ const receiptFields=deletion?.receipt?.fieldNames
+ if(receiptFields!==undefined&&JSON.stringify(receiptFields)!==JSON.stringify(originalSp129RecoveryFields))throw Error('SP 原包删楼字段契约无效，未回退')
+ const deletionFields=receiptFields===undefined?tableFields:originalSp129RecoveryFields
  const matched=new Set()
  for(const [index,message]of (chat.messages||[]).entries()){
   const previous=saved.messages.find(row=>row.id&&message.id===row.id)||saved.messages[index]
   if(!previous||previous.role!==message.role||previous.turn!==message.turn||Boolean(previous.greeting)!==Boolean(message.greeting))continue
   matched.add(previous)
   const fields={...(message.tavernPluginData||{})}
-  for(const key of [...tableFields,...scopeFields])delete fields[key]
+  for(const key of [...originalSp129RecoveryFields,...scopeFields])delete fields[key]
   Object.assign(fields,clone(previous.fields));if(Object.keys(fields).length)message.tavernPluginData=fields;else delete message.tavernPluginData
  }
  if(deletion){
@@ -48,9 +52,9 @@ export function restoreOriginalSpPersistence(chat,saved,{deletion}={}){
   for(const row of deletion.receipt?.changed||[]){
    const message=chat.messages?.[row.index]
    if(!message||Boolean(row.user)!==(message.role==='user'))throw new Error('SP 原包删楼回执的楼层与回退后的剧情不一致，未回退')
-   if(originalSpFieldsDigest(select(message.tavernPluginData,tableFields))!==row.before)throw new Error('SP 原包数据在回退准备期间已变化，未回退；请重试')
-   const fields={...(message.tavernPluginData||{})};for(const key of tableFields)delete fields[key]
-   Object.assign(fields,select(row.fields,tableFields));if(Object.keys(fields).length)message.tavernPluginData=fields;else delete message.tavernPluginData
+   if(originalSpFieldsDigest(select(message.tavernPluginData,deletionFields))!==row.before)throw new Error('SP 原包数据在回退准备期间已变化，未回退；请重试')
+   const fields={...(message.tavernPluginData||{})};for(const key of deletionFields)delete fields[key]
+   Object.assign(fields,select(row.fields,deletionFields));if(Object.keys(fields).length)message.tavernPluginData=fields;else delete message.tavernPluginData
   }
  }else{
  // SP scans assistant floors for its latest checkpoint/log. When rollback

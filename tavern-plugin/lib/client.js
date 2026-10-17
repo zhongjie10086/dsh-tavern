@@ -763,7 +763,16 @@ function installTavernFileBridge(win, call) {
     const url = new URL(typeof input === 'string' ? input : input.url || String(input), win.document.baseURI);
     const local = url.origin === new URL(win.document.baseURI).origin;
     if(local&&url.pathname==='/api/backends/chat-completions/generate') {
-      try { if(String(init.method||'GET').toUpperCase()!=='POST'||typeof init.body!=='string')throw Error('模型请求必须使用 JSON POST');return await win.__dshStGenerateRequest(JSON.parse(init.body),init.signal); }
+      try {
+        if(String(init.method||'GET').toUpperCase()!=='POST'||typeof init.body!=='string')throw Error('模型请求必须使用 JSON POST');
+        const body=JSON.parse(init.body),source=body?.chat_completion_source;
+        // A native host connection has no separately configured endpoint or
+        // credentials. Explicit and incomplete custom connections must still
+        // reach the independent-API validator rather than use the main model.
+        const independent=['reverse_proxy','proxy_password','custom_url','custom_include_headers','api_key','apiKey','api_url','base_url','baseURL','headers','authorization','azure_base_url'];
+        const main=body&&typeof body==='object'&&!Array.isArray(body)&&(source===undefined||source==='')&&!independent.some(key=>Object.prototype.hasOwnProperty.call(body,key));
+        return await win.__dshStGenerateRequest(body,init.signal,{main:!!main});
+      }
       catch(error){if(error.name==='AbortError')throw error;return new win.Response(JSON.stringify({error:error.message}),{status:400,headers:{'content-type':'application/json'}});}
     }
     // Upstream galleries fetch the stored ST path when exporting, not the displayed img URL.
@@ -7919,7 +7928,7 @@ function tavernFrameAssetBootstrap(access) {
 			}
 			function coreOf(message) {
 				const core = copy(message); delete core.pluginData;
-				core.mes = String(message.message || ""); core.is_user = message.role === "user";
+				core.mes = String(message.message || ""); core.is_user = message.role === "user"; core.is_system = message.role === "system";
 				core.variables = copy(message.swipes_data || []);
 				return core;
 			}
@@ -8236,6 +8245,7 @@ function tavernFrameAssetBootstrap(access) {
 				},
 				get characterId() { return context().character && typeof context().character === "object" ? 0 : undefined; },
 				chatCompletionSettings: {},
+                getChatCompletionModel: function () { const model = context().mainModel; return model && typeof model.model === 'string' ? model.model : ''; },
 				ToolManager: Object.freeze({ isToolCallingSupported: function () { return false; } }),
 				isToolCallingSupported: function () { return false; },
 				canPerformToolCalls: function () { return false; },
@@ -8471,7 +8481,11 @@ function tavernFrameAssetBootstrap(access) {
 					releaseMvuOpening();
                     if(audioBridge&&(result.helperAudio||incoming?.helperAudio||result.contextUpdate&&state.helperAudio))audioBridge.sync(result.helperAudio||incoming?.helperAudio||state.helperAudio);
                     if (result.database) state.database = result.database;
-                    if (databaseBridge && state.database) databaseBridge.sync(state.database);if(presetBridge)presetBridge.sync();if(nativePresetBridge)nativePresetBridge.sync();
+                    if (databaseBridge && state.database) databaseBridge.sync(state.database);
+                    // Persistence-only drain cannot admit auxiliary preset reads in
+                    // its quarantined realm. Keep their revision stamps unchanged;
+                    // the next ordinary context update will refresh both catalogs.
+                    if(activeHostEventName!=="DSH_SP_DRAIN"){if(presetBridge)presetBridge.sync();if(nativePresetBridge)nativePresetBridge.sync();}
 					if (result.worldbook) state.worldbook = copy(result.worldbook);
                     for(const name of ["globalVariables","presetVariables","characterVariables","extensionSettings"])if(result[name])state[name]=copy(result[name]);
 					// Chat-data saves acknowledge their own submitted snapshot separately.
@@ -8486,7 +8500,7 @@ function tavernFrameAssetBootstrap(access) {
                         const eventBody=window.document&&window.document.body, previousInert=eventBody&&eventBody.inert;
                         if(eventBody)eventBody.inert=true;
 						activeHostEventId = String(data.eventId || "");activeHostEventName=String(data.name||"");
-                        let finishOriginalHydration,originalHydrationError;
+                        let finishOriginalHydration,originalHydrationError,awaitOriginalStartup=false;
 						try {
                             if(data.name === "CHAT_CHANGED" && window.__dshOriginalExtensionState?.id === "sp-database")finishOriginalHydration=window.__dshBeginOriginalDatabaseHydration?.();
 							if (data.name === "mag_variable_update_ended" && suppliedArgs.length === 0) {
@@ -8508,6 +8522,13 @@ function tavernFrameAssetBootstrap(access) {
 								const original = window.AutoCardUpdaterAPI;
 								if (typeof original?.refreshDataAndWorldbook !== "function") throw new Error("SP 原包缺少聊天数据刷新接口，当前仅可查看缓存。");
                                 if (await original.refreshDataAndWorldbook() !== true) throw Object.assign(new Error("SP 原包聊天数据初始化未完成，当前仅可查看缓存。"), { code: "DSH_TAVERN_SP_INITIALIZING" });
+                                // Keep subscriptions and companion startup parallel. Only the
+                                // final initialization receipt waits for SP's finite startup
+                                // restore, never for this event or the global work ledger.
+                                if(typeof original.__dshAwaitStartupReady === "function") {
+                                    awaitOriginalStartup=true;
+                                    await original.__dshAwaitStartupReady();
+                                }
 							}
 							return suppliedArgs;
 						} catch(error) { originalHydrationError=error;throw error; } finally {
@@ -8532,7 +8553,7 @@ function tavernFrameAssetBootstrap(access) {
                                     // settings saves to this event; elsewhere a save reports its own failure.
                                     if(window.__dshOriginalExtensionState)await facade?.flush(recoveryCall);
                                 };
-                                if(releasing)await persistOriginal();
+                                if(releasing||awaitOriginalStartup)await persistOriginal();
                                 else await persistOriginal().catch(function(error){console.error(error);});
                                 await transport.drainEvent(String(data.eventId||''));
                             }
@@ -10104,7 +10125,9 @@ function tavernFrameAssetBootstrap(access) {
                 if(value?.extensionSettings&&Object.hasOwn(value.extensionSettings,'regex'))context.extensionSettings={...context.extensionSettings,regex:clone(value.extensionSettings.regex)};
                 if(value?.regexScripts&&Object.hasOwn(value.regexScripts,'global'))context.regexScripts={...context.regexScripts,global:clone(value.regexScripts.global)};
 				const previous = fallback && typeof fallback === "object" ? fallback : {};
-				for (const key of ["character", "characterVariables", "chatId", "playerName", "characterName", "worldbook", "mvuExtraAnalysis"]) {
+				// Save acknowledgements project chat fields, not the full preset catalog
+				// revision. Retain its composite stamp until an actual view replaces it.
+				for (const key of ["character", "characterVariables", "chatId", "playerName", "characterName", "worldbook", "mvuExtraAnalysis", "helperPresetRevision"]) {
 					if (context[key] === undefined && previous[key] !== undefined) context[key] = clone(previous[key]);
 				}
 				if (!context.scriptVariables || typeof context.scriptVariables !== "object") context.scriptVariables = clone(previous.scriptVariables || {});
@@ -11271,7 +11294,7 @@ function tavernFrameAssetBootstrap(access) {
 				const currentLease = lease;
 				runtime = createRuntime({
                     window: hostWindow, background:options?.background===true, rpc: (method,args,id,requestOptions)=>{
-                        if(currentLease.quarantined&&!(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline&&args.spRecoveryToken===currentLease.recoveryToken&&args.scriptId==='extension-sp-database'&&['saveTavernChatData','saveTavernExtensionSettings','publishTavernSpAuthorityCache'].includes(method)))return Promise.reject(new Error('SP 执行已隔离，仅允许显式保存重试'));
+                        if(currentLease.quarantined&&!(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline&&args.spRecoveryToken===currentLease.recoveryToken&&args.scriptId==='extension-sp-database'&&['saveTavernChatData','saveTavernExtensionSettings','publishTavernSpAuthorityCache'].includes(method)))return Promise.reject(new Error('SP 执行已隔离，仅允许显式保存重试（RPC: '+method+'; recoveryToken: '+(args.spRecoveryToken?'present':'missing')+'; recoveryWindow: '+(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline?'valid':'expired')+'）'));
                         return invoke(method,{...args,runtimeId:currentLease.id},id,requestOptions);
                     }, onMutation: invalidate,
 					onMvuLoadState: function (state) {

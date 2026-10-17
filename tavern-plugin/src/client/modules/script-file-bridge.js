@@ -9,7 +9,16 @@ function installTavernFileBridge(win, call) {
     const url = new URL(typeof input === 'string' ? input : input.url || String(input), win.document.baseURI);
     const local = url.origin === new URL(win.document.baseURI).origin;
     if(local&&url.pathname==='/api/backends/chat-completions/generate') {
-      try { if(String(init.method||'GET').toUpperCase()!=='POST'||typeof init.body!=='string')throw Error('模型请求必须使用 JSON POST');return await win.__dshStGenerateRequest(JSON.parse(init.body),init.signal); }
+      try {
+        if(String(init.method||'GET').toUpperCase()!=='POST'||typeof init.body!=='string')throw Error('模型请求必须使用 JSON POST');
+        const body=JSON.parse(init.body),source=body?.chat_completion_source;
+        // A native host connection has no separately configured endpoint or
+        // credentials. Explicit and incomplete custom connections must still
+        // reach the independent-API validator rather than use the main model.
+        const independent=['reverse_proxy','proxy_password','custom_url','custom_include_headers','api_key','apiKey','api_url','base_url','baseURL','headers','authorization','azure_base_url'];
+        const main=body&&typeof body==='object'&&!Array.isArray(body)&&(source===undefined||source==='')&&!independent.some(key=>Object.prototype.hasOwnProperty.call(body,key));
+        return await win.__dshStGenerateRequest(body,init.signal,{main:!!main});
+      }
       catch(error){if(error.name==='AbortError')throw error;return new win.Response(JSON.stringify({error:error.message}),{status:400,headers:{'content-type':'application/json'}});}
     }
     // Upstream galleries fetch the stored ST path when exporting, not the displayed img URL.

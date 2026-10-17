@@ -3,7 +3,7 @@ import { composeTavernRegexScripts } from './card-extension-reading.js'
 import { newGameRuntimeSettings } from './play-runtime-settings.js'
 import { pinScriptScopeSnapshot } from './tavern-script-library.js'
 import { appendTavernEvent } from './session-message-source.js'
-import { sessionEvents } from './session-events.js'
+import { sessionEvents, ensureInitialSystemHead } from './session-events.js'
 import { createHash } from 'node:crypto'
 import { cardOpeningChoices, resolveCardOpening } from './card-openings.js'
 import { projectAgentContent, projectOpeningCommit } from './runtime-content-projection.js'
@@ -256,10 +256,11 @@ export function createConversationInitialization(options) {
     const events = openingEvents()
     const messageId = openingId(chat)
     const seeded = events.some(event => event.type === 'assistant/message' && event.data.message.source?.model === 'synthetic-trajectory')
+    const initialHead = !seeded && events.some(event=>event.type==='system/message'&&event.data.message?.id==='tavern-initial-system-head:'+session.id)
     const step = seeded ? 2 : 1
     const stages = [
-      ...seeded ? [] : [['turn/start', { turn: 1 }]],
-      ['step/start', { turn: 1, step }],
+      ...seeded || initialHead ? [] : [['turn/start', { turn: 1 }]],
+      ...initialHead ? [] : [['step/start', { turn: 1, step }]],
       ['assistant/message', { turn: 1, step, stream: [], message: {
         id: messageId,
         role: 'assistant',
@@ -284,11 +285,12 @@ export function createConversationInitialization(options) {
           && events[index + 2]?.type === 'turn/end' && events[index + 2]?.data.turn === 1
       })
     }
-    let start = messageIndex >= 0 ? messageIndex - (seeded ? 1 : 2) : events.length
+    const openingPrefix = initialHead ? 0 : seeded ? 1 : 2
+    let start = messageIndex >= 0 ? messageIndex - openingPrefix : events.length
     // An append can fail synchronously before the message. Only reuse the
     // unfinished trailing opening prefix, never delete or rewrite DSH history.
-    if (messageIndex < 0 && events.at(-1)?.type === 'step/start' && events.at(-1)?.data.turn === 1 && events.at(-1)?.data.step === step && (seeded || events.at(-2)?.type === 'turn/start' && events.at(-2)?.data.turn === 1)) start -= seeded ? 1 : 2
-    else if (messageIndex < 0 && events.at(-1)?.type === 'turn/start' && events.at(-1)?.data.turn === 1) start -= 1
+    if (!initialHead && messageIndex < 0 && events.at(-1)?.type === 'step/start' && events.at(-1)?.data.turn === 1 && events.at(-1)?.data.step === step && (seeded || events.at(-2)?.type === 'turn/start' && events.at(-2)?.data.turn === 1)) start -= seeded ? 1 : 2
+    else if (!initialHead && messageIndex < 0 && events.at(-1)?.type === 'turn/start' && events.at(-1)?.data.turn === 1) start -= 1
     for (let index = 0; index < stages.length; index++) {
       const [type, data, intent] = stages[index]
       const existing = openingEvents()[start + index]
@@ -318,6 +320,7 @@ export function createConversationInitialization(options) {
     }
     const text = openingText(chat, card)
     const target = readyTarget || await native.wait(sessionId)
+    ensureInitialSystemHead(target.session)
     if (groupOfMode(chat.mode) === 'play' && chat.requestMode !== 'sillytavern') {
       await native.ensurePrefix(target.session, await snapshots.ensure(chat, card))
       await ensureSessionSeedTrajectory(target.session)
@@ -338,6 +341,8 @@ export function createConversationInitialization(options) {
       await native.flush(target.session)
     }
     if (text === '' && sessionEvents(target.session).some(event => event.type === 'turn/start') && !sessionEvents(target.session).some(event => event.type === 'turn/end')) {
+      const lastStep=sessionEvents(target.session).findLast(event=>event.type==='step/start'||event.type==='step/end')
+      if(lastStep?.type==='step/start')target.session.append('step/end',{turn:lastStep.data.turn,step:lastStep.data.step})
       target.session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
       if (target.agent?.phase?.kind === 'idle') target.agent.phase.lastTurn = Math.max(Number(target.agent.phase.lastTurn) || 0, 1)
       await native.flush(target.session)

@@ -1,5 +1,5 @@
 import { appendTavernEvent } from './session-message-source.js'
-import { sessionEvents } from './session-events.js'
+import { sessionEvents, ensureInitialSystemHead } from './session-events.js'
 
 const VERSION = 1
 const TEXT = Object.freeze([
@@ -65,8 +65,9 @@ function visibleEvents(session) {
 
 function ensure(session) {
   if (!session || typeof session.append !== 'function' || str(session.id) === '') throw new Error('无法写入 Session 种子轨迹')
+  const initialHead=ensureInitialSystemHead(session)
   const messages = sessionSeedTrajectoryMessages(session.id)
-  const stages = [messages[0], { type: 'turn/start', data: { turn: 1 } }, { type: 'step/start', data: { turn: 1, step: 1 } }, messages[1], { type: 'step/end', data: { turn: 1, step: 1 } }, messages[2]]
+  const stages = [messages[0], ...initialHead?[]:[{ type: 'turn/start', data: { turn: 1 } }, { type: 'step/start', data: { turn: 1, step: 1 } }], messages[1], { type: 'step/end', data: { turn: 1, step: 1 } }, messages[2]]
   const expectedIds = messages.map((_, index) => id(session.id, index))
   const matches = (event, stage) => Boolean(event && event.type === stage.type && (messageId(stage) ? messageId(event) === messageId(stage) : event.data?.turn === stage.data.turn && event.data?.step === stage.data.step))
   const events = visibleEvents(session)
