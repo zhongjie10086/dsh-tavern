@@ -36,26 +36,33 @@ function installTavernScriptStorage(options) {
     }
     report();
   }
+  const protectedKey=(owner,key)=>owner==='extension-sp-database'&&String(key)==='__dsh_internal_sp129_vector_flush_v1';
   function change(kind, key, value, fixedOwner) {
     key = String(key); value = String(value);
     const { owner, data } = bucket(fixedOwner), q = queue(owner), lifecycle = Number(context().lifecycleRevision || 0);
     if ((q.operations.length || q.task || q.error) && q.lifecycleRevision !== lifecycle) throw new Error('脚本生命周期已变化，旧设置尚未保存');
+    if(kind!=='clear'&&protectedKey(owner,key))throw new Error('SP 向量任务保留键不可通过普通设置修改');
     // An existing pending or failed write retains its receipt/retry state.
     if ((kind === 'set' && own(data,key) && data[key] === value) || (kind === 'remove' && !own(data,key)) || (kind === 'clear' && Object.keys(data).length === 0)) return;
     if (kind === 'set') { if (key.length > 4096 || value.length > 8000000) throw new DOMException('脚本存储超过容量', 'QuotaExceededError'); Object.defineProperty(data, key, { value, enumerable: true, writable: true, configurable: true }); }
-    else if (kind === 'remove') delete data[key]; else for (const key of Object.keys(data)) delete data[key];
+    else if (kind === 'remove') delete data[key]; else for (const key of Object.keys(data)) {if(!protectedKey(owner,key))delete data[key];}
     q.lifecycleRevision = lifecycle; q.operations = compact([...q.operations, { kind, key, value }]); report();
     if(q.error&&retryable(q.error)){if(q.attempts>=3)q.attempts=0;retryLater(q);}
     if (!q.timer && !q.task && !q.error) q.timer = win.setTimeout(() => { q.timer = null; void flush(owner).catch(error => win.console.error('脚本本机设置保存失败', error)); }, 50);
   }
   function storageFor(owner) {
     const storage = {
-      getItem(key) { const { data } = bucket(owner); return own(data, String(key)) ? data[String(key)] : null; },
+      getItem(key) { const { data } = bucket(owner); return !protectedKey(owner,key)&&own(data, String(key)) ? data[String(key)] : null; },
       setItem(key,value) { change('set',key,value,owner); }, removeItem(key) { change('remove',key,undefined,owner); }, clear() { change('clear',undefined,undefined,owner); },
-      key(index) { return Object.keys(bucket(owner).data)[Number(index)] ?? null; }
+      key(index) { return Object.keys(bucket(owner).data).filter(key=>!protectedKey(owner,key))[Number(index)] ?? null; }
     };
-    Object.defineProperty(storage,'length',{get:()=>Object.keys(bucket(owner).data).length,configurable:true});
-    return new Proxy(storage,{get(target,key){return key in target || typeof key==='symbol' ? target[key] : target.getItem(key) ?? undefined},set(target,key,value){target.setItem(key,value);return true},deleteProperty(target,key){target.removeItem(key);return true},ownKeys(){return Object.keys(bucket(owner).data)},getOwnPropertyDescriptor(target,key){return own(bucket(owner).data,key)?{value:target.getItem(key),enumerable:true,configurable:true,writable:true}:Reflect.getOwnPropertyDescriptor(target,key)}});
+    if(owner==='extension-sp-database'){
+      const request=operation=>call('tavernScriptStorage',{operation:{...operation,kind:'sp-vector-flush'}},{scriptId:owner,lifecycleRevision:Number(context().lifecycleRevision||0)});
+      storage.__dshSpVectorFlushSnapshot=()=>request({action:'read'});
+      storage.__dshSpVectorFlushUpdate=operation=>request(operation);
+    }
+    Object.defineProperty(storage,'length',{get:()=>Object.keys(bucket(owner).data).filter(key=>!protectedKey(owner,key)).length,configurable:true});
+    return new Proxy(storage,{get(target,key){return key in target || typeof key==='symbol' ? target[key] : target.getItem(key) ?? undefined},set(target,key,value){target.setItem(key,value);return true},deleteProperty(target,key){target.removeItem(key);return true},ownKeys(){return Object.keys(bucket(owner).data).filter(key=>!protectedKey(owner,key))},getOwnPropertyDescriptor(target,key){return !protectedKey(owner,key)&&own(bucket(owner).data,key)?{value:target.getItem(key),enumerable:true,configurable:true,writable:true}:Reflect.getOwnPropertyDescriptor(target,key)}});
   }
   const owned = new Map();
   win.__dshTavernStorageFor = owner => { owner=String(owner); if(!owner)throw new Error('脚本存储缺少身份'); if(!owned.has(owner))owned.set(owner,storageFor(owner));return owned.get(owner); };

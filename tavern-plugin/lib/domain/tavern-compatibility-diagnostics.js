@@ -6,7 +6,7 @@ import { redactDiagnostic } from './mvu-diagnostics.js'
 export const TAVERN_COMPATIBILITY_CAPABILITIES = Object.freeze([
   ...['scrollChatToBottom', 'showLoader', 'hideLoader', 'unregisterMacro'].map(name => ({ surface: 'SillyTavern', name, policy: 'noop' })),
   ...['registerMacro'].map(name => ({ surface: 'SillyTavern', name, policy: 'reject' })),
-  ...['generate', 'stopGeneration', 'deleteLastMessage', 'deleteMessage', 'clearChat', 'openGroupChat'].map(name => ({ surface: 'SillyTavern', name, policy: 'missing' })),
+  ...['deleteMessage', 'clearChat', 'openGroupChat'].map(name => ({ surface: 'SillyTavern', name, policy: 'missing' })),
 
 ].map(entry => Object.freeze({ ...entry, id: entry.surface + '.' + entry.name })))
 

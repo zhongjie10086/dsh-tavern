@@ -120,6 +120,7 @@ export function projectTavernHelperContext(chat,{readonly=false}={}) {
     version: 1,
     serverEvents:chat?.tavernHelperServerEvents===true,
     chatId: str(chat && chat.id),
+    nativeInput: chat?.fullPromptTemplatePendingInput && chat.timeline?.operations?.[chat.fullPromptTemplatePendingInput.operationId]?.status === 'running' && chat.fullPromptTemplatePendingInput.lifecycleRevision === (Number(chat.tavernHelperLifecycleRevision)||0) && chat.fullPromptTemplatePendingInput.branchId === chat.timeline?.branchId ? {operationId:chat.fullPromptTemplatePendingInput.operationId,floor:chat.fullPromptTemplatePendingInput.floor,branchId:chat.timeline?.branchId||''} : null,
     databaseInitialized: !!chat?.spDatabase,
     legacyChatFileName: str(chat?.legacyChatFileName),
     personaDescription: str(chat?.tavernPersona?.description),

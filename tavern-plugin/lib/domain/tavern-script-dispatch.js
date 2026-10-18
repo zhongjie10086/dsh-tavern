@@ -33,6 +33,12 @@ export function createTavernScriptDispatch(options = {}) {
     for(const item of workListeners)if(item.sessionId===sessionId){try{item.listener(signal)}catch{}}
   }
   function subscribeWork(sessionId,listener){const item={sessionId:str(sessionId),listener};workListeners.add(item);return()=>workListeners.delete(item)}
+  function executingEvent(sessionId,runtimeId,eventId,leaseToken){
+    const record=records.get(str(sessionId));
+    if(!record||record.phase!=='executing'||record.offeredTo!==str(runtimeId)||record.event.id!==str(eventId)||leaseToken!==undefined&&record.leaseToken!==leaseToken)return null;
+    return clone(record.event);
+  }
+  function retainedOwner(sessionId,runtimeId){const current=presence.get(str(sessionId));return !!current&&current.owner===str(runtimeId)&&!current.resetRequired&&!current.released;}
   const records = new Map()
   const presence = new Map()
   const readyListeners = new Set()
@@ -184,11 +190,28 @@ export function createTavernScriptDispatch(options = {}) {
   }
 
   const persistenceMethods=new Set(['saveTavernChatData','saveTavernExtensionSettings','publishTavernSpAuthorityCache'])
+  const saveRecoveryMethods=new Set([...persistenceMethods,'assertTavernSpOwnedTask','prepareTavernSpOwnedSaveRetry','checkpointTavernSpOwnedTask'])
+  function beginOwnedSaveRecovery(sessionId,runtimeId,token,taskId,durationMs=91000){
+    const current=presence.get(str(sessionId));
+    if(!current||current.owner!==str(runtimeId)||!current.quarantined||current.resetRequired||current.released||current.operations>0||!str(token)||!str(taskId))throw new Error('SP 原保存恢复身份已失效');
+    if(current.ownedSaveRecovery)throw new Error('SP 保存恢复已经执行');
+    current.ownedSaveRecovery={token:str(token),taskId:str(taskId),until:now()+Math.min(91000,Math.max(1,durationMs)),error:current.drainError};current.seenAt=now();current.drainUntil=current.ownedSaveRecovery.until;
+    return {reserved:true};
+  }
+  function finishOwnedSaveRecovery(sessionId,runtimeId,token,{resume=false}={}){
+    const id=str(sessionId),current=presence.get(id),recovery=current?.ownedSaveRecovery;
+    if(!current||current.owner!==str(runtimeId)||!recovery||recovery.token!==token||current.resetRequired||current.released)throw new Error('SP 保存恢复确认已失效');
+    const valid=now()<recovery.until&&current.drainError===recovery.error&&current.operations===0&&!records.has(id);
+    delete current.ownedSaveRecovery;
+    if(resume&&!valid)throw new Error('SP 保存后仍有其他隔离或未完成工作');
+    if(resume){current.quarantined=false;current.draining=false;current.ready=false;current.generalReady=false;delete current.drainError;delete current.recoveryToken;delete current.recoveryUntil;current.seenAt=now();}
+    return {resumed:resume===true};
+  }
   function quarantine(sessionId,runtimeId,error){
     const id=str(sessionId),current=presence.get(id)
     if(!current||current.owner!==str(runtimeId)||current.resetRequired)return {quarantined:false,superseded:true}
     invalidateUnload(current);current.quarantined=true;current.draining=true;current.ready=false;current.generalReady=false;current.drainUntil=now();
-    delete current.recoveryToken;delete current.recoveryUntil
+    delete current.recoveryToken;delete current.recoveryUntil;delete current.ownedSaveRecovery
     if(error)current.drainError=redactDiagnostic(str(error)).slice(0,2000)
     const record=records.get(id)
     if(record)resolveRecord(id,record,{handled:false,error:current.drainError||'SP 执行已隔离',phase:record.phase,args:clone(record.event.args)})
@@ -198,7 +221,9 @@ export function createTavernScriptDispatch(options = {}) {
     const id=str(sessionId),owner=str(runtimeId),current=presence.get(id)
     if(!owner&&!current?.requiresRuntimeId)return work() // Legacy and preparation facades have no execution lease.
     if(!owner||!current||current.owner!==owner||current.resetRequired||current.released||(!drainLive(current)&&now()-current.seenAt>presenceTtlMs&&records.get(id)?.phase!=='executing'))throw new Error('脚本执行窗口已失效或缺少当前身份，请重新打开游戏')
-    if(current.quarantined&&!(current.recoveryToken&&recovery.token===current.recoveryToken&&now()<current.recoveryUntil&&recovery.scriptId==='extension-sp-database'&&persistenceMethods.has(recovery.method)))throw new Error('SP 执行已隔离，仅允许当前显式保存重试')
+    const save=current.ownedSaveRecovery;
+    const ownedSave=save&&recovery.token===save.token&&now()<save.until&&recovery.scriptId==='extension-sp-database'&&saveRecoveryMethods.has(recovery.method)&&(!recovery.taskId||recovery.taskId===save.taskId);
+    if(current.quarantined&&!ownedSave&&!(current.recoveryToken&&recovery.token===current.recoveryToken&&now()<current.recoveryUntil&&recovery.scriptId==='extension-sp-database'&&persistenceMethods.has(recovery.method)))throw new Error('SP 执行已隔离，仅允许当前显式保存重试')
     if(str(recovery.eventId).startsWith('display-render:')){
       const record=records.get(id);
       if(!record?.event.displayedMessage||record.event.id!==recovery.eventId||record.phase!=='executing'||record.cancelled)throw new Error('正文显示事件已结束，写入未执行');
@@ -461,5 +486,5 @@ export function createTavernScriptDispatch(options = {}) {
     if (current) { invalidateUnload(current);current.ready = false; current.generalReady = false; current.resetRequired = true }
     publishSignal(id, { kind: 'runtime-reset', version: String(++sequence) })
   }
-  return Object.freeze({ touch, available,availableFrontend,heartbeat,subscribeWork,runOwned,reserveDrain,issueUnloadTicket,acceptsUnloadTicket,voteUnload,reserveUnload,quarantine, mvuActivity, setMvuActivity, claim, takeOver, start, complete, dispatch, enqueueDisplayedMessage,displayedMessageTarget,cancelDisplayedMessage,subscribeReady, subscribeSettled,waitForIdle, dispose, status, invalidate, needsReset })
+  return Object.freeze({ touch, available,availableFrontend,heartbeat,subscribeWork,executingEvent,retainedOwner,runOwned,reserveDrain,beginOwnedSaveRecovery,finishOwnedSaveRecovery,issueUnloadTicket,acceptsUnloadTicket,voteUnload,reserveUnload,quarantine, mvuActivity, setMvuActivity, claim, takeOver, start, complete, dispatch, enqueueDisplayedMessage,displayedMessageTarget,cancelDisplayedMessage,subscribeReady, subscribeSettled,waitForIdle, dispose, status, invalidate, needsReset })
 }

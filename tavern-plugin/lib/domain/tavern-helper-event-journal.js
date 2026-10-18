@@ -46,14 +46,23 @@ export function createTavernHelperEventJournal({chats,dispatch,waitForIdle,enabl
   chat.tavernHelperEventJournal=[...completed,...unfinished,...events.map(event=>({id:randomUUID(),...clone(event),status:'pending',attempt:0,createdAt:Date.now(),branchId:chat.timeline?.branchId||'',identityVersion:1,target:event.inputOperationId||event.name==='MESSAGE_DELETED'||!Number.isInteger(event.args?.[0])?null:{index:event.args?.[0],key:chat.messages?.[event.args?.[0]]?key(chat.messages[event.args[0]],event.args[0]):null},lifecycle:Number(chat.tavernHelperLifecycleRevision)||0}))]
   return chat
  }
- function stageInput(chat,operationId){
+ function stageInput(chat,operationId,{spNative=false}={}){
   if((chat.tavernHelperEventJournal||[]).some(row=>row.inputOperationId===operationId))return chat
   const view=templateInputView(chat);if(!view.input||view.input.operationId!==operationId)return chat
   const draft=persistTemplateInputView(view.chat,view.input)
   const generationType=chat.regenInProgress?'regenerate':'normal'
   // Like ST, after-commands runs before MESSAGE_SENT and prompt assembly. The
   // admitted operation has already survived slash-command processing here.
-  return stage(draft,[{name:'GENERATION_STARTED',args:[generationType,{},false],inputOperationId:operationId},{name:'GENERATION_AFTER_COMMANDS',args:[generationType,{},false],inputOperationId:operationId},{name:'MESSAGE_SENT',args:[view.input.floor],inputOperationId:operationId}])
+  const admission=spNative&&generationType==='normal'?{version:1,operationId,floor:view.input.floor,text:view.input.sourceText,branchId:chat.timeline?.branchId||'',chatId:chat.id,lifecycleRevision:Number(chat.tavernHelperLifecycleRevision)||0}:null
+  return stage(draft,[{name:'GENERATION_STARTED',args:[generationType,{},false],inputOperationId:operationId},{name:'GENERATION_AFTER_COMMANDS',args:[generationType,admission?{__dshNativeInput:admission}:{},false],inputOperationId:operationId},{name:'MESSAGE_SENT',args:[view.input.floor],inputOperationId:operationId},...(admission?[{name:'USER_MESSAGE_RENDERED',args:[view.input.floor],inputOperationId:operationId}]:[])])
+ }
+ function stageInputPrepared(chat,operationId){
+  if((chat.tavernHelperEventJournal||[]).some(row=>row.inputOperationId===operationId&&row.name==='GENERATE_AFTER_DATA'))return chat
+  const view=templateInputView(chat)
+  if(view.input?.operationId!==operationId)throw Error('正文请求准备期间输入身份已变化')
+  const admitted=(chat.tavernHelperEventJournal||[]).find(row=>row.inputOperationId===operationId&&row.name==='USER_MESSAGE_RENDERED')
+  if(!admitted||admitted.status!=='completed')throw Error('原生用户楼层尚未完成脚本处理')
+  return stage(chat,[{name:'GENERATE_AFTER_DATA',args:[{},false],inputOperationId:operationId}])
  }
  // Foreground completion is distinct from manual history edits. The operation
  // identity is persisted with the same commit and prevents duplicate notification.
@@ -118,6 +127,17 @@ export function createTavernHelperEventJournal({chats,dispatch,waitForIdle,enabl
    await fault('executed',event)
    const deferred=(result.diagnostics||[]).filter(item=>item.kind==='card-mvu-deferred-v1'&&item.name==='MESSAGE_RECEIVED'&&item.scriptId)
    await update(chat,event.id,(row,current)=>{
+    // Only a successful native after-commands receipt can replace this admitted
+    // input. The original SP writes options.prompt; its ST.chat mes mutation is
+    // a local facade edit, not permission to rewrite durable history.
+    const admission=event.name==='GENERATION_AFTER_COMMANDS'&&event.args?.[1]?.__dshNativeInput
+    const returned=result.args?.[1]
+    if(admission&&returned&&Object.hasOwn(returned,'prompt')){
+     const returnedAdmission=returned.__dshNativeInput,view=templateInputView(current),pending=current.fullPromptTemplatePendingInput
+     const fields=['version','operationId','floor','text','branchId','chatId','lifecycleRevision']
+     if(typeof returned.prompt!=='string'||!returnedAdmission||fields.some(key=>returnedAdmission[key]!==admission[key])||admission.version!==1||event.inputOperationId!==admission.operationId||current.id!==admission.chatId||current.timeline?.branchId!==admission.branchId||(Number(current.tavernHelperLifecycleRevision)||0)!==admission.lifecycleRevision||view.input?.operationId!==admission.operationId||view.input?.floor!==admission.floor||view.input?.sourceText!==admission.text||pending?.operationId!==admission.operationId)throw Error('原生输入在剧情回执前已变化，未覆盖当前输入')
+     pending.text=returned.prompt
+    }
     if(deferred.length){
      const ids=[...new Set(deferred.map(item=>item.scriptId))]
      if(ids.length!==1||selectedCore&&ids[0]!==selectedCore.id)throw new Error('卡核心延期回执身份不一致，未确认工作不会自动重放')
@@ -184,5 +204,24 @@ export function createTavernHelperEventJournal({chats,dispatch,waitForIdle,enabl
   await update(chat,id,row=>{if(!['running','failed'].includes(row.status)||row.attempt!==attempt)throw new Error('脚本事件状态已变化，请刷新');row.status=action==='retry'?'pending':'discarded';row.resolution={action,at:Date.now()};row.error='';if(action==='skip')row.finishedAt=Date.now()})
   await flush(sessionId);return status(await chats.forSession(sessionId))
  }
- return {resumeCardMvu,dispose(){stopped=true;cardRequested.clear();idleWait.abort(new Error('脚本事件服务已释放，未执行事件仍保留'))},stage,stageInput,stageGeneration,stageRegeneration,stageStopped,schedule,stageHistory:(before,after)=>stage(after,helperHistoryEvents(before,after)),flush,resolve,status,inspect:async sessionId=>({events:status(await chats.forSession(sessionId)),running:running.has(sessionId)}),isRunning:sessionId=>running.has(sessionId)}
+ // Host-only completion of an already executed SP event. This never dispatches
+ // a handler; caller proves the retained task saved and every other recipient
+ // finished before the SP-only persistence error.
+ async function completeSavedSpTask(sessionId,{eventId,identity,recoveryError,taskId}){
+  const match=/^journal:([^:]+):(\d+)$/.exec(eventId||'');
+  const chat=await chats.forSession(sessionId);
+  if(!chat||chat.id!==identity.chatId||(chat.timeline?.branchId||'')!==identity.branchId||(Number(chat.tavernHelperLifecycleRevision)||0)!==identity.lifecycleRevision)throw Error('SP 保存恢复事件剧情身份已变化');
+  if(!match){if((chat.tavernHelperEventJournal||[]).some(row=>['running','failed'].includes(row.status)))throw Error('SP 保存后仍有未确认脚本事件');return {completed:true,journal:false};}
+  if(running.has(sessionId))throw Error('SP 保存恢复事件仍在执行');
+  if((chat.tavernHelperEventJournal||[]).some(row=>row.id!==match[1]&&['running','failed'].includes(row.status)))throw Error('SP 保存后仍有另一未确认脚本事件');
+  await update(chat,match[1],(row,current)=>{
+   if(current.id!==identity.chatId||(current.timeline?.branchId||'')!==identity.branchId||(Number(current.tavernHelperLifecycleRevision)||0)!==identity.lifecycleRevision||(current.tavernHelperEventJournal||[]).some(other=>other.id!==row.id&&['running','failed'].includes(other.status)))throw Error('SP 保存恢复事件提交期间身份或其他事件已变化');
+   if(row.attempt!==Number(match[2])||row.lifecycle!==identity.lifecycleRevision||row.branchId!==identity.branchId||row.status!=='failed'||typeof recoveryError!=='string'||!recoveryError||!row.error?.endsWith(recoveryError)||cardUnfinished(row))throw Error('SP 保存恢复事件缺少精确失败回执');
+   row.status='completed';row.finishedAt=Date.now();row.resolution={action:'saved-sp-task',taskId,eventId,at:Date.now()};
+   // Preserve the original failure for diagnosis, rather than erasing it.
+   row.recoveredError=row.error;row.error='';
+  });
+  return {completed:true,journal:true};
+ }
+ return {resumeCardMvu,completeSavedSpTask,dispose(){stopped=true;cardRequested.clear();idleWait.abort(new Error('脚本事件服务已释放，未执行事件仍保留'))},stage,stageInput,stageInputPrepared,stageGeneration,stageRegeneration,stageStopped,schedule,stageHistory:(before,after)=>stage(after,helperHistoryEvents(before,after)),flush,resolve,status,inspect:async sessionId=>({events:status(await chats.forSession(sessionId)),running:running.has(sessionId)}),isRunning:sessionId=>running.has(sessionId)}
 }

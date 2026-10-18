@@ -17,11 +17,19 @@ function walk(node, visit, parent) {
   }
 }
 export function projectTavernHostScript(source, { isolatedDocument = false, storageOwner = false, preserveJQuery = false } = {}) {
+  return projectHostScript(source, {isolatedDocument,storageOwner,preserveJQuery})
+}
+// Internal bridge: the tree must be the successful strict module parse of this
+// exact source. Consume it synchronously; never retain it in the source cache.
+export function projectParsedTavernHostScript({source,tree}, {isolatedDocument=false,storageOwner=false,preserveJQuery=false}={}) {
+  return projectHostScript(source,{isolatedDocument,storageOwner,preserveJQuery},tree)
+}
+function projectHostScript(source, {isolatedDocument,storageOwner,preserveJQuery}, parsedTree) {
   const cacheKey = String(isolatedDocument) + String(storageOwner) + String(preserveJQuery) + source
   if (hostSourceCache.has(cacheKey)) return hostSourceCache.get(cacheKey)
   const originalSource = source
-  let tree
-  try { tree = parse(source, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, allowReturnOutsideFunction: true }) }
+  let tree=parsedTree
+  try { if(!tree)tree = parse(source, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, allowReturnOutsideFunction: true }) }
   catch(error) { if(storageOwner||isolatedDocument)throw new Error('脚本适配解析失败，未运行原始代码：'+error.message);return source }
   const bindings = [], candidates = [], hostIdentifiers = new Set(['window', 'parent', 'top', 'globalThis', 'localStorage'])
   function bind(pattern, scope) {

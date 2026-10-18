@@ -1,4 +1,4 @@
-import {walkSp129} from './sp129-source.js'
+import {walkSp129,sp129RootNodes} from './sp129-source.js'
 
 const callNamed=(node,name)=>node.type==='CallExpression'&&node.callee.type==='Identifier'&&node.callee.name===name
 const memberCall=(node,method)=>node.type==='CallExpression'&&node.callee.type==='MemberExpression'&&!node.callee.computed&&node.callee.property.name===method&&node.callee.object.type==='Identifier'
@@ -15,7 +15,7 @@ export function adaptSp129Work(ctx){
  // Preserve preorder and every duplicate, including named expressions nested
  // below the main scope. ctx.functions intentionally covers declarations only.
  const all=[],functions=[],byName=new Map()
- walkSp129(ctx.root,node=>{
+ sp129RootNodes(ctx).forEach(node=>{
   all.push(node)
   if(node.type!=='FunctionDeclaration'&&node.type!=='FunctionExpression')return
   functions.push(node)
@@ -88,7 +88,13 @@ export function adaptSp129Work(ctx){
  const archiveTimers=all.filter(n=>callNamed(n,'setTimeout')&&nodes(n.arguments[0],c=>callNamed(c,'persistPendingVectorIndexArchive_ACU')).length>0)
  const archiveTimer=unique(archiveTimers,'vector archive timer');timers.push(archiveTimer)
  for(const timer of timers){
+  if(timer.arguments.length!==2)throw Error('SP 1.2.9 延迟流水线参数改变')
   ctx.replace(timer.callee,timer===startupHydration?'__dshScheduleSpStartupHydration':'__dshScheduleSpWork')
+  const source=timer===startupHydration?'startupHydration':timer===receiveTimer?'passiveCompletion':timer===archiveTimer?'vectorArchive':nodes(timer.arguments[0],n=>callNamed(n,'initWithChatIdSafely')).length?'startupRestore':nodes(timer.arguments[0],n=>callNamed(n,'runMutationRound_ACU')).length?'chatMutation':'contentOptimization'
+  const eventParameter=source==='contentOptimization'?timerScopes[0].params[0]:null
+  const eventName=eventParameter?.type==='AssignmentPattern'?eventParameter.left:eventParameter
+  if(eventName&&eventName.type!=='Identifier')throw Error('SP 1.2.9 正文事件参数改变')
+  ctx.insert(timer.end-1,','+JSON.stringify(source)+(eventName?','+eventName.name:''))
   const cb=timer.arguments[0], tail=cb.body?.body?.at(-1)
   if(tail?.type==='ExpressionStatement'&&nodes(tail,n=>callNamed(n,'runMutationRound_ACU')||callNamed(n,'persistPendingVectorIndexArchive_ACU')).length)ctx.insert(tail.start,'return ')
  }
@@ -131,7 +137,7 @@ export function adaptSp129Work(ctx){
  // lock appears in its map. The ledger never changes their return values.
  for(const name of ['runTableWriteTransaction_ACU','runMutationRound_ACU','enqueueSummaryVectorIndexFlush_ACU','flushSummaryVectorIndexTaskNow_ACU','rebuildOutdatedSummaryVectorIndexInBackground_ACU']){
   const fn=named(name);if(!fn.async)throw Error('SP 1.2.9 工作函数不再异步：'+name)
-  ctx.insert(fn.body.start+1,'const __dshFinishSpWork=__dshBeginSpWork();try{')
+  ctx.insert(fn.body.start+1,'const __dshFinishSpWork=__dshBeginSpWork('+JSON.stringify(name)+');try{')
   ctx.insert(fn.body.end-1,'}finally{__dshFinishSpWork()}')
  }
  // A completed failed group otherwise only produces a mutable toast. Report it
@@ -148,18 +154,18 @@ export function adaptSp129Work(ctx){
  function __dshCompleteSpStartup(error){if(__dshSpStartupStatus!=='pending')return;if(error){__dshSpStartupStatus='failed';__dshRejectSpStartup(error)}else{__dshSpStartupStatus='ready';__dshResolveSpStartup()}}
  function __dshObserveSpStartup(promise){Promise.resolve(promise).then(()=>__dshCompleteSpStartup(),error=>__dshCompleteSpStartup(error));return promise;}
  let __dshSpStartupHydration=null,__dshSpStartupHydrationStatus='unregistered';
- function __dshScheduleSpStartupHydration(work,delay){
-  if(__dshSpStartupHydration)return __dshScheduleSpWork(()=>work(()=>{}),delay);
+ function __dshScheduleSpStartupHydration(work,delay,source='startupHydration'){
+  if(__dshSpStartupHydration)return __dshScheduleSpWork(()=>work(()=>{}),delay,source);
   let resolve,reject,done=false;__dshSpStartupHydrationStatus='pending';
   __dshSpStartupHydration=new Promise((yes,no)=>{resolve=yes;reject=no});__dshSpStartupHydration.catch(()=>{});
   const finish=error=>{if(done)return;done=true;if(error){__dshSpStartupHydrationStatus='failed';reject(error)}else{__dshSpStartupHydrationStatus='ready';resolve()}};
-  return __dshScheduleSpWork(async()=>{try{await work(finish);finish()}catch(error){finish(error);throw error}},delay);
+  return __dshScheduleSpWork(async()=>{try{await work(finish);finish()}catch(error){finish(error);throw error}},delay,source);
  }
  const __dshSpWork=new Set();let __dshSpDrains=0;
- function __dshBeginSpWork(){let resolve,done=false;const entry={settled:new Promise(r=>{resolve=r})};__dshSpWork.add(entry);return error=>{if(done)return;done=true;entry.error=error;resolve(error);if(!error&&${ctx.hostName}.__dshAwaitOriginalWork===false&&!__dshSpDrains)__dshSpWork.delete(entry)};}
+ function __dshBeginSpWork(source='tracked'){let resolve,done=false;const entry={source,done:false,settled:new Promise(r=>{resolve=r})};__dshSpWork.add(entry);return error=>{if(done)return;done=true;entry.done=true;entry.error=error;resolve(error);if(!error&&${ctx.hostName}.__dshAwaitOriginalWork===false&&!__dshSpDrains)__dshSpWork.delete(entry)};}
  function __dshTrackSpWork(promise){const finish=__dshBeginSpWork();Promise.resolve(promise).then(()=>finish(),error=>finish(error));return promise;}
  const __dshSpTimers=new Map();
- function __dshScheduleSpWork(work,delay,...args){const finish=__dshBeginSpWork(),entry={running:false,finish};const timer=setTimeout(async()=>{entry.running=true;try{await work(...args);finish()}catch(error){finish(error);if(${ctx.hostName}.__dshAwaitOriginalWork===false&&!__dshSpDrains)throw error}finally{__dshSpTimers.delete(timer)}},delay);__dshSpTimers.set(timer,entry);return timer;}
+ function __dshScheduleSpWork(work,delay,source='timer',eventType,...args){const finish=__dshBeginSpWork(source),entry={running:false,finish,source,delay,eventType:['MESSAGE_RECEIVED','CHARACTER_MESSAGE_RENDERED','GENERATION_ENDED'].includes(eventType)?eventType:'unknown',scheduledEpoch:Date.now()};const timer=setTimeout(async()=>{entry.running=true;try{await work(...args);finish()}catch(error){finish(error);if(${ctx.hostName}.__dshAwaitOriginalWork===false&&!__dshSpDrains)throw error}finally{__dshSpTimers.delete(timer)}},delay);__dshSpTimers.set(timer,entry);return timer;}
  function __dshCancelSpWork(timer){const entry=__dshSpTimers.get(timer);if(!entry){clearTimeout(timer);return}if(!entry.running){clearTimeout(timer);entry.finish();__dshSpTimers.delete(timer)}}
  function __dshReportSpFillFailure(result){try{const error=new Error('[DSH] SP 自动填表有 '+result.failedGroups+' 组失败'+(Array.isArray(result.errors)&&result.errors[0]?'：'+String(result.errors[0]):''));if(typeof globalThis.reportError==='function')globalThis.reportError(error);else console.error(error.message)}catch(_){}}
  `)
@@ -167,7 +173,26 @@ export function adaptSp129Work(ctx){
  Object.defineProperty(${ctx.apiName},'__dshAwaitStartupReady',{value:()=>Promise.all([__dshSpStartupReady,...(__dshSpStartupHydration?[__dshSpStartupHydration]:[])]).then(()=>{})});
  Object.defineProperty(${ctx.apiName},'__dshGetCurrentIsolationCode',{value:()=>getCurrentIsolationKey_ACU()});
  Object.defineProperty(${ctx.apiName},'__dshPendingWork',{value:()=>__dshSpWork.size});
- Object.defineProperty(${ctx.apiName},'__dshIsPersistenceIdle',{value:()=>{try{return __dshSpStartupStatus==='ready'&&!['pending','failed'].includes(__dshSpStartupHydrationStatus)&&__dshSpWork.size===0&&__dshSpDrains===0&&${runtimePending}.size===0&&${pending}.size===0&&${archiveTimerMap}.size===0&&${archiveLocks}.size===0&&${flushTimers}.size===0&&![${notifyFlags.join(',')}].some(Boolean)&&![...${locks}.values()].some(lock=>lock.activeReaders!==0||lock.activeWriter!==false||lock.queue.length!==0)&&!hasActiveProvisionalBridgeAnywhere_ACU(getChatArray_ACU())}catch(_){return false}}});
+ function __dshSpPersistenceState(detail=false){
+  const checks={};let idle=true;
+  const check=(name,read)=>{if(!detail&&!idle)return;const value=read();checks[name]=value;idle=idle&&value};
+  try{
+   check('startupReady',()=>__dshSpStartupStatus==='ready');
+   check('startupHydrationReady',()=>!['pending','failed'].includes(__dshSpStartupHydrationStatus));
+   check('workEmpty',()=>__dshSpWork.size===0);check('drainsEmpty',()=>__dshSpDrains===0);
+   check('runtimePendingEmpty',()=>${runtimePending}.size===0);check('archivePendingEmpty',()=>${pending}.size===0);
+   check('archiveTimersEmpty',()=>${archiveTimerMap}.size===0);check('archiveLocksEmpty',()=>${archiveLocks}.size===0);check('flushTimersEmpty',()=>${flushTimers}.size===0);
+   check('notificationsIdle',()=>![${notifyFlags.join(',')}].some(Boolean));
+   check('locksIdle',()=>![...${locks}.values()].some(lock=>lock.activeReaders!==0||lock.activeWriter!==false||lock.queue.length!==0));
+   check('provisionalIdle',()=>!hasActiveProvisionalBridgeAnywhere_ACU(getChatArray_ACU()));
+   if(!detail)return idle;
+   const sources={},ledger={pending:0,settled:0,error:0},errors=[];
+   for(const entry of __dshSpWork){sources[entry.source]=(sources[entry.source]||0)+1;ledger[entry.done?'settled':'pending']++;if(entry.error)ledger.error++;if(entry.done&&entry.error&&errors.length<4)errors.push({source:String(entry.source||'tracked').slice(0,96),name:String(entry.error?.name||'Error').slice(0,64),message:sanitizeRetryFeedback_ACU(typeof entry.error?.message==='string'?entry.error.message:typeof entry.error==='string'?entry.error:'Unknown work failure',384)})}
+   return {idle,checks,startup:__dshSpStartupStatus,startupHydration:__dshSpStartupHydrationStatus,work:__dshSpWork.size,drains:__dshSpDrains,timers:__dshSpTimers.size,timerDetails:[...__dshSpTimers.values()].map(entry=>({source:entry.source,delay:entry.delay,running:entry.running,eventType:entry.eventType,scheduledEpoch:entry.scheduledEpoch})),runtimePending:${runtimePending}.size,archivePending:${pending}.size,archiveTimers:${archiveTimerMap}.size,archiveLocks:${archiveLocks}.size,flushTimers:${flushTimers}.size,notificationFlags:[${notifyFlags.join(',')}].map(Boolean),ledger,sources,errors};
+  }catch(_){return detail?{idle:false,checks,probeFailed:true}:false}
+ }
+ Object.defineProperty(${ctx.apiName},'__dshIsPersistenceIdle',{value:()=>__dshSpPersistenceState()});
+ Object.defineProperty(${ctx.apiName},'__dshPersistenceDiagnostics',{value:()=>__dshSpPersistenceState(true)});
  Object.defineProperty(${ctx.apiName},'__dshFlushPendingWork',{value:async()=>{let failure;__dshSpDrains++;try{while(__dshSpWork.size){const batch=[...__dshSpWork],results=await Promise.all(batch.map(entry=>entry.settled));for(const entry of batch)__dshSpWork.delete(entry);failure ||= results.find(Boolean)}}finally{__dshSpDrains--}if(failure)throw failure}});
  `)
 }

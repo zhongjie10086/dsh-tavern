@@ -1,7 +1,7 @@
 import { assertScriptPromptBudget } from './tavern-script-prompts.js'
 const defaults = ['world_info_before', 'persona_description', 'char_description', 'char_personality', 'scenario', 'world_info_after', 'dialogue_examples', 'chat_history', 'user_input']
 const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key)
-export function compileHelperGeneration(config, { history = [], prompts = {}, preset = null, raw = true, scriptPrompts = [],promptLimits } = {}) {
+export function compileHelperGeneration(config, { history = [], prompts = {}, preset = null, raw = true, scriptPrompts = [],contentParts=false,nativeTools=false,promptLimits } = {}) {
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('生成参数必须是对象')
   assertScriptPromptBudget(scriptPrompts,promptLimits)
   assertScriptPromptBudget(config.injects || [],promptLimits)
@@ -12,14 +12,14 @@ export function compileHelperGeneration(config, { history = [], prompts = {}, pr
   const limit = config.max_chat_history ?? 'all'
   if (limit !== 'all' && (!Number.isSafeInteger(limit) || limit < 0)) throw new Error('max_chat_history 必须是非负整数或 all')
   const messages = [], overrides = config.overrides || {}, selected = overrides.chat_history?.prompts || (limit === 'all' ? history : limit === 0 ? [] : history.slice(-limit))
-  function append(role, text, images) {
-    if (!['system', 'user', 'assistant'].includes(role) || typeof text !== 'string') throw new Error('生成消息 role 或 content 无效')
-    const content = [{ type: 'text', text }]
+  function append(role, text, images,toolCallId) {
+    if (!(nativeTools?['system','user','assistant','tool']:['system', 'user', 'assistant']).includes(role) || typeof text !== 'string' && !(contentParts&&Array.isArray(text))) throw new Error('生成消息 role 或 content 无效')
+    const content = Array.isArray(text) ? text.map(part=>{if(part?.type==='text'&&typeof part.text==='string'||part?.type==='image'&&typeof part.url==='string'||nativeTools&&part?.type==='tool-call'&&typeof part.id==='string'&&typeof part.name==='string'&&typeof part.arguments==='string')return structuredClone(part);throw new Error('生成消息内容无效')}) : [{ type: 'text', text }]
     for (const image of images ? Array.isArray(images) ? images : [images] : []) {
       if (typeof image !== 'string') throw new Error('图片需先转换为 data URL 或 URL')
       content.push({ type: 'image', url: image })
     }
-    if (text.trim() || content.length > 1) messages.push({ role, content })
+    if (Array.isArray(text) || text.trim() || content.length > 1) messages.push({ role, content,...(role==='tool'?{toolCallId}: {}) })
   }
   function entries(phase) { for (const entry of preset?.[phase]?.entries || []) append(entry.role || 'system', String(entry.content || '')) }
   if (!raw) entries('front')
@@ -32,7 +32,7 @@ export function compileHelperGeneration(config, { history = [], prompts = {}, pr
       if (!order.includes('user_input')) append('user', config.user_input || '', config.image)
     } else if (item === 'user_input') append('user', config.user_input || '', config.image)
     else if (typeof item === 'string' && defaults.includes(item)) append('system', own(overrides, item) ? overrides[item] : prompts[item] || '')
-    else if (item && typeof item === 'object') append(item.role, item.content, item.image)
+    else if (item && typeof item === 'object') append(item.role, item.content, item.image,item.toolCallId)
     else throw new Error('未知内置提示词：' + String(item))
   }
   if (!order.includes('user_input') && !order.includes('chat_history')) append('user', config.user_input || '', config.image)
@@ -50,4 +50,12 @@ export function compileHelperGeneration(config, { history = [], prompts = {}, pr
 export async function generateHelperRaw(config, context) {
   const compiled = compileHelperGeneration(config, context)
   return await context.callModel(Object.fromEntries(Object.entries({ ...compiled, sessionId: context.sessionId || '', signal: context.signal, onDelta: context.onDelta }).filter(([, value]) => value !== undefined)))
+}
+
+/** Translate existing native helper blocks back to the independent OpenAI wire. */
+export function helperWireMessages(messages){
+ return messages.map(message=>{
+  const calls=message.content.filter(part=>part.type==='tool-call'),parts=message.content.filter(part=>part.type!=='tool-call').map(part=>part.type==='image'?{type:'image_url',image_url:{url:part.url}}:{type:'text',text:part.text});
+  return {role:message.role,content:message.role==='tool'?parts.map(part=>part.text||'').join(''):parts,...(message.role==='tool'?{tool_call_id:message.toolCallId}:{}),...(calls.length?{tool_calls:calls.map(part=>({id:part.id,type:'function',function:{name:part.name,arguments:part.arguments}}))}:{})};
+ });
 }

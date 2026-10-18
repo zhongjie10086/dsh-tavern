@@ -364,17 +364,33 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
    const bytes=JSON.stringify({kind:'record',value:records[i]}),ref=hash(bytes)
    refs[i]=ref;entries.set(ref,{ref,value:records[i],bytes})
   }
+  const ordered=[...entries.values()],checks=new Array(ordered.length)
+  let readIndex=0
+  const checked=await Promise.allSettled(Array.from({length:Math.min(8,ordered.length)},async()=>{
+   while(readIndex<ordered.length){
+    const position=readIndex++,entry=ordered[position]
+    try{
+     let existing
+     try{existing=await readFile(blobPath(dir,entry.ref))}catch(error){if(error.code!=='ENOENT')throw error}
+     if(existing!==undefined){
+      if(JSON.stringify(decodeBlock(dir,entry.ref,existing,batch))!==entry.bytes)throw Error('Immutable block corruption')
+      onIO({kind:'read',type:'record',bytes:Buffer.byteLength(existing),reason:'deduplication'})
+     }
+     checks[position]={exists:existing!==undefined}
+    }catch(error){checks[position]={error}}
+   }
+  }))
+  const checkFailure=checked.find(result=>result.status==='rejected')
+  if(checkFailure)throw checkFailure.reason
+  // All reads have settled before rejecting or writing, so the surrounding
+  // mutation lease still excludes maintenance for every in-flight read.
+  for(const check of checks)if(check.error)throw check.error
   let group=[],groupBytes=64
-  for(const entry of entries.values()){
-   let existing
-   try{existing=await readFile(blobPath(dir,entry.ref))}catch(error){if(error.code!=='ENOENT')throw error}
+  for(let position=0;position<ordered.length;position++){
+   const entry=ordered[position]
    const parent=path.dirname(blobPath(dir,entry.ref))
    directories.add(parent);directories.add(path.join(dir,'blocks'));directories.add(dir)
-   if(existing!==undefined){
-    if(JSON.stringify(decodeBlock(dir,entry.ref,existing,batch))!==entry.bytes)throw Error('Immutable block corruption')
-    onIO({kind:'read',type:'record',bytes:Buffer.byteLength(existing),reason:'deduplication'})
-    continue
-   }
+   if(checks[position].exists)continue
    const size=Buffer.byteLength(JSON.stringify([entry.ref,entry.value]))+1
    if(group.length&&(groupBytes+size>64*1024||group.length>=128)){groups.push(group);group=[];groupBytes=64}
    group.push(entry);groupBytes+=size

@@ -115,13 +115,15 @@ function installTavernGenerationBridge(win, call, events, identity = () => ({}),
         let offset=0;
         while(true){check();const state=await invoke('pollTavernHelperGeneration',{id,offset});check();offset=state.offset;
           if(state.delta)onDelta(state.delta);
-          if(state.status!=='running'){if(state.status!=='completed')throw Error(state.error||'生成未完成');if(typeof state.result!=='string')throw Error('扩展生成需要文本结果');await invoke('pollTavernHelperGeneration',{id,offset,received:true});return state.result;}
+          if(state.status!=='running'){if(state.status!=='completed')throw Error(state.error||'生成未完成');const result=state.result;
+            if(typeof result!=='string'&&!(owner.scriptId==='extension-sp-database'&&result&&typeof result.content==='string'&&Array.isArray(result.tool_calls)&&result.tool_calls.length&&result.tool_calls.every(call=>call?.type==='function'&&typeof call.id==='string'&&typeof call.function?.name==='string'&&typeof call.function.arguments==='string')))throw Error('扩展生成返回格式无效');
+            await invoke('pollTavernHelperGeneration',{id,offset,received:true});return result;}
           await new Promise(resolve=>win.setTimeout(resolve,100));
         }
       }
-      if(!body.stream){try{return observeResponse(new win.Response(JSON.stringify({choices:[{message:{role:'assistant',content:await consume(()=>{})}}]}),{headers:{'content-type':'application/json'}}))}catch(error){cleanup(error);throw error;}}
+      if(!body.stream){try{const result=await consume(()=>{}),message=typeof result==='string'?{role:'assistant',content:result}:{role:'assistant',content:result.content,tool_calls:result.tool_calls};return observeResponse(new win.Response(JSON.stringify({choices:[{message,finish_reason:message.tool_calls?'tool_calls':'stop'}]}),{headers:{'content-type':'application/json'}}))}catch(error){cleanup(error);throw error;}}
       const encoder=new win.TextEncoder();
-      const stream=new win.ReadableStream({start(controller){void consume(delta=>controller.enqueue(encoder.encode('data: '+JSON.stringify({choices:[{delta:{content:delta}}]})+'\n\n'))).then(()=>{controller.enqueue(encoder.encode('data: [DONE]\n\n'));controller.close();},error=>{controller.error(error);cleanup(error);});},cancel(){abort();}});
+      const stream=new win.ReadableStream({start(controller){void consume(delta=>controller.enqueue(encoder.encode('data: '+JSON.stringify({choices:[{delta:{content:delta}}]})+'\n\n'))).then(result=>{if(typeof result!=='string')controller.enqueue(encoder.encode('data: '+JSON.stringify({choices:[{delta:{tool_calls:result.tool_calls.map((call,index)=>({index,...call}))},finish_reason:'tool_calls'}]})+'\n\n'));controller.enqueue(encoder.encode('data: [DONE]\n\n'));controller.close();},error=>{controller.error(error);cleanup(error);});},cancel(){abort();}});
       return observeResponse(new win.Response(stream,{headers:{'content-type':'text/event-stream'}}));
     } catch(error){cleanup(error);throw error;}
   };

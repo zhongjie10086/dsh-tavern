@@ -12,6 +12,13 @@ export function walkSp129(node, visit, parent = null) {
  }
 }
 
+// Context creation already walks this root to verify the API publication.
+// Retain that exact preorder for adapters; callers with a bare root keep working.
+export function sp129RootNodes(ctx) {
+ if(ctx.rootNodes)return ctx.rootNodes
+ const nodes=[];walkSp129(ctx.root,node=>nodes.push(node));return nodes
+}
+
 export function createSp129Context(source) {
  const ast = parse(source, {ecmaVersion:'latest', sourceType:'module'})
  const roots = []
@@ -26,14 +33,15 @@ export function createSp129Context(source) {
   if (functions.has(name)) throw Error('SP 1.2.9 主作用域函数重复：'+name)
   functions.set(name, item)
  }
- const assignments = []
+ const assignments = [], rootNodes = []
  walkSp129(root, node => {
+  rootNodes.push(node)
   if (node.type === 'AssignmentExpression' && node.operator === '=' && node.left.type === 'MemberExpression' && !node.left.computed && node.left.property.name === 'AutoCardUpdaterAPI' && node.left.object.type === 'Identifier' && node.right.type === 'Identifier') assignments.push(node)
  })
  if (assignments.length !== 1) throw Error('SP 1.2.9 API 发布节点缺失或不唯一')
  const apiAssignment = assignments[0]
  const context = {
-  source, ast, root, functions, edits, apiAssignment,
+  source, ast, root, rootNodes, functions, edits, apiAssignment,
   apiName:apiAssignment.right.name, hostName:apiAssignment.left.object.name,
   function(name) { const node=functions.get(name); if(!node) throw Error('SP 1.2.9 函数缺失：'+name); return node },
   text(node) { return source.slice(node.start,node.end) },

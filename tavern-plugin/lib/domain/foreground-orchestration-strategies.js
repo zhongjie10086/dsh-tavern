@@ -5,6 +5,8 @@ import { projectRuntimePresetRequest } from './runtime-preset-lifecycle.js'
 import { projectStoryRegexRequest } from './st-request-projection.js'
 import {isTavernTriggerInput,isTavernTurnInput} from './tavern-turn-input.js'
 import { projectExpiredFramePrompts } from './foreground-frame-session-adapter.js'
+import {withCurrentWorldbook} from './session-stable-prefix.js'
+import {prependSystemInstruction} from './system-append.js'
 
 function str(value) {
   return typeof value === 'string' ? value : (value === undefined || value === null ? '' : String(value))
@@ -255,6 +257,7 @@ export function createCompatibilityOrchestrationStrategy(options) {
 }
 
 export function createNativePlayOrchestrationStrategy(options) {
+  const pendingWorldbooks = new Map()
   const turnContexts = new Map()
   const stagedRequests = options.stagedRequests instanceof Map ? options.stagedRequests : new Map()
   const redispatches = new WeakSet()
@@ -263,6 +266,7 @@ export function createNativePlayOrchestrationStrategy(options) {
     const sessionId = input.sessionId
     const payload = input.payload
     const mode = await options.modeFor(sessionId)
+    try {
     const visibleMessages = await options.filterMessages(input.decision.messages, mode, input.chat)
     let agentMessages = visibleMessages
     const snapshot = mode === 'story' || mode === 'script' ? await options.resolvePreset(input.chat) : null
@@ -306,7 +310,22 @@ export function createNativePlayOrchestrationStrategy(options) {
         agentMessages = agentMessages.concat([snapshotMessage(prepared.text)])
       }
     }
+    const pending=pendingWorldbooks.get(sessionId)
+    if(pending){
+      try{
+        payload.signal?.throwIfAborted()
+        const context=await pending.read()
+        payload.signal?.throwIfAborted()
+        if(pendingWorldbooks.get(sessionId)!==pending)throw Error('原生世界书组装已被新请求替换')
+        const sections=withCurrentWorldbook(pending.assembly.sections,context)
+        const projected=prependSystemInstruction({sections},pending.assembly.sections.find(row=>row.name==='tavern:system-append')?.text)
+        // The kernel may wrap the returned assembly when runtime context is
+        // suppressed, but retains its sections array. Keep that identity too.
+        pending.assembly.sections.splice(0,pending.assembly.sections.length,...projected.sections)
+      }finally{if(pendingWorldbooks.get(sessionId)===pending)pendingWorldbooks.delete(sessionId)}
+    }
     return { kind: 'enter', messages: agentMessages }
+    } catch(error) { pendingWorldbooks.delete(sessionId); throw error }
   }
 
   function projectRequest(optionsValue) {
@@ -376,6 +395,7 @@ export function createNativePlayOrchestrationStrategy(options) {
   }
 
   function clearRequestState(sessionId) {
+    pendingWorldbooks.delete(str(sessionId))
     stagedRequests.delete(str(sessionId))
     turnContexts.delete(str(sessionId))
   }
@@ -400,6 +420,8 @@ export function createNativePlayOrchestrationStrategy(options) {
       if (workspace !== '') sections.push({ name: 'tavern:resource-workspace', text: workspace })
     }
     assembly.sections = sections
+    if(typeof input.deferredWorldbook==='function')pendingWorldbooks.set(input.sessionId,{assembly,read:input.deferredWorldbook})
+    else pendingWorldbooks.delete(input.sessionId)
     assembly.tools = visibleTavernTools(assembly.tools, visible, options.controlledToolNames)
     return assembly
   }

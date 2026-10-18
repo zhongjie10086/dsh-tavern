@@ -13,7 +13,7 @@ function createTavernDatabaseProviderRouter({ records, post, schedule=setTimeout
   }
  }
  function dispatch(id,entry){
-  if(entry.sent||!entry.provider.databaseReady)return;
+  if(entry.sent||!entry.provider.databaseReady&&entry.operation.kind!=='zero-stop')return;
   entry.sent=true;
   post(entry.provider,{type:'dsh-tavern-original-database-command',requestId:id,operation:entry.operation,chatId:entry.chatId,lifecycleRevision:entry.lifecycleRevision});
  }
@@ -46,16 +46,19 @@ function createTavernDatabaseProviderRouter({ records, post, schedule=setTimeout
   if(data.ok){if(data.result?.names)catalog(record,data.result.names);entry.resolve(data.result)}else entry.reject(Error(data.error||'原数据库模板操作失败'));
   return true;
  }
- function remove(record){
+ function remove(record,retiringRecords){
   for(const[id,entry]of pending)if(entry.caller===record||entry.provider===record){pending.delete(id);cancel(entry.timer);entry.reject(Error('数据库脚本已重新加载，请重试'))}
   if(isProvider(record))for(const other of records.values())if(other!==record&&sameChat(other,record)){
    delete other.context.originalDatabaseTemplates;
-   post(other,{type:'dsh-tavern-helper-context',context:{originalDatabaseTemplates:null}});
+   // Bulk teardown still clears metadata and rejects work, but these exact
+   // retiring realms cannot consume another full projected context.
+   if(!retiringRecords?.has(other))post(other,{type:'dsh-tavern-helper-context',context:{originalDatabaseTemplates:null}});
   }
  }
- function requestPanel(sessionId,operation){
+ function requestPanel(sessionId,operation,expected){
   const provider=[...records.values()].find(record=>isProvider(record)&&record.sessionId===sessionId&&current(record));
-  if(!provider||!provider.databaseReady)return Promise.reject(Error('SP 原包未就绪，当前仅可查看缓存。'));
+  if(expected&&(!provider||provider.id!==expected.id||provider.context.chatId!==expected.chatId||Number(provider.context.lifecycleRevision||0)!==expected.lifecycleRevision))return Promise.reject(Error('原数据库实例已变化，操作已取消'));
+  if(!provider||!provider.databaseReady&&operation.kind!=='zero-stop')return Promise.reject(Error('SP 原包未就绪，当前仅可查看缓存。'));
   const id='database-panel-'+(++sequence);
   return new Promise((resolve,reject)=>{const timer=schedule(()=>{pending.delete(id);reject(Error('SP 原包操作超时，缓存保持只读。'));},60000),entry={caller:provider,provider,resolve,reject,timer,operation,chatId:provider.context.chatId,lifecycleRevision:Number(provider.context.lifecycleRevision||0)};pending.set(id,entry);dispatch(id,entry)});
  }

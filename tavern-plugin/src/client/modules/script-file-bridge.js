@@ -8,6 +8,7 @@ function installTavernFileBridge(win, call) {
   win.fetch = async function (input, init = {}) {
     const url = new URL(typeof input === 'string' ? input : input.url || String(input), win.document.baseURI);
     const local = url.origin === new URL(win.document.baseURI).origin;
+    if(local&&['/api/search/searxng','/api/search/visit'].includes(url.pathname)&&typeof win.__dshSpWebFetch==='function')return win.__dshSpWebFetch(url.pathname,init);
     if(local&&url.pathname==='/api/backends/chat-completions/generate') {
       try {
         if(String(init.method||'GET').toUpperCase()!=='POST'||typeof init.body!=='string')throw Error('模型请求必须使用 JSON POST');

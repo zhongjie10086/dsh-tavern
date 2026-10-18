@@ -542,6 +542,7 @@ function createMigrationWorkbenchFeature() {
         executeSlash: createTavernFrameSlashExecutor(ctx),
         composerInput: function(sessionId){const scope=ctx.sessions.scope(sessionId),conversation=ctx.get('conversation');if(!scope||!conversation)throw new Error('当前对话输入框不可用');return conversation.input.for(scope);},
         composerRunning: function(sessionId){return ctx.sessions.list.getSnapshot().byId[sessionId]?.running===true;},
+        stopComposer: function(sessionId){const scope=ctx.sessions.scope(sessionId),conversation=scope?.get('conversation');if(!conversation)throw new Error('当前会话停止入口不可用');return conversation.cancel();},
         composerRoot: function(sessionId){return Array.from(document.querySelectorAll('[data-dsh-tavern-composer-owner]')).find(node=>node.dataset.dshTavernComposerOwner===sessionId)?.closest('[data-composer-card]')||null;},
         appendInput: function (sessionId, text) {
           const scope = ctx.sessions.scope(sessionId), conversation = ctx.get("conversation");

@@ -17,6 +17,33 @@ function mergeFields(base,current,desired,label) {
   }
   return result
 }
+function historyConflict(stage,initial,current){
+  const keys=new Set([...Object.keys(initial),...Object.keys(current)]),changed=[...keys].filter(key=>!['_storageRevision','updatedAt'].includes(key)&&(!own(initial,key)||!own(current,key)||!isDeepStrictEqual(initial[key],current[key])))
+  const messages=[]
+  for(let index=0;index<Math.max(initial.messages.length,current.messages.length)&&messages.length<8;index++){
+    const before=initial.messages[index],after=current.messages[index];if(isDeepStrictEqual(before,after))continue
+    const fields=before&&after?[...new Set([...Object.keys(before),...Object.keys(after)])].filter(key=>own(before,key)!==own(after,key)||!isDeepStrictEqual(before[key],after[key])):['message-presence']
+    messages.push({index,fields:fields.slice(0,12)})
+  }
+  const details={stage,expectedRevision:initial._storageRevision,actualRevision:current._storageRevision,changed:changed.slice(0,16),messages,pending:!!current.nativeHistoryEdit}
+  const error=new Error('聊天已被其他操作修改，请重新读取');error.code='DSH_TAVERN_HISTORY_CONFLICT';error.details=details;return error
+}
+// A late renderer capture is derived from the unchanged stored body, not a
+// conflicting history/variable/material write. Prove that exact narrow case.
+function onlyDisplayCapturesChanged(before,current){
+  if(before.messages.length!==current.messages.length)return false
+  const projection=chat=>({...Object.fromEntries(Object.entries(chat).filter(([key])=>!['_storageRevision','updatedAt','messages'].includes(key))),messages:chat.messages.map(({displayRuntime,...row})=>row)})
+  return before.messages.some((row,index)=>own(row,'displayRuntime')!==own(current.messages[index],'displayRuntime')||!isDeepStrictEqual(row.displayRuntime,current.messages[index].displayRuntime))&&isDeepStrictEqual(projection(before),projection(current))
+}
+function rebaseDisplayCaptures(before,after,current,invalidatedFrom){
+  for(const [index,row]of before.messages.entries()){
+    const latest=current.messages[index],desired=after.messages[index]
+    const retained=index<invalidatedFrom&&desired?.tavernHistoryKey===row.tavernHistoryKey&&text(desired)===text(row)&&own(desired,'displayRuntime')===own(row,'displayRuntime')&&isDeepStrictEqual(desired.displayRuntime,row.displayRuntime)
+    if(retained){if(own(latest,'displayRuntime'))desired.displayRuntime=structuredClone(latest.displayRuntime);else delete desired.displayRuntime}
+    if(own(latest,'displayRuntime'))row.displayRuntime=structuredClone(latest.displayRuntime);else delete row.displayRuntime
+  }
+  before._storageRevision=current._storageRevision;before.updatedAt=current.updatedAt
+}
 function expandCompactedItems(session,items) {
   const events=sessionEvents(session),bySeq=new Map(events.map(e=>[e.seq,e]))
   const visit=(item,ancestors=new Set())=>{
@@ -86,7 +113,7 @@ export function projectHistoryMutation(session,before,after) {
 function invalidate(after,before) {
   let first=0
   while(first<before.messages.length&&first<after.messages.length&&isDeepStrictEqual(before.messages[first],after.messages[first]))first++
-  if(first===before.messages.length&&first===after.messages.length)return
+  if(first===before.messages.length&&first===after.messages.length)return Infinity
   const turns=[...before.messages.slice(first),...after.messages.slice(first)].map(row=>Number(row.turn)||(row.greeting?1:0)).filter(Boolean)
   const turn=turns.length?Math.min(...turns):0
   if(after.timeline) {
@@ -105,6 +132,7 @@ function invalidate(after,before) {
   }
   for(const row of after.messages.slice(first)) {delete row.displayRuntime;delete row.bodyEdit;delete row.tavernTemplateDisplay}
   if(after.contextCompaction)after.contextCompaction={...after.contextCompaction,baseline:[],operation:null,warning:''}
+  return first
 }
 
 /** Durable prepare → native append/flush → authoritative Chat commit, with exact recovery. */
@@ -143,20 +171,20 @@ export function createTavernHistoryOperations({chats,sessions,activity=()=>({}),
     if(afterCommit)await afterCommit(sessionId)
     return saved
   }
-  async function mutate(initial,mutator,{template=true}={}) {
+  async function mutate(initial,mutator,{template=true,preserveTimeline=false}={}) {
     if(running.has(initial.sessionId))await running.get(initial.sessionId)
     const task=exclusive(initial.id,async()=>{
       let current=await chats.forSession(initial.sessionId),agent=sessions.get(initial.sessionId)
       if(!agent?.session)throw new Error('无法访问原生会话')
       if(current.nativeHistoryEdit)current=await finish(current,agent)
       idle(current,agent)
-      if(current._storageRevision!==initial._storageRevision)throw new Error('聊天已被其他操作修改，请重新读取')
+      if(current._storageRevision!==initial._storageRevision&&!onlyDisplayCapturesChanged(initial,current))throw historyConflict('admission',initial,current)
       await synchronizeBodyEdits(agent.session,current,sessions.flush);syncAuthoredAgentPhase(agent)
       const before=structuredClone(current)
       for(const row of before.messages)row.tavernHistoryKey ||= randomUUID()
       let after=structuredClone(before);const targets=await mutator(after)
       for(const row of after.messages)row.tavernHistoryKey ||= randomUUID()
-      invalidate(after,before)
+      const invalidatedFrom=preserveTimeline?Infinity:invalidate(after,before)
       if(template&&prepareHistory)after=await prepareHistory(before,after,targets)
       const projected=projectHistoryMutation(agent.session,before,after)
       const plan=planNativeHistoryEdit(agent.session,projected.items)
@@ -167,7 +195,9 @@ export function createTavernHistoryOperations({chats,sessions,activity=()=>({}),
       const pending={id:randomUUID(),before,after,plan}
       current=await chats.update(current.id,latest=>{
         idle(latest,agent)
-        if(latest._storageRevision!==initial._storageRevision || latest.nativeHistoryEdit)throw new Error('聊天已被其他操作修改，请重新读取')
+        const changed=latest._storageRevision!==current._storageRevision
+        if(latest.nativeHistoryEdit||changed&&!onlyDisplayCapturesChanged(current,latest))throw historyConflict('prepared-admission',current,latest)
+        if(changed)rebaseDisplayCaptures(before,after,latest,invalidatedFrom)
         latest.messages=before.messages;latest.nativeHistoryEdit=pending;return latest
       },{source:'history.prepare'})
       try {const saved=await finish(current,agent);return {chat:saved,targets}}

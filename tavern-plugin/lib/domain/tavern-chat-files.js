@@ -4,7 +4,7 @@ const copy = value => structuredClone(value)
 export function legacyChatDocument(chat) {
   const context = projectTavernHelperContext(chat)
   return [{ user_name:chat.macroState?.userName||'你', character_name:chat.cardName||'', chat_metadata:context.chatMetadata },
-    ...context.messages.map(m=>({...copy(m.pluginData), name:m.name, mes:m.message, is_user:m.role==='user', is_system:m.role==='system',
+    ...context.messages.map(m=>({...copy(m.pluginData), name:m.name, mes:m.message, is_user:m.role==='user', is_system:m.role==='system', is_hidden:m.is_hidden,
       swipe_id:m.swipe_id, swipes:m.swipes, variables:m.swipes_data, extra:m.extra, swipe_info:m.swipes_info,
       ...(m.id?{id:m.id}:{}),...(m.send_date?{send_date:copy(m.send_date)}:{})}))]
 }

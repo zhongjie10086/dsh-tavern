@@ -664,18 +664,112 @@ window.__ModuleLoader__.load({
 		        let offset=0;
 		        while(true){check();const state=await invoke('pollTavernHelperGeneration',{id,offset});check();offset=state.offset;
 		          if(state.delta)onDelta(state.delta);
-		          if(state.status!=='running'){if(state.status!=='completed')throw Error(state.error||'生成未完成');if(typeof state.result!=='string')throw Error('扩展生成需要文本结果');await invoke('pollTavernHelperGeneration',{id,offset,received:true});return state.result;}
+		          if(state.status!=='running'){if(state.status!=='completed')throw Error(state.error||'生成未完成');const result=state.result;
+		            if(typeof result!=='string'&&!(owner.scriptId==='extension-sp-database'&&result&&typeof result.content==='string'&&Array.isArray(result.tool_calls)&&result.tool_calls.length&&result.tool_calls.every(call=>call?.type==='function'&&typeof call.id==='string'&&typeof call.function?.name==='string'&&typeof call.function.arguments==='string')))throw Error('扩展生成返回格式无效');
+		            await invoke('pollTavernHelperGeneration',{id,offset,received:true});return result;}
 		          await new Promise(resolve=>win.setTimeout(resolve,100));
 		        }
 		      }
-		      if(!body.stream){try{return observeResponse(new win.Response(JSON.stringify({choices:[{message:{role:'assistant',content:await consume(()=>{})}}]}),{headers:{'content-type':'application/json'}}))}catch(error){cleanup(error);throw error;}}
+		      if(!body.stream){try{const result=await consume(()=>{}),message=typeof result==='string'?{role:'assistant',content:result}:{role:'assistant',content:result.content,tool_calls:result.tool_calls};return observeResponse(new win.Response(JSON.stringify({choices:[{message,finish_reason:message.tool_calls?'tool_calls':'stop'}]}),{headers:{'content-type':'application/json'}}))}catch(error){cleanup(error);throw error;}}
 		      const encoder=new win.TextEncoder();
-		      const stream=new win.ReadableStream({start(controller){void consume(delta=>controller.enqueue(encoder.encode('data: '+JSON.stringify({choices:[{delta:{content:delta}}]})+'\n\n'))).then(()=>{controller.enqueue(encoder.encode('data: [DONE]\n\n'));controller.close();},error=>{controller.error(error);cleanup(error);});},cancel(){abort();}});
+		      const stream=new win.ReadableStream({start(controller){void consume(delta=>controller.enqueue(encoder.encode('data: '+JSON.stringify({choices:[{delta:{content:delta}}]})+'\n\n'))).then(result=>{if(typeof result!=='string')controller.enqueue(encoder.encode('data: '+JSON.stringify({choices:[{delta:{tool_calls:result.tool_calls.map((call,index)=>({index,...call}))},finish_reason:'tool_calls'}]})+'\n\n'));controller.enqueue(encoder.encode('data: [DONE]\n\n'));controller.close();},error=>{controller.error(error);cleanup(error);});},cancel(){abort();}});
 		      return observeResponse(new win.Response(stream,{headers:{'content-type':'text/event-stream'}}));
 		    } catch(error){cleanup(error);throw error;}
 		  };
 		  return { stop: win.stopAllGeneration };
 		}
+        // Native ST generation used by SP's logical turns. Keep the fetch call visible
+        // to the original package: its interceptor owns response capture and settlement.
+        function installTavernSpHostGeneration(win, st, { context, request, owner = () => ({}), track = promise => promise }) {
+          let active = null, disposed = false, preparation = null;
+          const identity = () => JSON.stringify([context().chatId, context().lifecycleRevision]);
+          const assertCurrent = expected => {
+            if (disposed || identity() !== expected) throw new win.DOMException('聊天已切换，生成已取消', 'AbortError');
+          };
+          // Called only by the fixed original forwarder, after its durable beforeDispatch
+          // gate. The receipt stays in this closure, including for direct API routes.
+          win.__dshSpQuietRequest=async function(messages,dispatch,signal){
+            const captured=preparation;
+            if(!captured)return dispatch(messages);
+            if(captured.claimed)throw new Error('零层请求缺少当前准备，不能重发');
+            assertCurrent(captured.scope);signal?.throwIfAborted();captured.claimed=true;
+            await request('prepareTavernSpQuietPrompt',{operation:'dispatch',id:captured.id},captured.origin);
+            let failed=true,attempted=false;
+            try{assertCurrent(captured.scope);signal?.throwIfAborted();attempted=true;const result=await dispatch(messages);failed=false;return result}
+            finally{await request('prepareTavernSpQuietPrompt',{operation:'complete',id:captured.id,failed,attempted},captured.origin)}
+          };
+          async function generate(kind = 'normal', options = {}, origin) {
+            if (!['normal', 'quiet'].includes(kind)) throw new Error('此宿主入口仅支持普通发送与 quiet 生成');
+            const scope = identity(); assertCurrent(scope);
+            options.signal?.throwIfAborted();
+            if (kind === 'normal') {
+              await win.__dshTavernComposerReady;
+              assertCurrent(scope);
+              if (typeof win.__dshSubmitTavernComposer !== 'function') throw new Error('真实会话输入框尚未就绪');
+              // The original package can reject this event before the authenticated
+              // composer submits anything. Do not catch AbortError and send anyway.
+              // Ordinary physical sends receive this event from the durable native
+              // input journal. Only a live logical carrier needs the earlier gate;
+              // otherwise listeners would receive the same admission twice.
+              if(st.chat.some(row=>Object.hasOwn(row,'_acu_zero_layer_v1')&&row._acu_zero_layer_v1?.exitManifest?.phase!=='committed'))
+                await st.eventSource.emit(st.eventTypes.GENERATION_AFTER_COMMANDS, kind, options, false);
+              assertCurrent(scope);
+              return win.__dshSubmitTavernComposer();
+            }
+            if (active) throw new Error('已有 quiet 生成正在进行');
+            if (typeof options.quiet_prompt !== 'string') throw new TypeError('quiet_prompt 必须是字符串');
+            const controller = new win.AbortController();
+            const abort = () => controller.abort(options.signal?.reason);
+            options.signal?.addEventListener('abort', abort, { once: true });
+            if (options.signal?.aborted) abort();
+            active = controller;
+            try {
+              await st.eventSource.emit(st.eventTypes.GENERATION_AFTER_COMMANDS, kind, options, false);
+              assertCurrent(scope); controller.signal.throwIfAborted();
+              const prepared = await request('prepareTavernSpQuietPrompt', {quietPrompt:options.quiet_prompt},origin);
+              assertCurrent(scope); controller.signal.throwIfAborted();
+              if(typeof prepared?.id!=='string'||!Array.isArray(prepared?.messages))throw new Error('零层正文上下文尚未准备');
+              preparation={id:prepared.id,scope,origin,claimed:false};
+              const chat = prepared.messages;
+              const prompt = { chat, dryRun: false };
+              Object.defineProperty(prompt, 'prompt', { configurable: true, enumerable: true, get() { return this.chat; }, set(value) { this.chat = value; } });
+              await st.eventSource.emit(st.eventTypes.CHAT_COMPLETION_PROMPT_READY, prompt, false);
+              assertCurrent(scope); controller.signal.throwIfAborted();
+              const body = { messages: prompt.chat, stream: false };
+              await st.eventSource.emit(st.eventTypes.CHAT_COMPLETION_SETTINGS_READY, body);
+              assertCurrent(scope); controller.signal.throwIfAborted();
+              const response = await win.fetch('/api/backends/chat-completions/generate', { method: 'POST', headers: st.getRequestHeaders(), body: JSON.stringify(body), signal: controller.signal });
+              assertCurrent(scope); controller.signal.throwIfAborted();
+              if (!response.ok) throw new Error('正文生成失败（HTTP ' + response.status + '）');
+              const value = await response.json();
+              assertCurrent(scope); controller.signal.throwIfAborted();
+              const text = value?.choices?.[0]?.message?.content;
+              if (typeof text !== 'string') throw new Error('正文模型未返回文本结果');
+              return text;
+            } finally {
+              options.signal?.removeEventListener('abort', abort);
+              if (active === controller) { active = null; preparation = null; }
+            }
+          }
+          st.generate = (kind,options) => {const origin=owner();return track(generate(kind,options,origin),origin);};
+          st.stopGeneration = async function () {
+            const stopped = active !== null;
+            active?.abort(new win.DOMException('生成已停止', 'AbortError'));
+            const helperStopped=win.stopAllGeneration?.()===true;
+            if(stopped||helperStopped)await st.eventSource.emit(st.eventTypes.GENERATION_STOPPED);
+            if(typeof win.__dshStopTavernComposer!=='function')throw new Error('当前会话停止入口不可用');
+            await win.__dshStopTavernComposer();
+            return true;
+          };
+          // History edits keep their existing authenticated mutation contract.
+          st.deleteLastMessage = async function () {
+            const last = st.chat.length - 1;
+            if (last < 0) return;
+            await win.deleteChatMessages([last]);
+          };
+          win.addEventListener('pagehide', () => { disposed = true; active?.abort(); }, { once: true });
+          return { invalidate() { active?.abort(new win.DOMException('聊天已切换', 'AbortError')); } };
+        }
 function installTavernScriptStorage(options) {
   const { window: win, context, currentScript, call } = options;
   const values = structuredClone(context().scriptStorage || {}), queues = new Map();
@@ -714,26 +808,33 @@ function installTavernScriptStorage(options) {
     }
     report();
   }
+  const protectedKey=(owner,key)=>owner==='extension-sp-database'&&String(key)==='__dsh_internal_sp129_vector_flush_v1';
   function change(kind, key, value, fixedOwner) {
     key = String(key); value = String(value);
     const { owner, data } = bucket(fixedOwner), q = queue(owner), lifecycle = Number(context().lifecycleRevision || 0);
     if ((q.operations.length || q.task || q.error) && q.lifecycleRevision !== lifecycle) throw new Error('脚本生命周期已变化，旧设置尚未保存');
+    if(kind!=='clear'&&protectedKey(owner,key))throw new Error('SP 向量任务保留键不可通过普通设置修改');
     // An existing pending or failed write retains its receipt/retry state.
     if ((kind === 'set' && own(data,key) && data[key] === value) || (kind === 'remove' && !own(data,key)) || (kind === 'clear' && Object.keys(data).length === 0)) return;
     if (kind === 'set') { if (key.length > 4096 || value.length > 8000000) throw new DOMException('脚本存储超过容量', 'QuotaExceededError'); Object.defineProperty(data, key, { value, enumerable: true, writable: true, configurable: true }); }
-    else if (kind === 'remove') delete data[key]; else for (const key of Object.keys(data)) delete data[key];
+    else if (kind === 'remove') delete data[key]; else for (const key of Object.keys(data)) {if(!protectedKey(owner,key))delete data[key];}
     q.lifecycleRevision = lifecycle; q.operations = compact([...q.operations, { kind, key, value }]); report();
     if(q.error&&retryable(q.error)){if(q.attempts>=3)q.attempts=0;retryLater(q);}
     if (!q.timer && !q.task && !q.error) q.timer = win.setTimeout(() => { q.timer = null; void flush(owner).catch(error => win.console.error('脚本本机设置保存失败', error)); }, 50);
   }
   function storageFor(owner) {
     const storage = {
-      getItem(key) { const { data } = bucket(owner); return own(data, String(key)) ? data[String(key)] : null; },
+      getItem(key) { const { data } = bucket(owner); return !protectedKey(owner,key)&&own(data, String(key)) ? data[String(key)] : null; },
       setItem(key,value) { change('set',key,value,owner); }, removeItem(key) { change('remove',key,undefined,owner); }, clear() { change('clear',undefined,undefined,owner); },
-      key(index) { return Object.keys(bucket(owner).data)[Number(index)] ?? null; }
+      key(index) { return Object.keys(bucket(owner).data).filter(key=>!protectedKey(owner,key))[Number(index)] ?? null; }
     };
-    Object.defineProperty(storage,'length',{get:()=>Object.keys(bucket(owner).data).length,configurable:true});
-    return new Proxy(storage,{get(target,key){return key in target || typeof key==='symbol' ? target[key] : target.getItem(key) ?? undefined},set(target,key,value){target.setItem(key,value);return true},deleteProperty(target,key){target.removeItem(key);return true},ownKeys(){return Object.keys(bucket(owner).data)},getOwnPropertyDescriptor(target,key){return own(bucket(owner).data,key)?{value:target.getItem(key),enumerable:true,configurable:true,writable:true}:Reflect.getOwnPropertyDescriptor(target,key)}});
+    if(owner==='extension-sp-database'){
+      const request=operation=>call('tavernScriptStorage',{operation:{...operation,kind:'sp-vector-flush'}},{scriptId:owner,lifecycleRevision:Number(context().lifecycleRevision||0)});
+      storage.__dshSpVectorFlushSnapshot=()=>request({action:'read'});
+      storage.__dshSpVectorFlushUpdate=operation=>request(operation);
+    }
+    Object.defineProperty(storage,'length',{get:()=>Object.keys(bucket(owner).data).filter(key=>!protectedKey(owner,key)).length,configurable:true});
+    return new Proxy(storage,{get(target,key){return key in target || typeof key==='symbol' ? target[key] : target.getItem(key) ?? undefined},set(target,key,value){target.setItem(key,value);return true},deleteProperty(target,key){target.removeItem(key);return true},ownKeys(){return Object.keys(bucket(owner).data).filter(key=>!protectedKey(owner,key))},getOwnPropertyDescriptor(target,key){return !protectedKey(owner,key)&&own(bucket(owner).data,key)?{value:target.getItem(key),enumerable:true,configurable:true,writable:true}:Reflect.getOwnPropertyDescriptor(target,key)}});
   }
   const owned = new Map();
   win.__dshTavernStorageFor = owner => { owner=String(owner); if(!owner)throw new Error('脚本存储缺少身份'); if(!owned.has(owner))owned.set(owner,storageFor(owner));return owned.get(owner); };
@@ -762,6 +863,7 @@ function installTavernFileBridge(win, call) {
   win.fetch = async function (input, init = {}) {
     const url = new URL(typeof input === 'string' ? input : input.url || String(input), win.document.baseURI);
     const local = url.origin === new URL(win.document.baseURI).origin;
+    if(local&&['/api/search/searxng','/api/search/visit'].includes(url.pathname)&&typeof win.__dshSpWebFetch==='function')return win.__dshSpWebFetch(url.pathname,init);
     if(local&&url.pathname==='/api/backends/chat-completions/generate') {
       try {
         if(String(init.method||'GET').toUpperCase()!=='POST'||typeof init.body!=='string')throw Error('模型请求必须使用 JSON POST');
@@ -904,7 +1006,7 @@ function installTavernRegisteredSlashComposer({window:w,document:doc,getRoot,get
           }
          }
          function dispatch(id,entry){
-          if(entry.sent||!entry.provider.databaseReady)return;
+          if(entry.sent||!entry.provider.databaseReady&&entry.operation.kind!=='zero-stop')return;
           entry.sent=true;
           post(entry.provider,{type:'dsh-tavern-original-database-command',requestId:id,operation:entry.operation,chatId:entry.chatId,lifecycleRevision:entry.lifecycleRevision});
          }
@@ -937,16 +1039,19 @@ function installTavernRegisteredSlashComposer({window:w,document:doc,getRoot,get
           if(data.ok){if(data.result?.names)catalog(record,data.result.names);entry.resolve(data.result)}else entry.reject(Error(data.error||'原数据库模板操作失败'));
           return true;
          }
-         function remove(record){
+         function remove(record,retiringRecords){
           for(const[id,entry]of pending)if(entry.caller===record||entry.provider===record){pending.delete(id);cancel(entry.timer);entry.reject(Error('数据库脚本已重新加载，请重试'))}
           if(isProvider(record))for(const other of records.values())if(other!==record&&sameChat(other,record)){
            delete other.context.originalDatabaseTemplates;
-           post(other,{type:'dsh-tavern-helper-context',context:{originalDatabaseTemplates:null}});
+           // Bulk teardown still clears metadata and rejects work, but these exact
+           // retiring realms cannot consume another full projected context.
+           if(!retiringRecords?.has(other))post(other,{type:'dsh-tavern-helper-context',context:{originalDatabaseTemplates:null}});
           }
          }
-         function requestPanel(sessionId,operation){
+         function requestPanel(sessionId,operation,expected){
           const provider=[...records.values()].find(record=>isProvider(record)&&record.sessionId===sessionId&&current(record));
-          if(!provider||!provider.databaseReady)return Promise.reject(Error('SP 原包未就绪，当前仅可查看缓存。'));
+          if(expected&&(!provider||provider.id!==expected.id||provider.context.chatId!==expected.chatId||Number(provider.context.lifecycleRevision||0)!==expected.lifecycleRevision))return Promise.reject(Error('原数据库实例已变化，操作已取消'));
+          if(!provider||!provider.databaseReady&&operation.kind!=='zero-stop')return Promise.reject(Error('SP 原包未就绪，当前仅可查看缓存。'));
           const id='database-panel-'+(++sequence);
           return new Promise((resolve,reject)=>{const timer=schedule(()=>{pending.delete(id);reject(Error('SP 原包操作超时，缓存保持只读。'));},60000),entry={caller:provider,provider,resolve,reject,timer,operation,chatId:provider.context.chatId,lifecycleRevision:Number(provider.context.lifecycleRevision||0)};pending.set(id,entry);dispatch(id,entry)});
          }
@@ -1005,6 +1110,10 @@ function installTavernRegisteredSlashComposer({window:w,document:doc,getRoot,get
           const {confirmed}=stale;
           await queue(async()=>{if(!stale)return;try{return await publish(confirmed,call,'flush')}catch(error){status('unavailable',error);throw error}});
          }
+         function persistenceState(detail=false){
+          const checks={};let persisted=true;const check=(name,read)=>{if(!detail&&!persisted)return;const value=read();checks[name]=Boolean(value);persisted=Boolean(persisted&&value)};
+          try{const api=options.getOriginalApi();check('apiPresent',()=>api);check('ready',()=>ready);check('open',()=>!closed);check('unclaimed',()=>!claim);check('fresh',()=>!stale);check('queueEmpty',()=>!queued);check('publishingEmpty',()=>!publishing.size);check('receiptPresent',()=>lastReceipt);check('stampMatches',()=>lastStamp===stamp(api.exportTableAsJson()));check('scopeMatches',()=>lastScope===scope(api));return detail?{persisted,checks,queued,publishing:publishing.size}:persisted}catch(_){return detail?{persisted:false,checks,probeFailed:true}:false}
+         }
          return {
           connect:()=>queue(async()=>{try{const api=options.getOriginalApi();if(!api)throw new Error('SP 原包未就绪，当前仅可查看缓存。');const state=await options.call('beginTavernSpAuthority',request(await api.exportTableAsJson(),scope(api)));revision=state.revision;status(state.phase);return state}catch(error){status('unavailable',error);throw error}}),
           choose:side=>queue(async()=>{try{const choice=await options.call('chooseTavernSpAuthority',{side,lifecycle:options.lifecycle,expectedRevision:revision});revision=choice.revision??revision;if(choice.alreadyChosen)return choice;claim=choice.claimId;status('claiming');await options.importOriginal(choice.importToOriginal);return await publish(false,options.call,'choose')}catch(error){status('unavailable',error);throw error}}),
@@ -1024,7 +1133,8 @@ function installTavernRegisteredSlashComposer({window:w,document:doc,getRoot,get
           note,
           trace:()=>trace,
           getState:()=>({ready,revision,claim,closed,stale:Boolean(stale)}),
-          isPersisted:()=>{try{const api=options.getOriginalApi();return Boolean(api&&ready&&!closed&&!claim&&!stale&&!queued&&!publishing.size&&lastReceipt&&lastStamp===stamp(api.exportTableAsJson())&&lastScope===scope(api));}catch(_){return false;}},
+          isPersisted:()=>persistenceState(),
+          persistenceDiagnostics:()=>persistenceState(true),
           close:()=>{closed=true;status('closed')}
          };
         }
@@ -1110,7 +1220,7 @@ function installTavernRegisteredSlashComposer({window:w,document:doc,getRoot,get
          // the fault and the repair waits for the game's page, which has no such
          // budget. Returns whether the tables changed, so the caller publishes them.
          async function repairHiddenColumns(){
-          let dropped=[],left=[],failure='';const started=Date.now(),deferred=options.background===true;
+          let dropped=[],left=[],failure='';const started=Date.now(),deferred=options.background===true&&options.persistentOwner!==true;
           try{
            const template=structuredClone(project(api.exportTableAsJson()));({dropped,left}=dropGhostHiddenColumns(template));
            if(dropped.length&&!deferred){
@@ -1185,7 +1295,12 @@ function installTavernRegisteredSlashComposer({window:w,document:doc,getRoot,get
          // `awaitOriginalWork` is false only for an ordinary event on a visible page: the
          // original's deferred table fill then stays parallel to the next send.
          win.__dshFlushOriginalDatabase=async({retry=false,recoveryCall,awaitOriginalWork=true}={})=>{if(awaitOriginalWork)await api.__dshFlushPendingWork?.();if(retry){if(hydration)throw Error('SP 原包正在加载本局表格，当前仅可查看缓存。');const failedHydration=hydrationFailure;hydrationFailure=null;await bridge.publish(true,recoveryCall,failedHydration?'hydration':'retry')}await bridge.flush({settle:awaitOriginalWork,call:recoveryCall});await options.flushSettings?.(recoveryCall);};
-         Object.defineProperty(win,'__dshOriginalDatabaseIsPersisted',{value:()=>{try{return connected&&!internal&&!hydration&&!hydrationFailure&&!state.retired&&state.ready===true&&win.AutoCardUpdaterAPI===api&&Number(options.context().lifecycleRevision)===lifecycle&&api.__dshIsPersistenceIdle?.()===true&&bridge.isPersisted();}catch(_){return false;}}});
+         function originalPersistenceState(detail=false){
+          const checks={};let persisted=true;const check=(name,read)=>{if(!detail&&!persisted)return;const value=read();checks[name]=Boolean(value);persisted=Boolean(persisted&&value)};
+          try{check('connected',()=>connected);check('external',()=>!internal);check('hydrationIdle',()=>!hydration);check('hydrationHealthy',()=>!hydrationFailure);check('active',()=>!state.retired);check('ready',()=>state.ready===true);check('apiMatches',()=>win.AutoCardUpdaterAPI===api);check('lifecycleMatches',()=>Number(options.context().lifecycleRevision)===lifecycle);check('coreIdle',()=>api.__dshIsPersistenceIdle?.()===true);check('authorityPersisted',()=>bridge.isPersisted());return detail?{epoch:Date.now(),persisted,checks,core:api.__dshPersistenceDiagnostics?.(),authority:bridge.persistenceDiagnostics()}:persisted}catch(_){return detail?{epoch:Date.now(),persisted:false,checks,probeFailed:true}:false}
+         }
+         Object.defineProperty(win,'__dshOriginalDatabaseIsPersisted',{value:()=>originalPersistenceState()});
+         Object.defineProperty(win,'__dshOriginalDatabasePersistenceDiagnostics',{value:()=>originalPersistenceState(true)});
          const initial=await bridge.connect();connected=true;
          if(initial.phase==='choice'||initial.phase==='claiming'){
           conflictPanel=win.document.createElement('section');conflictPanel.setAttribute('role','alert');conflictPanel.style.cssText='position:fixed;inset:12px 12px auto;z-index:2147483647;background:Canvas;color:CanvasText;padding:16px;border:1px solid #b88';
@@ -1201,7 +1316,14 @@ function installTavernRegisteredSlashComposer({window:w,document:doc,getRoot,get
          win.__dshOriginalDatabaseCatalogChanged=()=>{const names=api.getTemplatePresetNames?.()||[],signature=JSON.stringify(names);if(signature!==announced){announced=signature;options.post?.({type:'dsh-tavern-original-database-ready',ready:state.ready===true,names})}};
          win.__dshOriginalDatabaseCommand=async operation=>{
           if(operation.kind==='list')return {success:true,names:api.getTemplatePresetNames?.()||[]};
+          if(operation.kind==='zero-stop'){if(state.retired||win.AutoCardUpdaterAPI!==api||Number(options.context().lifecycleRevision)!==lifecycle)throw Error('零层实例已变化，停止已取消');api.stopZeroLayer();return {stopped:true}}
           if(hydration||hydrationFailure||state.retired||win.AutoCardUpdaterAPI!==api||Number(options.context().lifecycleRevision)!==lifecycle)throw Error('SP 原包正在加载本局表格、加载失败或所属实例已变化，当前仅可查看缓存。');
+          if(operation.kind==='zero-input'){
+           const carrier=win.SillyTavern.getContext().chat.find(row=>Object.hasOwn(row,'_acu_zero_layer_v1'))?._acu_zero_layer_v1;
+           if(!carrier?.enabled||carrier.exitManifest)throw Error('零层未启用或退出尚未完成，输入已保留');
+           const result=await api.submitZeroLayerInput(operation.text);await options.flushSettings?.();return result;
+          }
+          if(operation.kind==='zero-read')return operation.method==='history'?api.zeroLayer.readHistory(operation.query):api.zeroLayer.getSnapshot(operation.query);
           const result=await bridge.mutate(operation);await options.flushSettings?.();win.__dshOriginalDatabaseCatalogChanged();
           const {database}=await options.call('getSpDatabase');return {...result,names:api.getTemplatePresetNames?.()||[],database};
          };
@@ -1255,31 +1377,87 @@ function installTavernRegisteredSlashComposer({window:w,document:doc,getRoot,get
          let descriptor=null, nativeDatabase=null, commandTail=Promise.resolve();
          win.__dshInstallExtensionHost=async function(input){
           descriptor=input;nativeDatabase=win.AutoCardUpdaterAPI;
-          const bound=new Map();let host;host=new Proxy(win,{get(target,key){if(['window','self','parent','top'].includes(key))return host;const value=Reflect.get(target,key,target);if(typeof value==='function'&&!value.prototype){if(!bound.has(value))bound.set(value,value.bind(target));return bound.get(value)}return value},set(target,key,value){return Reflect.set(target,key,value,target)}});win.__dshExtensionWindow=host;
+          // Original request gates compare endpoints with the owning host URL. srcdoc's
+          // about: URL is not that endpoint; expose the actual authenticated document
+          // base as a read-only URL, without granting parent DOM or navigation access.
+          const baseUrl=new URL(doc.baseURI),hostLocation=Object.freeze({href:baseUrl.href,origin:baseUrl.origin,protocol:baseUrl.protocol,host:baseUrl.host,hostname:baseUrl.hostname,port:baseUrl.port,pathname:baseUrl.pathname,search:baseUrl.search,hash:baseUrl.hash,toString:()=>baseUrl.href});
+          const nativeRequestLocation=input.id==='sp-database'&&input.version==='1.2.9';
+          if(nativeRequestLocation&&options.persistentOwner===true){
+           const owner=()=>({scriptId:'extension-sp-database',lifecycleRevision:Number(options.context().lifecycleRevision)||0});
+           const canonical=await options.call('getTavernSpOwnedTaskIdentity',{},owner());
+           win.__dshSpOwnedTaskIdentity=()=>({...canonical});
+           const methods={Register:'registerTavernSpOwnedTask',Cancel:'cancelTavernSpOwnedTask',Dispatch:'dispatchTavernSpOwnedTask',Checkpoint:'checkpointTavernSpOwnedTask',AssertOwner:'assertTavernSpOwnedTask',Command:'commandTavernSpOwnedTask',PrepareSaveRetry:'prepareTavernSpOwnedSaveRetry'};
+           for(const [name,method]of Object.entries(methods))win['__dshSpOwnedTask'+name]=(payload,recovery)=>options.call(method,{payload},recovery?{...owner(),spRecoveryToken:recovery.token}:owner());
+           win.__dshCaptureSpOwnedTaskRegister=()=>{
+            if(typeof options.captureOwner!=='function')throw Error('SP 注册事件身份捕获入口不可用');
+            const captured=Object.freeze({...owner(),eventId:String(options.captureOwner().eventId||'')});
+            return payload=>options.call('registerTavernSpOwnedTask',{payload},captured);
+           };
+           win.__dshSpOwnedSaveCall=recovery=>{
+            if(!recovery?.token||!recovery.taskId)throw Error('SP 专用保存能力缺失');
+            const savedOwner=Object.freeze({...owner(),spRecoveryToken:recovery.token});
+            return (method,args)=>{if(!['saveTavernChatData','saveTavernExtensionSettings','publishTavernSpAuthorityCache'].includes(method))throw Error('SP 恢复仅允许保存');return options.call(method,args,savedOwner);};
+           };
+           win.__dshSpOwnedTaskOwnerCommand=payload=>options.call('commandTavernSpOwnedTask',{payload},owner());
+           win.__dshSpOwnedModelStep=payload=>options.call('modelTavernSpOwnedTask',{payload},owner());
+           win.__dshSpOwnedTasksEnabled=true;
+          }
+          if(nativeRequestLocation)win.__dshAssertSpNativeInput=stamp=>{
+           const state=options.context(),chat=win.SillyTavern.getContext().chat,row=chat[stamp?.floor];
+           if(!stamp||stamp.version!==1||typeof stamp.operationId!=='string'||!stamp.operationId||stamp.chatId!==state.chatId||state.nativeInput?.operationId!==stamp.operationId||state.nativeInput?.floor!==stamp.floor||state.nativeInput?.branchId!==stamp.branchId||stamp.lifecycleRevision!==Number(state.lifecycleRevision||0)||stamp.floor!==chat.length-1||!row?.is_user)throw Error('原生输入准入身份已变化');
+          };
+          if(nativeRequestLocation)win.__dshSpWebFetch=async(path,init)=>{
+           if(String(init.method||'GET').toUpperCase()!=='POST'||typeof init.body!=='string')throw Error('网页请求必须使用 JSON POST');
+           init.signal?.throwIfAborted();
+           const requestId=win.crypto.randomUUID(),body=JSON.parse(init.body),owner={scriptId:'extension-sp-database',lifecycleRevision:Number(options.context().lifecycleRevision)||0};
+           const abort=()=>{void options.call('tavernSpWebRequest',{operation:{kind:'cancel',requestId}},owner).catch(()=>{})};
+           init.signal?.addEventListener('abort',abort,{once:true});
+           try{const result=await options.call('tavernSpWebRequest',{operation:{path,body,requestId}},owner);init.signal?.throwIfAborted();return new win.Response([204,205,304].includes(result.status)?null:result.body,{status:result.status,headers:{'content-type':result.contentType}})}
+           finally{init.signal?.removeEventListener('abort',abort)}
+          };
+
+          const bound=new Map();let host;host=new Proxy(win,{get(target,key){if(['window','self','parent','top'].includes(key))return host;if(key==='location'&&nativeRequestLocation)return hostLocation;const value=Reflect.get(target,key,target);if(typeof value==='function'&&!value.prototype){if(!bound.has(value))bound.set(value,value.bind(target));return bound.get(value)}return value},set(target,key,value){if(key==='location'&&nativeRequestLocation)throw Error('扩展不能导航宿主');return Reflect.set(target,key,value,target)}});win.__dshExtensionWindow=host;
           if(!doc.body)await new Promise(r=>doc.addEventListener('DOMContentLoaded',r,{once:true}));
           if(!win.__dshUiJQuery){await new Promise((resolve,reject)=>{const s=doc.createElement('script');s.src='/api/dsh-tavern/vendor/runtime-assets/jquery/jquery.min.js';s.onload=resolve;s.onerror=()=>reject(Error('扩展 jQuery 加载失败'));doc.head.appendChild(s)});win.__dshUiJQuery=win.jQuery.noConflict(true)}
           win.jQuery=win.$=win.__dshUiJQuery;
           for(const id of ['extensionsMenu','extensions_settings','extensions_settings2','top-settings-holder']){let node=doc.getElementById(id);if(!node){node=doc.createElement('div');node.id=id;doc.body.appendChild(node)}node.hidden=false}
           const style=doc.createElement('style');style.textContent='html,body{margin:0;min-height:100%;background:#202529;color:#e2e6e9;font:14px system-ui}#extensionsMenu{padding:12px;display:flex;gap:12px;flex-wrap:wrap}.list-group-item{cursor:pointer;padding:10px;border:1px solid #4e5f63;border-radius:8px}';doc.head.appendChild(style);
           if(input.style){const packageStyle=doc.createElement('style');packageStyle.textContent=String(input.style);doc.head.appendChild(packageStyle)}
-          win.__dshOriginalExtensionState={...input,ready:false};
+          win.__dshOriginalExtensionState={...input,ready:false,phase:'host-installed'};
+          if(input.id==='sp-database'&&input.version==='1.2.9'){
+           let closed=false,channelReady=false,readyEpoch=0,frames=[];
+           win.addEventListener('message',event=>{if(event.source===win.parent&&event.data?.token===options.token&&event.data.type==='dsh-tavern-sp-game-state'){readyEpoch++;channelReady=event.data.ready===true}});
+           const invoke=(kind,value={})=>options.call('tavernSpZeroLayerView',{operation:{kind,...value}});
+           const update=value=>({carrierIndex:value.carrierIndex,update:{snapshot:value.snapshot,body:value.body,preview:value.preview??null},expectedOrigin:value.expectedOrigin,frameToken:value.frameToken});
+           win.__dshSpView={
+            async mount(value){closed=false;channelReady=false;const result=await invoke('mount',update(value));if(result?.mounted!==true)throw Error('零层真实载体尚未挂载');frames=result.frames||[];return result},
+            async publish(value){if(closed)throw Error('零层显示已退出');const result=await invoke('publish',update(value));if(result?.mounted!==true)throw Error('零层真实载体尚未挂载');frames=result.frames||[];return result},
+            frames:()=>frames.map(frame=>({...frame})),
+            bindGameFrame(value){if(closed)throw Error('零层显示已退出');let disposed=false;const epoch=readyEpoch,task=invoke('bind',update(value)).then(result=>{if(epoch===readyEpoch)channelReady=result.isReady===true});task.catch(error=>win.toastr?.error(error.message));return {get isReady(){return !disposed&&!closed&&channelReady},dispose(){disposed=true;void invoke('unbind').catch(()=>{})}}},
+            dispose(){if(closed)return;closed=true;channelReady=false;frames=[];void invoke('dispose').catch(()=>{})},
+            error(message){win.toastr?.warning?.(message)}
+           };
+          }
           win.addEventListener('pagehide',()=>{win.__dshOriginalExtensionState.retired=true;win.__dshOriginalExtensionState.ready=false},{capture:true,once:true});
           win.__dshOpenExtension=()=>{const menu=doc.querySelector('#extensionsMenu .list-group-item, #extensionsMenu button');if(menu)menu.click()};
          };
          // SP owns its original UI/storage, while every other script reads the host's
          // AutoCardUpdaterAPI. Exchange committed tables through that existing API.
          win.__dshConnectOriginalDatabase=async function(){
+          win.__dshOriginalExtensionState.phase='connect-enter';
           if(descriptor?.id==='sp-database')return options.connectSingleAuthority(win,options,nativeDatabase,descriptor);
          };
          win.addEventListener('message',event=>{
           const data=event.data;if(event.source!==win.parent||data?.token!==options.token)return;
           if(data.type==='dsh-tavern-extension-open'){win.__dshOpenExtension?.();return}
           if(data.type!=='dsh-tavern-original-database-command')return;
-          const task=commandTail.catch(()=>{}).then(async()=>{
+          const execute=async()=>{
            const context=options.context();if(data.chatId!==context.chatId||Number(data.lifecycleRevision)!==Number(context.lifecycleRevision||0))throw Error('聊天已切换，模板操作已取消');
-           if(!win.__dshOriginalExtensionState?.ready||!win.__dshOriginalDatabaseCommand)throw Error('原数据库尚未就绪');
+           if(data.operation?.kind!=='zero-stop'&&!win.__dshOriginalExtensionState?.ready||!win.__dshOriginalDatabaseCommand)throw Error('原数据库尚未就绪');
            return win.__dshOriginalDatabaseCommand(data.operation);
-          });commandTail=task;
+          };
+          const task=data.operation?.kind==='zero-stop'?Promise.resolve().then(execute):commandTail.catch(()=>{}).then(execute);
+          if(data.operation?.kind!=='zero-stop')commandTail=task;
           task.then(result=>options.post({type:'dsh-tavern-original-database-result',requestId:data.requestId,ok:true,result}),error=>options.post({type:'dsh-tavern-original-database-result',requestId:data.requestId,ok:false,error:String(error.message||error)}));
          });
         }
@@ -3266,6 +3444,7 @@ function createMigrationWorkbenchFeature() {
         executeSlash: createTavernFrameSlashExecutor(ctx),
         composerInput: function(sessionId){const scope=ctx.sessions.scope(sessionId),conversation=ctx.get('conversation');if(!scope||!conversation)throw new Error('当前对话输入框不可用');return conversation.input.for(scope);},
         composerRunning: function(sessionId){return ctx.sessions.list.getSnapshot().byId[sessionId]?.running===true;},
+        stopComposer: function(sessionId){const scope=ctx.sessions.scope(sessionId),conversation=scope?.get('conversation');if(!conversation)throw new Error('当前会话停止入口不可用');return conversation.cancel();},
         composerRoot: function(sessionId){return Array.from(document.querySelectorAll('[data-dsh-tavern-composer-owner]')).find(node=>node.dataset.dshTavernComposerOwner===sessionId)?.closest('[data-composer-card]')||null;},
         appendInput: function (sessionId, text) {
           const scope = ctx.sessions.scope(sessionId), conversation = ctx.get("conversation");
@@ -5960,6 +6139,221 @@ function IzumiFloatingPanel(props){
 		    }
 		  };
 		}
+        // Real renderer instances, never a cloned transcript or a replacement game.
+        function createTavernSpLiveSurfaces(){
+         const frames=new Set(),views=new Map();
+         const key=scope=>JSON.stringify([scope.sessionId,Number(scope.lifecycleRevision)||0]);
+         function register(frame){frames.add(frame);return()=>{frames.delete(frame);for(const view of views.values())if(view.frame===frame)dispose(view)}}
+         function dispose(view){view.channel?.dispose();view.slot?.remove();view.frame.hold=false;for(const game of view.games||[])game.hold=false;views.delete(view.key)}
+         function assertFrame(view){if(!frames.has(view.frame)||!view.frame.current()||!view.frame.node.isConnected)throw Error('零层真实游戏表面已退出');}
+         function command(scope,operation,read,notify=()=>{}){
+          const id=key(scope);
+          if(operation.kind==='dispose'){const old=views.get(id);if(old)dispose(old);return {disposed:true}}
+          if(operation.kind==='unbind'){views.get(id)?.channel?.dispose();if(views.get(id))views.get(id).channel=null;return {unbound:true}}
+          const update=operation.update,snapshot=update?.snapshot;
+          if(!snapshot||snapshot.carrierRef?.messageIndex!==undefined&&snapshot.carrierRef.messageIndex!==operation.carrierIndex)throw Error('零层载体身份无效');
+          let view=views.get(id);const created=!view;
+          if(!view){
+           let candidates=[...frames].filter(frame=>frame.current()&&frame.identity.sessionId===scope.sessionId&&Number(frame.identity.lifecycleRevision||0)===Number(scope.lifecycleRevision||0)&&frame.identity.messageId===operation.carrierIndex);
+           const games=candidates.filter(frame=>frame.node.tagName==='IFRAME'),surfaces=candidates.filter(frame=>frame.node.tagName!=='IFRAME');
+           if(surfaces.length===1)candidates=surfaces;
+           if(candidates.length!==1)throw Error('零层载体的真实游戏界面尚未挂载或不唯一；请显示开场游戏界面后重同步');
+           const frame=candidates[0],slot=frame.node.ownerDocument.createElement('section');slot.dataset.dshZeroLayerBody='true';slot.setAttribute('aria-live','polite');slot.style.whiteSpace='pre-wrap';frame.node.after(slot);frame.hold=true;
+           view={key:id,frame,games,slot,scope:structuredClone(scope),latest:structuredClone(update),read,notify};views.set(id,view);
+          }
+          // Discover real renderer iframes activated after the stable carrier mount.
+          view.games=[...frames].filter(frame=>frame.node.tagName==='IFRAME'&&frame.current()&&frame.node.isConnected&&frame.identity.sessionId===scope.sessionId&&Number(frame.identity.lifecycleRevision||0)===Number(scope.lifecycleRevision||0)&&frame.identity.messageId===operation.carrierIndex);
+          assertFrame(view);
+          const prior=view.latest.snapshot;
+          if(prior.sessionId!==snapshot.sessionId||prior.branchId!==snapshot.branchId||prior.carrierRef.carrierId!==snapshot.carrierRef.carrierId||prior.carrierRef.swipeId!==snapshot.carrierRef.swipeId){dispose(view);return command(scope,operation,read,notify)}
+          if(snapshot.revision<prior.revision)throw Error('零层显示修订已过期');
+          view.latest=structuredClone(update);view.slot.textContent=String(update.body||'');if(view.channel?.isActive)view.channel.publish(view.latest);
+          if(operation.kind==='bind'||operation.kind==='mount'||created){
+           const game=operation.frameToken?view.games.find(frame=>frame.token===operation.frameToken):view.games.length===1?view.games[0]:null;
+           if(operation.kind==='bind'&&!game)throw Error('请指定已认证的真实游戏 frame 身份');
+           if(game){
+            if(operation.expectedOrigin!==undefined&&operation.expectedOrigin!==game.node.ownerDocument.location.origin)throw Error('游戏表面来源不匹配');
+            if(view.game!==game){view.channel?.dispose();if(view.game)view.game.hold=false;view.channel=null;view.game=game;game.hold=true}
+            if(operation.kind==='bind'&&view.channel){view.channel.dispose();view.channel=null}
+            if(!view.channel?.isActive)view.channel=createTavernSpGameChannel({...view,frame:game},()=>{assertFrame(view);if(!frames.has(game)||!game.current()||!game.node.isConnected)throw Error('游戏表面已退出')});
+           }
+          }
+          return {mounted:true,isReady:view.channel?.isReady===true,frames:view.games.map(frame=>({dshFrameToken:frame.token}))};
+         }
+         return {register,command,isHeld:node=>[...frames].some(frame=>frame.node===node&&frame.hold),disposeScope(scope){const view=views.get(key(scope));if(view)dispose(view)}};
+        }
+
+        // Same bounded protocol as the fixed original. Opaque origin is accepted only
+        // for this authenticated, registered sandboxed frame, with its exact Window,
+        // fresh nonce, monotonically increasing sequence and complete logical scope.
+        function createTavernSpGameChannel(view,assertCurrent){
+         const frame=view.frame.node,host=frame.ownerDocument.defaultView,target=frame.contentWindow;
+         const opaque=frame.hasAttribute('sandbox')&&!frame.sandbox.contains('allow-same-origin');
+         const origin=opaque?'null':new URL(frame.hasAttribute('srcdoc')?frame.ownerDocument.location.href:frame.getAttribute('src')||frame.ownerDocument.location.href,frame.ownerDocument.baseURI).origin;
+         if(!target||!opaque&&!/^https?:/.test(origin))throw Error('游戏表面来源不受支持');
+         const attributes=['src','srcdoc','sandbox'].map(name=>frame.getAttribute(name)),token=host.crypto.randomUUID();
+         let active=true,ready=false,incoming=0,outgoing=0,latest=view.latest;
+         const scope=()=>({sessionId:latest.snapshot.sessionId,branchId:latest.snapshot.branchId,carrierRef:latest.snapshot.carrierRef});
+         const same=(left,right)=>left?.sessionId===right.sessionId&&left.branchId===right.branchId&&left.carrierRef?.carrierId===right.carrierRef.carrierId&&left.carrierRef?.swipeId===right.carrierRef.swipeId;
+         function check(){assertCurrent();if(!active||frame.contentWindow!==target||attributes.some((value,index)=>frame.getAttribute(['src','srcdoc','sandbox'][index])!==value))throw Error('游戏表面身份已变化')}
+         function send(kind,value){check();target.postMessage({protocol:'acu-zero-layer-game',version:1,kind,token,scope:scope(),sequence:++outgoing,...value},opaque?'*':origin)}
+         function dispose(){if(!active)return;active=false;ready=false;host.clearTimeout(timer);host.removeEventListener('message',receive);frame.removeEventListener('load',dispose);observer?.disconnect();view.notify(false)}
+         async function receive(event){
+          if(!active||event.source!==target||event.origin!==origin)return;
+          const data=event.data;if(data?.protocol!=='acu-zero-layer-game'||data.version!==1||data.token!==token||!Number.isSafeInteger(data.sequence)||data.sequence<=incoming||!same(data.scope,scope()))return;
+          try{check();if(data.kind==='accept'&&!ready){incoming=data.sequence;ready=true;host.clearTimeout(timer);send('update',{update:latest});view.notify(true);return}
+           if(!ready||!['snapshot','history','close'].includes(data.kind))return;incoming=data.sequence;if(data.kind==='close'){dispose();return}
+           if(typeof data.requestId!=='string'||!data.requestId)return;
+           const result=await view.read(data.kind,data.query);check();if(ready)send('result',{requestId:data.requestId,result});
+          }catch{dispose()}
+         }
+         host.addEventListener('message',receive);frame.addEventListener('load',dispose);
+         const observer=host.MutationObserver?new host.MutationObserver(()=>{try{check()}catch{dispose()}}):null;
+         observer?.observe(frame.ownerDocument.documentElement,{subtree:true,childList:true});observer?.observe(frame,{attributes:true,attributeFilter:['src','srcdoc','sandbox']});
+         const timer=host.setTimeout(dispose,10000);send('offer',{});
+         return {get isActive(){return active},get isReady(){return active&&ready},dispose,publish(update){check();latest=structuredClone(update);if(ready)send('update',{update:latest})}};
+        }
+
+        function TavernSpCarrierSurface(props){
+         const node=React.useRef(null),identity=props.identity;
+         React.useLayoutEffect(()=>identity?tavernSpLiveSurfaces.register({node:node.current,identity,current:()=>node.current?.isConnected===true}):undefined,[identity?.sessionId,identity?.lifecycleRevision,identity?.messageId,identity?.bodyId,identity?.swipeId]);
+         return React.createElement('div',{ref:node,'data-dsh-sp-carrier-surface':identity?.messageId},props.children);
+        }
+
+        // Fixed runtime SessionInputShell admission, after slash/reference adjudication
+        // and before its default sink writes a native message. Stop never uses this sink.
+        function installTavernSpNativeInputGate(host,{getRoot,getInput,logical,submit,report,identity=()=>''}){
+         const bindings=new Map();let disposed=false,pending=false;
+         function ensure(input=getInput()){
+          if(!input||bindings.has(input))return;
+          const deps=input.deps;
+          if(!deps||typeof deps.defaultSink!=='function')throw Error('当前固定内核的输入准入接口已变化，零层输入未发送');
+          const original=deps.defaultSink,scope=identity();
+          const wrapped=async function(text,attachments,mode,signal){
+           if(!logical())return original.call(this,text,attachments,mode,signal);
+           if(disposed||identity()!==scope)return {kind:'error',text:'聊天已切换，零层输入未发送'};
+           if(typeof text!=='string'||!text.trim())return {kind:'error',text:'零层输入不能为空，输入已保留'};
+           if(attachments?.length)return {kind:'error',text:'原包零层入口仅接受正文文字，附件已保留'};
+           if(pending)return {kind:'error',text:'零层回合仍在处理中，输入已保留'};
+           signal?.throwIfAborted();pending=true;
+           try{await submit(text,scope,signal);return {kind:'success'}}
+           catch(error){return {kind:'error',text:String(error.message||error)}}
+           finally{pending=false}
+          };
+          deps.defaultSink=wrapped;bindings.set(input,{deps,original,wrapped});
+         }
+         function receive(event){
+          if(disposed)return;
+          const root=getRoot();if(!root?.contains(event.target))return;
+          try{ensure()}catch(error){if(logical()){event.preventDefault();event.stopImmediatePropagation();report(error)}}
+         }
+         host.addEventListener('click',receive,true);host.addEventListener('keydown',receive,true);
+         const release=()=>{disposed=true;host.removeEventListener('click',receive,true);host.removeEventListener('keydown',receive,true);for(const {deps,original,wrapped}of bindings.values())if(deps.defaultSink===wrapped)deps.defaultSink=original;bindings.clear()};
+         release.ensure=ensure;return release;
+        }
+        // Fixed SP owner surface: pixels and real browser input; no mirrored scripts.
+        function createTavernSpRemoteSurface({window:win,document:doc,container,frame,sessionId,identity,command,retrySave,onClose=()=>{},onNativeDialogPending=()=>{},report=()=>{}}){
+         let disposed=false,opened=false,recovering=false,timer=null,polling=false,revision=0,viewport=null,tail=Promise.resolve(),composing=false,signature='',epoch=0,lastSize='',moving=false,clickCount=0,lastDown=0,lastPoint=null;
+         let saveRecoveryRequired=false;const toolbarButtons=[];
+         const notices=new Map(),urls=new Set(),downloads=new Map(),listeners=[];
+         const panel=doc.createElement('section'),toolbar=doc.createElement('div'),image=doc.createElement('img'),keyboard=doc.createElement('textarea'),status=doc.createElement('div'),noticeBox=doc.createElement('div');
+         panel.setAttribute('aria-label','SP 原插件界面');panel.hidden=true;panel.style.cssText='position:relative;width:100%;height:100%;overflow:auto;background:#24221f;color:#ddd';
+         image.alt='SP 原插件实时界面';image.draggable=false;image.style.cssText='display:block;width:100%;height:auto;touch-action:none;user-select:none';
+         keyboard.setAttribute('aria-label','SP 原界面键盘输入');keyboard.style.cssText='position:fixed;left:-10000px;top:0;width:1px;height:1px;opacity:0';
+         toolbar.style.cssText='display:flex;gap:8px;align-items:center;padding:6px;flex-wrap:wrap';status.setAttribute('role','status');
+         const button=(text,work)=>{const el=doc.createElement('button');el.type='button';el.textContent=text;el.addEventListener('click',()=>Promise.resolve().then(work).catch(fail));toolbar.appendChild(el);toolbarButtons.push(el);return el};
+         panel.append(toolbar,status,noticeBox,image,keyboard);container.appendChild(panel);
+         function fail(error){if(!disposed){status.textContent=String(error?.message||error);report(error)}}
+         const current=()=>JSON.stringify(identity?.()||{sessionId});
+         const rpc=async operation=>{if(disposed)throw Error('SP 界面已退出');const version=epoch,scope=current();const result=await command({kind:'ui',command:operation});if(disposed||version!==epoch||scope!==current())throw Error('SP 界面身份已变化，操作回执未应用');return result};
+         const serial=work=>{const next=tail.catch(()=>{}).then(()=>{if(disposed)throw Error('SP 界面已退出');return work()});tail=next;next.catch(fail);return next};
+         function input(events){const observedRevision=revision;return serial(async()=>{if(recovering||!opened||!observedRevision)throw Error('SP 当前画面尚未就绪');if(observedRevision!==revision)throw Error('SP 画面尺寸已变化，请按当前画面重新操作');const result=await rpc({operation:'input',revision:observedRevision,events});if(result?.delivered!==true)throw Error('SP 原界面未确认输入送达');return result})}
+         function listen(target,name,handler,options){target.addEventListener(name,handler,options);listeners.push(()=>target.removeEventListener(name,handler,options))}
+         function point(event){const box=image.getBoundingClientRect();if(!viewport||!box.width||!box.height)throw Error('SP 画面尺寸尚未就绪');return{x:Math.max(0,Math.min(viewport.width,(event.clientX-box.left)*viewport.width/box.width)),y:Math.max(0,Math.min(viewport.height,(event.clientY-box.top)*viewport.height/box.height))}}
+         const mouseButton=number=>number===2?'right':number===1?'middle':'left';
+         let pointerModifiers=[];
+         listen(image,'pointerdown',event=>{event.preventDefault();keyboard.focus({preventScroll:true});image.setPointerCapture?.(event.pointerId);moving=true;const p=point(event),now=Date.now();clickCount=now-lastDown<400&&lastPoint&&Math.abs(p.x-lastPoint.x)<4&&Math.abs(p.y-lastPoint.y)<4?clickCount%3+1:1;lastDown=now;lastPoint=p;pointerModifiers=[event.ctrlKey?'Control':null,event.metaKey?'Meta':null,event.shiftKey?'Shift':null,event.altKey?'Alt':null].filter(Boolean);void input([...pointerModifiers.map(key=>({type:'key',key,action:'down'})),{type:'down',...p,button:mouseButton(event.button),clickCount}])});
+         listen(image,'pointerup',event=>{event.preventDefault();moving=false;void input([{type:'up',...point(event),button:mouseButton(event.button),clickCount},...pointerModifiers.map(key=>({type:'key',key,action:'up'}))]);pointerModifiers=[];image.releasePointerCapture?.(event.pointerId)});
+         let latestMove=null,moveFrame=null;
+         listen(image,'pointermove',event=>{latestMove=point(event);if(moveFrame===null)moveFrame=win.requestAnimationFrame(()=>{moveFrame=null;if(!disposed&&opened)void input([{type:'move',...latestMove}])})});
+         listen(image,'pointercancel',event=>{moving=false;void input([{type:'up',...point(event),button:'left'},...pointerModifiers.map(key=>({type:'key',key,action:'up'}))]);pointerModifiers=[]});
+         listen(image,'contextmenu',event=>event.preventDefault());
+         listen(image,'wheel',event=>{event.preventDefault();const factor=event.deltaMode===1?16:event.deltaMode===2?(viewport?.height||600):1;void input([{type:'wheel',...point(event),deltaX:event.deltaX*factor,deltaY:event.deltaY*factor}])},{passive:false});
+         const keyName=event=>event.key===' '?'Space':event.key;
+         listen(keyboard,'keydown',event=>{
+          if(composing||event.isComposing||event.key==='Process'||event.key==='Dead')return;
+          const modifier=event.ctrlKey||event.metaKey;
+          if(modifier&&event.key.toLowerCase()==='v')return;
+          if(modifier&&event.key.toLowerCase()==='c'){event.preventDefault();void copySelection();return}
+          if(modifier&&event.key.toLowerCase()==='x'){event.preventDefault();void copySelection().then(text=>text?input([{type:'key',key:'Backspace'}]):undefined).catch(fail);return}
+          if(event.key.length===1&&!modifier&&!event.altKey)return;
+          if(['Control','Shift','Meta','Alt'].includes(event.key))return;
+          event.preventDefault();const prefix=[event.ctrlKey?'Control':null,event.metaKey?'Meta':null,event.altKey?'Alt':null,event.shiftKey?'Shift':null].filter(Boolean);
+          void input([{type:'key',key:[...prefix,keyName(event)].join('+'),action:'press'}]);
+         });
+         listen(keyboard,'beforeinput',event=>{
+          if(composing||event.isComposing)return;
+          if(committedComposition!==null&&event.data===committedComposition){event.preventDefault();committedComposition=null;keyboard.value='';return}
+          if(event.inputType==='insertText'&&typeof event.data==='string'){event.preventDefault();void input([{type:'insertText',text:event.data}]);keyboard.value=''}
+         });
+         let committedComposition=null;
+         listen(keyboard,'compositionstart',()=>{composing=true;committedComposition=null});
+         listen(keyboard,'compositionend',event=>{composing=false;committedComposition=event.data||'';if(committedComposition)void input([{type:'insertText',text:committedComposition}]);keyboard.value='';win.setTimeout(()=>{committedComposition=null},0)});
+         // Some engines emit the committed insertText after compositionend.
+         listen(keyboard,'input',()=>{keyboard.value=''});
+         listen(keyboard,'paste',event=>{event.preventDefault();const text=event.clipboardData?.getData('text/plain');if(typeof text==='string')void input([{type:'insertText',text}])});
+         async function copySelection(){const result=await serial(()=>rpc({operation:'selection'}));if(typeof result?.text!=='string')throw Error('SP 原界面选中文字未返回');
+          try{await win.navigator.clipboard.writeText(result.text)}catch{const area=doc.createElement('textarea');area.value=result.text;noticeBox.appendChild(area);area.focus();area.select();if(!doc.execCommand?.('copy')){status.textContent='已取回选中文字，请在文本框中复制';return result.text}area.remove()}return result.text;
+         }
+         button('复制选中文字',copySelection);button('粘贴文字',async()=>{const text=await win.navigator.clipboard.readText();await input([{type:'insertText',text}])});
+         button('关闭界面',close);button('刷新画面',()=>capture());
+         if(typeof retrySave==='function')button('仅重试保存',async()=>{const result=await serial(()=>retrySave());if(result?.saved!==true)throw Error('SP 仅重试保存未获持久化确认');status.textContent='SP 保存已确认';return result});
+         async function filesToJson(files){const rows=[];for(const file of files){const data=await new Promise((resolve,reject)=>{const reader=new win.FileReader();reader.onerror=()=>reject(reader.error||Error('文件读取失败'));reader.onload=()=>resolve(String(reader.result).split(',')[1]||'');reader.readAsDataURL(file)});rows.push({name:file.name,mimeType:file.type||'application/octet-stream',data})}return rows}
+         async function download(notice){let progress=downloads.get(notice.id);if(!progress){progress={offset:0,done:false,name:notice.name||'SP-export',mimeType:'application/octet-stream',parts:[]};downloads.set(notice.id,progress)}
+          while(!progress.done){const result=await rpc({operation:'download',id:notice.id,offset:progress.offset});if(typeof result?.data!=='string'||!Number.isSafeInteger(result.offset)||result.offset<progress.offset||!result.done&&result.offset===progress.offset)throw Error('SP 下载分块回执无效');const text=win.atob(result.data),bytes=new Uint8Array(text.length);for(let i=0;i<text.length;i++)bytes[i]=text.charCodeAt(i);if(result.offset!==progress.offset+bytes.length)throw Error('SP 下载分块位置不一致');progress.parts.push(bytes);progress.offset=result.offset;progress.done=result.done===true;progress.name=result.name||progress.name;progress.mimeType=result.mimeType||progress.mimeType}
+          await rpc({operation:'download-ack',id:notice.id,offset:progress.offset});
+          const url=win.URL.createObjectURL(new win.Blob(progress.parts,{type:progress.mimeType}));urls.add(url);const link=doc.createElement('a');link.href=url;link.download=progress.name;link.textContent='下载 '+progress.name;noticeBox.appendChild(link);link.click();downloads.delete(notice.id);
+         }
+         async function handleNotice(notice){
+          if(!notice||typeof notice.id!=='string'||notices.has(notice.id))return;notices.set(notice.id,true);
+          try{if(notice.kind==='dialog'){
+           const row=doc.createElement('dialog'),message=doc.createElement('p'),accept=doc.createElement('button'),cancel=doc.createElement('button');row.setAttribute('role','dialog');row.setAttribute('aria-modal','true');row.setAttribute('aria-label','SP 原插件确认');row.style.cssText='background:#24221f;color:#ddd;padding:20px;border:1px solid #697489;border-radius:8px;max-width:calc(100vw - 48px)';message.textContent=String(notice.message||'');accept.type=cancel.type='button';accept.textContent='确定';cancel.textContent='取消';row.append(message);
+           let field;if(notice.type==='prompt'){field=doc.createElement('input');field.type='text';field.setAttribute('aria-label','SP 原插件输入');field.value=String(notice.defaultValue||'');row.append(field)}
+           row.append(accept);if(notice.type!=='alert')row.append(cancel);noticeBox.appendChild(row);notices.set(notice.id,'native-pending');onNativeDialogPending(true);
+           const answer=async accepted=>{if(accept.disabled)return;accept.disabled=cancel.disabled=true;try{await rpc({operation:'dialog',id:notice.id,accept:accepted,...field&&accepted?{promptText:field.value}:{}});row.remove();notices.set(notice.id,'answered');onNativeDialogPending([...notices.values()].some(value=>value==='native-pending'))}catch(error){accept.disabled=cancel.disabled=false;fail(error)}};
+           accept.addEventListener('click',()=>{void answer(true)});cancel.addEventListener('click',()=>{void answer(false)});
+           row.addEventListener('cancel',event=>{event.preventDefault();void answer(notice.type==='alert')});row.showModal?.();(field||accept).focus();
+          }else if(notice.kind==='file'){
+           const row=doc.createElement('label'),picker=doc.createElement('input'),cancel=doc.createElement('button');row.textContent='SP 原插件选择文件：';picker.type='file';picker.multiple=notice.multiple===true;cancel.type='button';cancel.textContent='取消文件选择';row.append(picker,cancel);noticeBox.appendChild(row);
+           const submit=async files=>{try{await rpc({operation:'files',id:notice.id,files:await filesToJson(files)});row.remove()}catch(error){notices.delete(notice.id);fail(error)}};
+           picker.addEventListener('change',()=>{void submit(Array.from(picker.files||[]))});picker.addEventListener('cancel',()=>{void submit([])});cancel.addEventListener('click',()=>{void submit([])});
+          }else if(notice.kind==='select'){
+           if(!Array.isArray(notice.options))throw Error('SP 选择列表回执无效');
+           const row=doc.createElement('label'),select=doc.createElement('select'),apply=doc.createElement('button');row.textContent=String(notice.label||'SP 原插件选择：');select.multiple=notice.multiple===true;apply.type='button';apply.textContent='确认选择';
+           const groups=new Map();for(const option of notice.options){if(typeof option.value!=='string')throw Error('SP 选择项目无效');const el=doc.createElement('option');el.value=option.value;el.textContent=String(option.label??option.text??option.value);el.disabled=option.disabled===true;el.selected=option.selected===true||(notice.values||[]).includes(option.value);let parent=select;if(option.group){if(!groups.has(option.group)){const group=doc.createElement('optgroup');group.label=String(option.group);groups.set(option.group,group);select.appendChild(group)}parent=groups.get(option.group)}parent.appendChild(el)}
+           row.append(select,apply);noticeBox.appendChild(row);
+           apply.addEventListener('click',()=>{apply.disabled=true;const values=Array.from(select.options).filter(option=>option.selected).map(option=>String(option.value));void rpc({operation:'select',id:notice.id,values}).then(()=>row.remove()).catch(error=>{apply.disabled=false;fail(error)})});
+          }else if(notice.kind==='download')await download(notice);else throw Error('SP 原界面返回未知交互');
+          }catch(error){notices.delete(notice.id);throw error}
+         }
+         function apply(result){if(!result||!Number.isSafeInteger(result.revision))throw Error('SP 画面回执无效');if(result.revision<revision)return;revision=result.revision;
+          if(result.image){if(!['image/jpeg','image/png'].includes(result.image.mimeType)||typeof result.image.data!=='string')throw Error('SP 画面类型无效');image.src='data:'+result.image.mimeType+';base64,'+result.image.data}
+          if(result.viewport){if(!(result.viewport.width>0&&result.viewport.height>0))throw Error('SP 画面尺寸无效');viewport=result.viewport}
+          for(const notice of result.notices||[])void handleNotice(notice).catch(fail);
+         }
+         const visible=()=>doc.visibilityState!=='hidden'&&!container.hidden&&(!panel.getClientRects||panel.getClientRects().length>0);
+         async function capture(){if(disposed||!opened||!visible())return;if(polling)return;polling=true;
+          try{apply(await rpc({operation:recovering?'recover':'capture'}))}catch(error){fail(error)}finally{polling=false;schedule()}}
+         function schedule(){if(timer!==null)win.clearTimeout(timer);timer=null;if(!disposed&&opened&&visible())timer=win.setTimeout(()=>{timer=null;void capture()},400)}
+         async function resize(){if(!opened||disposed||recovering)return;const box=panel.getBoundingClientRect(),width=Math.max(240,Math.min(4096,Math.round(box.width||940))),height=Math.max(160,Math.min(4096,Math.round(box.height||700)));const size=width+'x'+height;if(size===lastSize)return;apply(await serial(()=>rpc({operation:'resize',width,height})));lastSize=size}
+         async function open({recover=false}={}){if(disposed)throw Error('SP 界面已退出');recovering=recover;opened=true;panel.hidden=false;if(frame)frame.hidden=true;status.textContent=saveRecoveryRequired?'SP 保存失败，原实例保留；请仅重试保存':recover?'正在恢复原 SP 确认，初始化尚未完成':'正在连接原 SP 界面';schedule();
+          try{const result=await serial(()=>rpc({operation:recover?'recover':'open'}));apply(result);if(!recover&&!result.notices?.some(item=>item.kind==='dialog')){await resize();status.textContent='';keyboard.focus({preventScroll:true})}schedule()}catch(error){fail(error);throw error}}
+         async function close({notify=true}={}){opened=false;panel.hidden=true;if(timer!==null)win.clearTimeout(timer);timer=null;try{const result=await rpc({operation:'close'});if(result?.detached!==true)throw Error('SP 原界面关闭未获确认')}finally{if(notify)onClose()}}
+         listen(doc,'visibilitychange',()=>{if(doc.visibilityState==='hidden'){if(timer!==null)win.clearTimeout(timer);timer=null}else if(opened)void capture()});
+         const observer=win.ResizeObserver?new win.ResizeObserver(()=>{if(opened)void resize().catch(fail)}):null;observer?.observe(container);
+         return {sync(state){if(state?.recoveryError)fail(Error(state.recoveryError));if(state?.recoveryRequired!==undefined||state?.ready===true)saveRecoveryRequired=state?.recoveryRequired===true;for(const button of toolbarButtons)button.disabled=saveRecoveryRequired&&!['仅重试保存','关闭界面'].includes(button.textContent);if(saveRecoveryRequired)status.textContent=String(state.error||'SP 保存失败，原实例保留；请仅重试保存');const next=current();if(signature&&signature!==next){epoch++;opened=false;panel.hidden=true;if(timer!==null)win.clearTimeout(timer);timer=null;notices.clear();onNativeDialogPending(false);downloads.clear();revision=0;viewport=null}signature=next;if(opened)schedule()},open,close,dispose({close=true}={}){if(disposed)return;if(close)try{Promise.resolve(command({kind:'ui',command:{operation:'close'}})).catch(error=>report(error))}catch(error){report(error)}disposed=true;onNativeDialogPending(false);epoch++;opened=false;if(timer!==null)win.clearTimeout(timer);if(moveFrame!==null)win.cancelAnimationFrame(moveFrame);observer?.disconnect();for(const remove of listeners)remove();for(const url of urls)win.URL.revokeObjectURL(url);downloads.clear();panel.remove()}};
+        }
+        const tavernSpLiveSurfaces=createTavernSpLiveSurfaces();
 		const tavernDisplayedMessages = createTavernDisplayedMessageRegistry({MutationObserver:window.MutationObserver,reportError:error=>tavernErrorHub.report('正文显示改写',error)});
 		window.__dshTavernRetrieveDisplayedMessage = (caller,id) => tavernDisplayedMessages.retrieve(caller,id);
 		function installTavernStatusRefresh(token, staticDisplay) {
@@ -6417,47 +6811,117 @@ function IzumiFloatingPanel(props){
 
 		// Original script windows use native textarea setters; mirror them to the
 		// owning DSH draft through the authenticated script channel.
-		async function installTavernScriptComposer(win, call, token) {
+		async function installTavernScriptComposer(win, call, token, options={}) {
 		  const doc=win.document;
 		  if(!doc.body)await new Promise(resolve=>doc.addEventListener('DOMContentLoaded',resolve,{once:true}));
 		  if(doc.getElementById('send_textarea'))return;
 		  const controls=doc.createElement('div'),area=doc.createElement('textarea'),button=doc.createElement('button');
 		  controls.hidden=true;controls.dataset.dshScriptComposer='true';area.id='send_textarea';button.id='send_but';button.type='button';
 		  controls.append(area,button);doc.body.append(controls);
-		  let latest={draft:'',revision:-1},optimistic='',pending=0,tail=Promise.resolve(),sending=false,disposed=false;
+		  let latest={draft:'',revision:-1,composerEpoch:0},optimistic='',pending=0,tail=Promise.resolve(),sending=false,disposed=false,writeError=null,previewIntent=false,attached=true;
+		  const epochCurrent=epoch=>options.owned!==true||epoch===latest.composerEpoch;
+		  function assertEpoch(epoch){if(!epochCurrent(epoch))throw Error('SP 输入连接代次已变化，旧操作未应用')}
+		  function applyReply(value,epoch){assertEpoch(epoch);if(options.owned===true&&value?.composerEpoch!==epoch)throw Error('SP 输入回执连接代次已变化');apply(value);return value}
 		  function apply(value){
-		    if(!value||Number(value.revision)<latest.revision)return;
-		    latest={draft:String(value.draft||''),revision:Number(value.revision)||0};
+		    if(!value)return;
+		    let advanced=false;
+		    if(options.owned===true){
+		      if(!Number.isSafeInteger(value.composerEpoch)||value.composerEpoch<1)throw Error('SP 输入连接代次无效');
+		      if(value.composerEpoch<latest.composerEpoch)return;
+		      advanced=value.composerEpoch>latest.composerEpoch;
+		      if(advanced){pending=0;tail=Promise.resolve();sending=false;button.disabled=false;writeError=null}
+		    }
+		    if(!advanced&&Number(value.revision)<latest.revision)return;
+		    latest={draft:String(value.draft||''),revision:Number(value.revision)||0,composerEpoch:options.owned===true?value.composerEpoch:0};
+		    if(options.owned===true)attached=value.attached!==false;
 		    if(!pending){area.value=latest.draft;optimistic=latest.draft}
 		  }
 		  function report(error){win.toastr?.error?.(String(error?.message||error),'输入框');win.console.error('[DSH Tavern] 脚本输入操作失败',error)}
 		  function receive(event){const data=event.data;if(event.source===win.parent&&data?.token===token&&data.type==='dsh-tavern-composer-state')apply(data.value)}
 		  win.addEventListener('message',receive);
 		  function changed(){
+		    if(options.owned===true&&!attached)throw Error('真实游戏输入框已关闭，草稿未写回');
 		    if(String(area.value||'')===optimistic)return;
-		    const expectedDraft=optimistic,text=String(area.value||'');optimistic=text;pending++;
-		    tail=tail.catch(()=>{}).then(()=>{if(disposed)throw Error('脚本窗口已关闭');return call('tavernHelperComposer',{operation:{kind:'write',text,expectedDraft}})})
-		      .then(apply,report).finally(()=>{pending--;if(!pending)apply(latest)});
+		    const expectedDraft=optimistic,text=String(area.value||''),epoch=latest.composerEpoch;optimistic=text;pending++;
+		    tail=tail.catch(()=>{}).then(()=>{assertEpoch(epoch);if(disposed)throw Error('脚本窗口已关闭');return call('tavernHelperComposer',{operation:{kind:'write',text,expectedDraft,...options.owned===true?{expectedRevision:latest.revision,expectedComposerEpoch:epoch}:{}}})})
+		      .then(value=>{applyReply(value,epoch);writeError=null}).catch(error=>{if(epochCurrent(epoch))writeError=error;report(error)}).finally(()=>{if(epochCurrent(epoch)){pending--;if(!pending)apply(latest)}});
 		  };
 		  area.addEventListener('input',changed);
 		  const nativeValue=win.HTMLTextAreaElement&&Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype,'value');
 		  if(nativeValue?.get&&nativeValue?.set)Object.defineProperty(area,'value',{configurable:true,get(){return nativeValue.get.call(this)},set(value){nativeValue.set.call(this,value);win.queueMicrotask(()=>{if(!disposed&&String(area.value||'')!==optimistic)changed()})}});
 		  function send(){
+		    if(previewIntent)return;
 		    if(sending||!String(area.value||'').trim())return;
 		    if(String(area.value||'')!==optimistic)changed();
-		    sending=true;button.disabled=true;const expectedDraft=optimistic;
-		    tail=tail.catch(()=>{}).then(()=>{if(disposed)throw Error('脚本窗口已关闭');return call('tavernHelperComposer',{operation:{kind:'send',expectedDraft}})})
-		      .then(apply,report).finally(()=>{sending=false;button.disabled=false});
+		    sending=true;button.disabled=true;const expectedDraft=optimistic,epoch=latest.composerEpoch;
+		    tail=tail.catch(()=>{}).then(()=>{assertEpoch(epoch);if(disposed)throw Error('脚本窗口已关闭');if(options.owned===true&&(!attached||writeError))throw writeError||Error('真实游戏输入框已关闭');return call('tavernHelperComposer',{operation:{kind:'send',expectedDraft,...options.owned===true?{expectedRevision:latest.revision,expectedComposerEpoch:epoch}:{}}})})
+		      .then(value=>applyReply(value,epoch)).catch(report).finally(()=>{if(epochCurrent(epoch)){sending=false;button.disabled=false}});
 		  }
+		  // Native context.generate must await the authenticated submission and receive
+		  // its actual CAS failure, rather than merely dispatching a button click.
+		  win.__dshSubmitTavernComposer=async function(){
+		    if(sending)throw Error('当前输入正在发送');
+		    if(!String(area.value||'').trim())throw Error('输入框为空');
+		    if(String(area.value||'')!==optimistic)changed();
+		    sending=true;button.disabled=true;const expectedDraft=optimistic,epoch=latest.composerEpoch;
+		    const task=tail.catch(()=>{}).then(()=>{assertEpoch(epoch);if(disposed)throw Error('脚本窗口已关闭');if(options.owned===true&&(!attached||writeError))throw writeError||Error('真实游戏输入框已关闭');return call('tavernHelperComposer',{operation:{kind:'send',expectedDraft,...options.owned===true?{expectedRevision:latest.revision,expectedComposerEpoch:epoch}:{}}})}).then(value=>applyReply(value,epoch));
+		    tail=task;
+		    try{return await task}finally{if(epochCurrent(epoch)){sending=false;button.disabled=false}}
+		  };
+		  win.__dshStopTavernComposer=()=>{const epoch=latest.composerEpoch;return call('tavernHelperComposer',{operation:{kind:'stop',...options.owned===true?{expectedComposerEpoch:epoch}:{}}}).then(value=>applyReply(value,epoch))};
 		  button.addEventListener('click',send);
-		  area.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}});
+		  area.addEventListener('keydown',event=>{if(!previewIntent&&event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}});
 		  win.addEventListener('pagehide',()=>{disposed=true;win.removeEventListener('message',receive)},{once:true});
 		  apply(await call('tavernHelperComposer',{operation:{kind:'read'}}));
+		  return {apply,async flush(){await tail;if(writeError)throw writeError},async intent(value){
+		    const epoch=value?.composerEpoch;assertEpoch(epoch);await tail;assertEpoch(epoch);if(writeError)throw writeError;if(!attached)throw Error('真实游戏输入框已关闭');
+		    if(!value||typeof value.draft!=='string'||!Number.isSafeInteger(value.revision)||!['click','keydown'].includes(value.type))throw Error('SP 发送意图无效');
+		    apply({...value,attached:true});if(value.revision!==latest.revision||value.draft!==latest.draft)throw Error('发送前草稿版本已变化');
+		    previewIntent=true;let event;
+		    try{event=value.type==='click'?new win.MouseEvent('click',{bubbles:true,cancelable:true,button:0}):new win.KeyboardEvent('keydown',{bubbles:true,cancelable:true,key:value.key||'Enter',code:'Enter',shiftKey:value.shiftKey===true});(value.type==='click'?button:area).dispatchEvent(event)}finally{previewIntent=false}
+		    await tail;assertEpoch(epoch);if(writeError)throw writeError;return {prevented:event.defaultPrevented,draft:latest.draft,revision:latest.revision,composerEpoch:latest.composerEpoch};
+		  },dispose(){disposed=true;win.removeEventListener('message',receive);controls.remove()}};
+		}
+
+		// One authenticated fixed-SP viewer. The native input remains the draft owner.
+		function installTavernSpRemoteComposer({window:win,input,getRoot,current,command,report,running=()=>false,composerEpoch}){
+		 if(!Number.isSafeInteger(composerEpoch)||composerEpoch<1)throw Error('SP 输入连接代次无效');
+		 let revision=0,disposed=false,pending=false,tail=Promise.resolve();
+		 const snapshot=()=>({draft:String(input.state.getSnapshot().draft||''),revision,attached:!disposed&&current(),composerEpoch});
+		 function publish(){const value=snapshot();tail=tail.catch(()=>{}).then(()=>command({kind:'composer-state',composerEpoch,value}));void tail.catch(report);return tail}
+		 const unsubscribe=input.state.subscribe(()=>{revision++;void publish()});
+		 const initial=publish();
+		 function receive(event){
+		  if(disposed||!current())return;
+		  const root=getRoot(),editor=root?.querySelector('[data-composer-input]'),buttons=root?.querySelectorAll('button'),send=buttons?.[buttons.length-1];
+		  const click=event.type==='click'&&send?.contains(event.target),enter=event.type==='keydown'&&event.target===editor&&(event.key==='Enter'||event.key==='NumpadEnter')&&!event.shiftKey&&!event.isComposing;
+		  if(!click&&!enter)return;
+		  // The fixed native composer replaces its send button with Stop while busy.
+		  // Its cancellation must reach the original native handler without a handshake.
+		  if(running())return;
+		  event.preventDefault();event.stopImmediatePropagation();if(pending){report(Error('SP 正在处理发送意图，输入已保留'));return}
+		  pending=true;const expected=snapshot();
+		  void (async()=>{
+		   await initial;await tail;if(!current()||disposed)throw Error('SP 游戏页面已关闭，输入未发送');
+		   const value=await command({kind:'composer-intent',composerEpoch,value:{...expected,type:click?'click':'keydown',key:event.key||'Enter',shiftKey:false}});
+		   if(typeof value?.prevented!=='boolean'||typeof value.draft!=='string'||!Number.isSafeInteger(value.revision)||value.composerEpoch!==composerEpoch)throw Error('SP 原发送意图未获当前连接确认');
+		   if(value.prevented)return;
+		   if(!current()||disposed||snapshot().draft!==value.draft||revision!==value.revision)throw Error('发送期间输入框已变化，当前草稿已保留');
+		   performTavernComposerOperation(input,{kind:'send',expectedDraft:value.draft},{running:running()});
+		  })().catch(report).finally(()=>{pending=false});
+		 }
+		 win.addEventListener('click',receive,true);win.addEventListener('keydown',receive,true);
+		 const visibility=()=>{void publish()};win.document?.addEventListener('visibilitychange',visibility);
+		 return {snapshot,publish,dispose(){if(disposed)return;disposed=true;unsubscribe();win.document?.removeEventListener('visibilitychange',visibility);win.removeEventListener('click',receive,true);win.removeEventListener('keydown',receive,true);void command({kind:'composer-state',composerEpoch,value:snapshot()}).catch(report)}};
 		}
 
 		function performTavernComposerOperation(input, operation, options={}) {
 		  const draft=String(input.state.getSnapshot().draft||'');
-		  if(!operation||!['read','write','send'].includes(operation.kind))throw new Error('未知输入框操作');
+		  if(!operation||!['read','write','send','stop'].includes(operation.kind))throw new Error('未知输入框操作');
+		  if(operation.kind==='stop'){
+		    if(typeof options.stop!=='function')throw new Error('当前会话停止入口不可用');
+		    return Promise.resolve(options.stop()).then(()=>({draft:String(input.state.getSnapshot().draft||''),revision:options.revision?.()||0}));
+		  }
 		  if(operation.kind!=='read'&&String(operation.expectedDraft??'')!==draft)throw new Error('输入框已被修改，已保留当前草稿；请重新操作');
 		  if(operation.kind==='write'){
 		    if(typeof operation.text!=='string'||operation.text.length>1000000)throw new Error('输入文字无效或过长');
@@ -7896,19 +8360,48 @@ function tavernFrameAssetBootstrap(access) {
 			let chat = [], metadata = {}, rows = [], metadataBase = {}, metadataRevision = 0;
 			let binding = "", chatId = "", lifecycleRevision = 0, lastRevision = -1;
 			let tail = Promise.resolve(), saving = false, deferred = null, pendingSaves=0, failedSave=false;
+            const historyUpdates = new Set();
+            function historyUpdate(work) {
+                const receipt=Promise.resolve().then(work);historyUpdates.add(receipt);
+                receipt.then(()=>historyUpdates.delete(receipt),()=>historyUpdates.delete(receipt));
+                return receipt;
+            }
 			function reportSave(){try{options.onSaveState?.({pending:pendingSaves,failed:failedSave?1:0});}catch(_) {}}
 			function keyOf(value) { return String(value.chatId || "") + ":" + Number(value.lifecycleRevision || 0); }
 			function set(target, key, value) {
 				Object.defineProperty(target, key, { value: copy(value), writable: true, configurable: true, enumerable: true });
 			}
+            // Original SP retains frozen evidence/scope snapshots inside writable
+            // chat data. Equal snapshots need no writes; changed readonly branches
+            // get detached replacements, keeping the old snapshot and its integrity.
+            function detachedView(source, previous) {
+                const next=copy(source);
+                function integrity(value, prior) {
+                    if(!value||!prior||typeof value!=='object'||typeof prior!=='object')return;
+                    for(const key of Object.keys(value))if(own(prior,key)){
+                        integrity(value[key],prior[key]);
+                        const descriptor=Object.getOwnPropertyDescriptor(prior,key);
+                        if(descriptor&&'value' in descriptor&&(!descriptor.writable||!descriptor.configurable))Object.defineProperty(value,key,{value:value[key],writable:descriptor.writable,configurable:descriptor.configurable,enumerable:true});
+                    }
+                    if(Object.isFrozen(prior))Object.freeze(value);
+                    else if(Object.isSealed(prior))Object.seal(value);
+                    else if(!Object.isExtensible(prior))Object.preventExtensions(value);
+                }
+                integrity(next,previous);return next;
+            }
+            function putView(target,key,value){Object.defineProperty(target,key,{value,writable:true,configurable:true,enumerable:true});}
 			function reconcile(target, source) {
+                const readonly=!Object.isExtensible(target)||Object.keys(target).some(key=>{const d=Object.getOwnPropertyDescriptor(target,key);return !d.configurable||!('value' in d)||!d.writable});
+                if(readonly)return same(target,source)?target:detachedView(source,target);
 				for (const key of Object.keys(target)) if (!own(source, key)) delete target[key];
 				for (const key of Object.keys(source)) {
 					const a = own(target, key) ? target[key] : undefined, b = source[key];
 					if (a && b && typeof a === "object" && typeof b === "object" && Array.isArray(a) === Array.isArray(b)) {
-						reconcile(a, b); if (Array.isArray(a)) a.length = b.length;
+                        const next=reconcile(a,b);if(next!==a)putView(target,key,next);
 					} else set(target, key, b);
 				}
+                if(Array.isArray(target))target.length=source.length;
+                return target;
 			}
 			const opaque = new Set(['id','is_hidden','extra','swipes_info']);
 			function pluginData(value, base = {}) {
@@ -7922,7 +8415,7 @@ function tavernFrameAssetBootstrap(access) {
 					if (own(target, key) !== own(base, key) || !same(target[key], base[key])) continue;
 					if (!own(remote, key)) delete target[key];
 					else if (target[key] && remote[key] && typeof target[key] === "object" && typeof remote[key] === "object" && Array.isArray(target[key]) === Array.isArray(remote[key])) {
-						reconcile(target[key], remote[key]); if (Array.isArray(target[key])) target[key].length = remote[key].length;
+						const next=reconcile(target[key], remote[key]);if(next!==target[key])putView(target,key,next);
 					} else set(target, key, remote[key]);
 				}
 			}
@@ -7983,7 +8476,7 @@ function tavernFrameAssetBootstrap(access) {
 				const nextRows = (value.messages || []).map(function (message, index) {
 					const core = coreOf(message), remote = copy(message.pluginData || {});
 					let row = rows[index];
-					if (!row || !same(identity(row.core), identity(core))) {
+					if (!row || !same(identity(row.core), identity(core)) && acknowledged?.worldSimulationProjection?.message_id!==core.message_id) {
 						const view = copy(remote); for (const key of Object.keys(core)) set(view, key, core[key]);
                         const created = { view: view, core: core, base: remote, revision: revision };
                         renewCopy(created); return created;
@@ -8013,16 +8506,25 @@ function tavernFrameAssetBootstrap(access) {
                     throw new Error("saveChat 不支持新增、删除、替换或重排历史消息");
                 }
 				const messages = [];
+                let worldSimulationProjection;
 				for (const row of rows) {
+                    const changedBody=!same(row.view.mes,row.core.mes)||!same(row.view.message,row.core.message)||!same(row.view.swipes,row.core.swipes);
+                    if(changedBody){
+                        const desired=row.view.mes!==row.core.mes?row.view.mes:row.view.message,swipe=row.core.swipe_id||0,expected=copy(row.core.swipes);expected[swipe]=desired;
+                        if(worldSimulationProjection||row.core.role!=="assistant"||typeof desired!=="string"||!same(row.view.swipes,expected)||![row.core.message,desired].includes(row.view.message)||![row.core.mes,desired].includes(row.view.mes))throw Error("saveChat 不支持任意正文或消息版本修改");
+                        worldSimulationProjection={message_id:row.core.message_id,stateRevision:row.revision,message:desired};
+                    }
                     if (!own(row.view, copyMarker) || row.view[copyMarker] !== row.generation) throw staleCopy();
 					for (const key of reserved) {
 						const baseline=opaque.has(key)&&!own(row.core,key)?row.base:row.core;
-						if (own(row.view,key)!==own(baseline,key)||!same(row.view[key],baseline[key])) throw new Error("saveChat 只保存插件数据，不支持修改正文、身份或消息版本: " + key);
+						if (changedBody && ["mes","message","swipes"].includes(key)) continue;
+                        if (own(row.view,key)!==own(baseline,key)||!same(row.view[key],baseline[key])) throw new Error("saveChat 只保存插件数据，不支持修改正文、身份或消息版本: " + key);
 					}
 					const data = pluginData(row.view, row.base);
 					if (!same(data, row.base)) messages.push({ message_id: row.core.message_id, stateRevision: row.revision, data: data });
 				}
 				const result = { chatId: chatId, lifecycleRevision: lifecycleRevision, messages: messages };
+                if(worldSimulationProjection){if(!rows.some(row=>row.view._qrf_world_simulation?.task?.status==="completed"))throw Error("saveChat 只支持原推演联合提交的正文投影");result.worldSimulationProjection=worldSimulationProjection;}
 				if (!same(metadata, metadataBase)) result.metadata = { stateRevision: metadataRevision, data: copy(metadata) };
 				return result;
 			}
@@ -8030,9 +8532,10 @@ function tavernFrameAssetBootstrap(access) {
 				const requestedBinding = binding;
 				pendingSaves++;reportSave();
 				const task = tail.catch(function () {}).then(async function () {
+					while(historyUpdates.size)await Promise.all([...historyUpdates]);
 					if (binding !== requestedBinding) throw new Error("聊天已切换，已取消旧聊天的排队保存");
 					const submitted = snapshot();
-					if (!submitted.messages.length && !submitted.metadata) return;
+					if (!submitted.messages.length && !submitted.metadata && !submitted.worldSimulationProjection) return;
 					saving = true;
 					try {
 						const result = await retryRequest("saveTavernChatData", { request: submitted });
@@ -8071,10 +8574,10 @@ function tavernFrameAssetBootstrap(access) {
 			}
 			sync(options.context());
 			function isPersisted(){try{
-                if(!binding||binding!==keyOf(options.context())||saving||deferred||pendingSaves||failedSave||copyConflict||markerCollision||dirty())return false;
+                if(!binding||binding!==keyOf(options.context())||saving||deferred||pendingSaves||historyUpdates.size||failedSave||copyConflict||markerCollision||dirty())return false;
                 return rows.every(row=>own(row.view,copyMarker)&&row.view[copyMarker]===row.generation&&[...reserved].every(key=>{const base=opaque.has(key)&&!own(row.core,key)?row.base:row.core;return own(row.view,key)===own(base,key)&&same(row.view[key],base[key]);}));
             }catch(_){return false;}}
-            return { isPersisted:isPersisted,sync: sync, save: () => save(), retry: retryRequest => save(retryRequest), reload: reload, flush:()=>tail, failed:()=>failedSave, updateMetadata: updateMetadata, chat: () => chat, metadata: () => metadata };
+            return { historyUpdate:historyUpdate,isPersisted:isPersisted,sync: sync, save: () => save(), retry: retryRequest => save(retryRequest), reload: reload, flush:()=>tail, failed:()=>failedSave, updateMetadata: updateMetadata, chat: () => chat, metadata: () => metadata };
 		}
 
 		function installTavernCompatibilityDiagnostics(options) {
@@ -8092,6 +8595,10 @@ function tavernFrameAssetBootstrap(access) {
 					options.post({ type: "dsh-tavern-helper-compatibility", scriptId: scriptId, capabilityId: entry.id, count: count, argumentTypes: argumentTypes });
 				}
 				if (entry.policy === "missing") {
+					// A stale host catalog must never replace an installed capability.
+					// Inspect descriptors without invoking plugin getters during installation.
+					const installed = Object.getOwnPropertyDescriptor(target, entry.name);
+					if (installed && (installed.get || installed.value !== undefined)) continue;
 					// Preserve typeof-based fallbacks. This records a lookup, never a successful call.
 					Object.defineProperty(target, entry.name, { configurable: true, get: function () { record([]); return undefined; },
 						set: function (value) { Object.defineProperty(target, entry.name, { value: value, configurable: true, writable: true }); } });
@@ -8312,6 +8819,17 @@ function tavernFrameAssetBootstrap(access) {
 					if (type === "confirm" && legacyCleanup) return Promise.resolve(0);
 					return new HelperPopup(content, type, title, options).show();
 				},
+                // Original SP calls this through SillyTavern.getContext(), while
+                // Helper exposes the same authenticated history update on window.
+                setChatMessages: function (patches, option) {
+                    if (!Array.isArray(patches)) throw new TypeError('消息更新必须是数组');
+                    const normalized = copy(patches);
+                    for (const patch of normalized) if (patch && Object.prototype.hasOwnProperty.call(patch, 'mes')) {
+                        if (Object.prototype.hasOwnProperty.call(patch, 'message') && patch.message !== patch.mes) throw new Error('消息正文别名不一致');
+                        patch.message = patch.mes; delete patch.mes;
+                    }
+                    return window.setChatMessages(normalized, option);
+                },
 				saveChat: chatData.save,
 				reloadCurrentChat: chatData.reload,
 				saveMetadata: chatData.save,
@@ -8332,6 +8850,7 @@ function tavernFrameAssetBootstrap(access) {
 				chatMetadata: { enumerable: true, get: chatData.metadata },
 				name2: { enumerable: true, get: function () { return String(context().characterName || "角色"); } }
 			});
+            options.installSpHostGeneration?.(window, sillyTavern, {context,request:call,owner:options.generationOwner,track:options.trackGeneration});
 			options.installCompatibility({ catalog: context().compatibilityCapabilities, surfaces: { TavernHelper: helper, SillyTavern: sillyTavern }, window: window, currentScript: options.currentScript, post: options.post });
 			window.SillyTavern = Object.freeze(sillyTavern);
 			window.getContext = sillyTavern.getContext;
@@ -8356,7 +8875,7 @@ function tavernFrameAssetBootstrap(access) {
 			// attempt can fail the caller, an old failure is never rethrown forever.
 			async function settleSettings(retryCall){await settingsTail.catch(function(){});if(settingsFailed)await saveExtensionSettings(retryCall);}
 			async function settleChat(retryCall){await chatData.flush().catch(function(){});if(chatData.failed())await (retryCall?chatData.retry(retryCall):chatData.save());}
-			return { isPersisted:isPersisted,retry:flushAll,sync: chatData.sync, flushSettings: settleSettings,flush:retryCall=>Promise.all([settleChat(retryCall),settleSettings(retryCall)]) };
+			return { historyUpdate:chatData.historyUpdate,isPersisted:isPersisted,retry:flushAll,sync: chatData.sync, flushSettings: settleSettings,flush:retryCall=>Promise.all([settleChat(retryCall),settleSettings(retryCall)]) };
 		}
 
         // Bounded, value-free timings shared by every card's initialization.
@@ -8498,7 +9017,11 @@ function tavernFrameAssetBootstrap(access) {
 					const run = async function () {
 						const previousEventId = activeHostEventId,previousEventName=activeHostEventName;
                         const eventBody=window.document&&window.document.body, previousInert=eventBody&&eventBody.inert;
-                        if(eventBody)eventBody.inert=true;
+                        // Visible SP listeners may await a foreground turn; their real stop UI
+                        // must remain usable. Hydration and retirement still lock the realm,
+                        // and other extensions retain their existing event synchronization.
+                        const lockEventBody=window.__dshOriginalExtensionState?.id!=="sp-database"||metadata.background===true&&metadata.persistentOwner!==true||data.name==="CHAT_CHANGED"||data.name==="DSH_SP_DRAIN";
+                        if(eventBody&&lockEventBody)eventBody.inert=true;
 						activeHostEventId = String(data.eventId || "");activeHostEventName=String(data.name||"");
                         let finishOriginalHydration,originalHydrationError,awaitOriginalStartup=false;
 						try {
@@ -8545,7 +9068,7 @@ function tavernFrameAssetBootstrap(access) {
                                 // deferred work and prove its persistence, or fail. A visible page
                                 // stays alive: a table fill must not hold the next send, and a
                                 // failed save is reported and retried instead of failing the event.
-                                const releasing=metadata.background===true||data.name==="DSH_SP_DRAIN";
+                                const releasing=metadata.background===true&&metadata.persistentOwner!==true||data.name==="DSH_SP_DRAIN";
                                 const persistOriginal=async function(){
                                     if(retry)await facade?.retry(recoveryCall);
                                     if(!data.reentrantParentId)await window.__dshFlushOriginalDatabase?.({retry,recoveryCall,awaitOriginalWork:releasing});
@@ -8558,7 +9081,7 @@ function tavernFrameAssetBootstrap(access) {
                                 await transport.drainEvent(String(data.eventId||''));
                             }
                             catch(error) { if(!finishOriginalHydration||!originalHydrationError)throw error;console.error(error); }
-                            finally { activeHostEventId = previousEventId;activeHostEventName=previousEventName; if(eventBody)eventBody.inert=previousInert; }
+                            finally { activeHostEventId = previousEventId;activeHostEventName=previousEventName; if(eventBody&&lockEventBody)eventBody.inert=previousInert; }
                         }
 					};
 					// A listener may await a different event emitted by a companion. Only
@@ -8816,7 +9339,7 @@ function tavernFrameAssetBootstrap(access) {
 				return copy(next);
 			};
 			window.getButtonEvent = buttonEvent;
-			window.getCharData = function () { return copy(state.character || null); };
+			window.getCharData = function () { const character = copy(state.character || null); if (character && !character.avatar) character.avatar = String(character.path || ""); return character; };
 			window.getCurrentCharacterName = function () { return String(state.characterName || state.character && state.character.name || ""); };
 			window.getCurrentMessageId = function () { throw new Error('getCurrentMessageId 只能在聊天楼层 iframe 中使用'); };
 			window.getLastMessageId = lastId;
@@ -8909,7 +9432,9 @@ function tavernFrameAssetBootstrap(access) {
             }
             window.setChatMessages = async function(patches,option) {
                 const refresh=refreshOption(option),plain=copy(patches||[]);
-                const result=await call('updateTavernHelperMessages',{messages:plain});
+                // The transport synchronizes context before this receipt resolves.
+                // Release the facade barrier before refresh handlers can save.
+                const result=await facade.historyUpdate(()=>call('updateTavernHelperMessages',{messages:plain}));
                 await refreshHistory(result,refresh,'MESSAGE_UPDATED');
             };
             window.generateRaw = function(config){return call('generateTavernHelperRaw',{config:copy(config)}).then(result=>result.text);};
@@ -8961,7 +9486,7 @@ function tavernFrameAssetBootstrap(access) {
 					target[parts[parts.length - 1]] = copy(value);
 				}
 				const mappings = { uid: "uid", comment: "name", enabled: "enabled", content: "content", probability: "probability", type: "strategy.type", keys: "strategy.keys", filters: "strategy.keys_secondary.keys", logic: "strategy.keys_secondary.logic", scan_depth: "strategy.scan_depth", order: "position.order", exclude_recursion: "recursion.prevent_incoming", prevent_recursion: "recursion.prevent_outgoing", sticky: "effect.sticky", cooldown: "effect.cooldown", delay: "effect.delay", group: "extra.group", display_index: "extra.displayIndex" };
-				for (const key of Object.keys(mappings)) if (Object.prototype.hasOwnProperty.call(patch, key)) set(mappings[key], patch[key]);
+				for (const key of Object.keys(mappings)) if (Object.prototype.hasOwnProperty.call(patch, key)) set(mappings[key], key === "type" && patch[key] === "keyword" ? "selective" : patch[key]);
 				for (const pair of [["case_sensitive", "caseSensitive"], ["match_whole_words", "matchWholeWords"]]) if (Object.prototype.hasOwnProperty.call(patch, pair[0])) set("extra." + pair[1], patch[pair[0]] === "same_as_global" ? null : patch[pair[0]]);
 				if (patch.depth !== undefined && patch.depth !== null) set("position.depth", patch.depth);
 				if (patch.position !== undefined) {
@@ -9107,7 +9632,8 @@ function tavernFrameAssetBootstrap(access) {
 					.replace(/{{\s*user\s*}}/gi, String(state.playerName || "你"))
 					.replace(/{{\s*char\s*}}/gi, String(state.characterName || "角色"));
 			};
-			facade = modules.installFacade({ token:token,installCompatibility: modules.installCompatibility, currentScript: currentScript, post: transport.post, createChatData: modules.createChatData, window: window, copy: copy, request: call, context: function () { return state; },
+			facade = modules.installFacade({ token:token,installSpHostGeneration:modules.installSpHostGeneration,installCompatibility: modules.installCompatibility, currentScript: currentScript, post: transport.post, createChatData: modules.createChatData, window: window, copy: copy, request: call, context: function () { return state; },
+                generationOwner:()=>({scriptId:currentScript().id,lifecycleRevision:Number(state.lifecycleRevision)||0,eventId:activeHostEventId}),trackGeneration:transport.trackTask,
 				retrieveDisplayed:metadata.trustedResource===true && metadata.background!==true ? id=>parent.__dshTavernRetrieveDisplayedMessage?.(window,id) || [] : null,
 				Popup: modules.createPopup({ document: window.document, parent: parent, token: token,hostDocument:metadata.trustedHostDocument===true }) });
 			let regexSaveTimer = null;
@@ -9192,7 +9718,7 @@ function tavernFrameAssetBootstrap(access) {
                 return {...helper,getWorldbook:read,replaceWorldbook:async(name,entries)=>{const expectedEntries=baselines.has(name)?copy(baselines.get(name)):await read(name);if(window._.isEqual(entries,expectedEntries))return;const saved=await call('replaceTavernHelperWorldbook',{name,entries:copy(entries),expectedEntries},owner);if(saved.worldbook)baselines.set(name,copy(saved.worldbook.entries||[]))}};
             };
             window.__dshReadIzumiBrowserCache=()=>call('tavernHelperBrowserCache',{});
-            if(metadata.requiresComposer)window.__dshTavernComposerReady=modules.installComposer(window,call,token);
+            if(metadata.requiresComposer){window.__dshTavernComposerReady=modules.installComposer(window,call,token,{owned:metadata.persistentOwner===true});if(metadata.persistentOwner===true)window.__dshOwnedComposerBridgeReady=window.__dshTavernComposerReady;}
             audioBridge=modules.installAudioBridge({window,context:()=>state,call,currentScript});
             modules.installMirror({window,token,post:transport.post});
             window.getProxyPresetNames = () => copy(state.proxyPresetNames || []);
@@ -9200,9 +9726,9 @@ function tavernFrameAssetBootstrap(access) {
             modules.installGenerationBridge(window, call, events, () => ({ scriptId: currentScript().id, lifecycleRevision: Number(state.lifecycleRevision || 0), eventId: activeHostEventId }), owner => drainPromptWrites(owner.scriptId), transport.trackTask);
             scriptLibraryBridge = modules.installScriptLibraryBridge({ window, call, context: () => state, currentScript, scriptList, buttonEvent, writer: writerOrigin, recordUnverifiedWrite });
             modules.installSlash({window,call,assertSlash:modules.assertSlash,trusted:metadata.trustedResource,currentScript,publish:transport.post});
-            // Read by the projected original package: only a background instance keeps
-            // its deferred work on the ledger until the event epilogue drains it.
-            window.__dshAwaitOriginalWork=metadata.background===true;
+            // Ordinary background events drain their settled work in the epilogue.
+            // Persistent owners retain pending/errors but release successful work.
+            window.__dshAwaitOriginalWork=metadata.background===true&&metadata.persistentOwner!==true;
             Object.defineProperty(window,'__dshTavernIsPersisted',{value:()=>{try{return !activeHostEventId&&transport.isIdle()&&facade.isPersisted()&&scriptStorageBridge?.isPersisted()===true&&![...promptWritesByScript.values()].some(w=>w.pending.size||w.failures.size)&&window.__dshTavernGenerationBusy?.()!==true;}catch(_){return false;}}});
             if(unloadFetch&&metadata.spUnload){
                 window.addEventListener('pagehide',event=>{
@@ -9215,13 +9741,13 @@ function tavernFrameAssetBootstrap(access) {
                     for(const participant of metadata.spUnload.participants)void unloadFetch(new Request(participant.path,{method:'POST',mode:'no-cors',credentials:'omit',keepalive:true,body:''})).catch(()=>{});
                 },{capture:true});
             }
-            modules.installExtensionHost(window,{token:metadata.token,background:metadata.background===true,post:transport.post,call,context:()=>state,flushSettings:retryCall=>facade.flushSettings(retryCall),connectSingleAuthority:modules.connectSpSingleAuthority,createAuthorityBridge:modules.createSpAuthorityBridge});
+            modules.installExtensionHost(window,{token:metadata.token,background:metadata.background===true,persistentOwner:metadata.persistentOwner===true,post:transport.post,call,captureOwner:()=>({eventId:activeHostEventId}),context:()=>state,flushSettings:retryCall=>facade.flushSettings(retryCall),connectSingleAuthority:modules.connectSpSingleAuthority,createAuthorityBridge:modules.createSpAuthorityBridge});
             modules.installGithubExtensionHost(window,{call,context:()=>state});
             databaseBridge = modules.createDatabaseBridge({ window: window, context: function () { return state; }, call: call, loadSqlCode: function () { return call("getTavernSqlCode",{}).then(function(result){return result.sqlCode;}); }, openVisualizer: function () { transport.post({ type: "dsh-tavern-helper-open-database" }); } });
             addEventListener('message',async event=>{if(event.source===parent&&event.data?.token===token&&event.data.type==='dsh-tavern-izumi-open'){if(window.__dshIzumiWasShutdown===true){await window.__dshTavernFlushScriptStorage?.();transport.post({type:'dsh-tavern-helper-reload-request'});return}window.__dshOpenIzumi?.();if(event.data.quick)window.__dshOpenIzumiQuick?.()}});
             window.__dshTavernReadScriptSource = digest => call("getTavernScriptResource", { digest }).then(result => result.content);
             const scriptTreesReady = state.scriptTreesDigest ? window.__dshTavernReadScriptSource(state.scriptTreesDigest).then(content => { state.scriptTrees = JSON.parse(content); }) : Promise.resolve();
-            window.__dshTavernHelperReady = initializationTiming.wait("dependencies", Promise.all([ready, databaseBridge.ready, scriptTreesReady,presetBridge.ready,nativePresetBridge.ready]));
+            window.__dshTavernHelperReady = initializationTiming.wait("dependencies", Promise.all([ready, databaseBridge.ready, scriptTreesReady,presetBridge.ready,nativePresetBridge.ready,metadata.persistentOwner===true?window.__dshTavernComposerReady:undefined]));
             if(typeof parent!=="undefined")parent.postMessage({type:"dsh-tavern-helper-initialization-progress",token,stage:"dependencies"},"*");
 			void window.__dshTavernHelperReady.catch(function (error) {
 				parent.postMessage({ type: "dsh-tavern-helper-bootstrap-failed", token: token, message: String(error && error.message || error || "人物卡脚本依赖加载失败") }, "*");
@@ -9864,10 +10390,11 @@ function tavernFrameAssetBootstrap(access) {
 				token: String(input && input.token || ""),
 				relayEvents: input.relayEvents === true,
                 background: input.background === true,
+                persistentOwner: input.persistentOwner === true,
                 ...(input.spUnload?{spUnload:input.spUnload}:{}),
                 trustedHostDocument: input.trustedCardMode===true&&!scripts.some(s=>s.uiKind||s.originalUi),
                 trustedResource:input.trustedCardMode === true,
-                requiresComposer: input.background!==true && !input.previewScope && scripts.some(s=>s.uiKind||s.originalUi||/\b(send_textarea|send_but)\b/.test(s.content||"")),
+                requiresComposer: (input.background!==true||input.persistentOwner===true&&scripts.length===1&&scripts[0].id==='extension-sp-database') && !input.previewScope && scripts.some(s=>s.uiKind||s.originalUi||/\b(send_textarea|send_but)\b/.test(s.content||"")),
 				officialMvu: input.officialMvu === true || scripts.some(function (script) { return script && ["official-mvu", "card-mvu"].includes(script.system); }),
                 mvuCoreId: input.mvuCoreId || scripts.find(script => ["official-mvu", "card-mvu"].includes(script.system))?.id || "",
                 mvuReady: input.mvuReady && typeof input.mvuReady === "object" ? { events: Object.assign({}, input.mvuReady.events) } : null,
@@ -9913,6 +10440,7 @@ function tavernFrameAssetBootstrap(access) {
                 + 'installScriptLibraryBridge:' + installTavernScriptLibraryBridge.toString() + ','
                 + 'installAudioBridge:' + installTavernHelperAudioBridge.toString() + ','
                 + 'installGenerationBridge:' + installTavernGenerationBridge.toString() + ','
+                + 'installSpHostGeneration:' + installTavernSpHostGeneration.toString() + ','
 				+ 'installFacade:' + installTavernHelperFacade.toString() + '});';
 			const modules = scripts.map(function (script) {
 				return { id: String(script && script.id || ""), system: String(script && script.system || ""), mvuVersionSelection:script.mvuVersionSelection || null, mvuInitialization: script.mvuInitialization || null, sourceDigest: String(script && script.sourceDigest || ""), assetUrl: String(script && script.assetUrl || ""), content: String(script && script.content || "") };
@@ -9983,14 +10511,21 @@ function tavernFrameAssetBootstrap(access) {
             const databaseProviders = createTavernDatabaseProviderRouter({ records, post, schedule:hostWindow.setTimeout.bind(hostWindow), cancel:hostWindow.clearTimeout.bind(hostWindow) });
             function databasePanelCommand(event){const detail=event.detail;if(!detail||detail.sessionId!==activeSessionId||detail.accepted)return;detail.accepted=true;databaseProviders.requestPanel(detail.sessionId,detail.operation).then(detail.resolve,detail.reject)}
             hostWindow.addEventListener('dsh-tavern-database-panel-command',databasePanelCommand);
+            const spProvider=()=>[...records.values()].find(record=>record.sessionId===activeSessionId&&record.scripts.has('extension-sp-database'));
+            let spInputContext=null;
+            const spLogical=()=>{const record=spProvider();return !!record?.spZeroLayerViewActive||((record?.context||spInputContext)?.messages||[]).some(message=>{const value=message.pluginData?._acu_zero_layer_v1||message._acu_zero_layer_v1;return value&&value.exitManifest?.phase!=='committed'})};
+            const releaseSpNativeInput=installTavernSpNativeInputGate(hostWindow,{identity:()=>activeSessionId,getRoot:()=>migrationHost?.composerRoot(activeSessionId),getInput:()=>migrationHost?.composerInput(activeSessionId),logical:spLogical,submit:async(text,sessionId,signal)=>{signal?.throwIfAborted();const provider=spProvider(),expected={id:provider?.id,chatId:provider?.context.chatId,lifecycleRevision:Number(provider?.context.lifecycleRevision||0)};const abort=()=>{void databaseProviders.requestPanel(sessionId,{kind:'zero-stop'},expected).catch(error=>reportError('零层停止',error))};signal?.addEventListener('abort',abort,{once:true});try{return await databaseProviders.requestPanel(sessionId,{kind:'zero-input',text},expected)}finally{signal?.removeEventListener('abort',abort)}},report:error=>reportError('零层输入',error)});
             const sourceRequests = new Map();
 			const closedEventIds = new Set();
 			const closedEventOrder = [];
 			const reportedEventTimeouts = new Set();
-			const allowedMethods = new Set(["prepareTavernOriginalDatabaseMutation","setTavernMvuActivity","selectTavernFrontendWorldInfo","startTavernFrontendGeneration","startTavernFrontendMainGeneration","tavernHelperBrowserCache","tavernHelperComposer","triggerTavernSlash","tavernHelperDatabaseTemplates","tavernHelperChatFiles","tavernHelperIzumiConnection","tavernHelperPresets","tavernHelperIzumiAdvice","tavernHelperAudio","mutateTavernHelperHistory","tavernHelperWorldbookLibrary","tavernScriptStorage", "fillTavernScriptDatabase", "getTavernScriptResource", "editTavernRuntimeScripts", "startTavernHelperGeneration", "pollTavernHelperGeneration", "stopTavernHelperGeneration", "listTavernHelperModels", "commitTavernScriptDatabase", "tavernScriptImages", "tavernScriptFiles", "getTavernScriptLibrary", "changeTavernScriptLibrary", "generateTavernHelperRaw", "updateTavernHelperPrompts", "updateTavernHelperVariables", "updateTavernHelperMessages", "createTavernHelperMessages", "getTavernHelperWorldbook", "replaceTavernHelperWorldbook", "saveTavernExtensionSettings", "loadTavernWorldInfo", "saveTavernWorldInfo", "saveTavernChatData"]);
+			const allowedMethods = new Set(["tavernSpWebRequest","prepareTavernSpQuietPrompt","prepareTavernOriginalDatabaseMutation","setTavernMvuActivity","selectTavernFrontendWorldInfo","startTavernFrontendGeneration","startTavernFrontendMainGeneration","tavernHelperBrowserCache","tavernHelperComposer","triggerTavernSlash","tavernHelperDatabaseTemplates","tavernHelperChatFiles","tavernHelperIzumiConnection","tavernHelperPresets","tavernHelperIzumiAdvice","tavernHelperAudio","mutateTavernHelperHistory","tavernHelperWorldbookLibrary","tavernScriptStorage", "fillTavernScriptDatabase", "getTavernScriptResource", "editTavernRuntimeScripts", "startTavernHelperGeneration", "pollTavernHelperGeneration", "stopTavernHelperGeneration", "listTavernHelperModels", "commitTavernScriptDatabase", "tavernScriptImages", "tavernScriptFiles", "getTavernScriptLibrary", "changeTavernScriptLibrary", "generateTavernHelperRaw", "updateTavernHelperPrompts", "updateTavernHelperVariables", "updateTavernHelperMessages", "createTavernHelperMessages", "getTavernHelperWorldbook", "replaceTavernHelperWorldbook", "saveTavernExtensionSettings", "loadTavernWorldInfo", "saveTavernWorldInfo", "saveTavernChatData"]);
 			for(const method of ['beginTavernSpAuthority','chooseTavernSpAuthority','publishTavernSpAuthorityCache','getSpDatabase'])allowedMethods.add(method);
+            const spOwnedTaskMethods=new Set(['getTavernSpOwnedTaskIdentity','registerTavernSpOwnedTask','cancelTavernSpOwnedTask','dispatchTavernSpOwnedTask','checkpointTavernSpOwnedTask','modelTavernSpOwnedTask','assertTavernSpOwnedTask','commandTavernSpOwnedTask','prepareTavernSpOwnedSaveRetry']);
+            for(const method of spOwnedTaskMethods)allowedMethods.add(method);
 			// Page-only calls that cannot write host state; a background runtime skips them (R8 Z61).
 			const foregroundOnlyMethods = new Set(["tavernHelperComposer"]);
+            allowedMethods.add('tavernSpZeroLayerView');foregroundOnlyMethods.add('tavernSpZeroLayerView');
 			let activeSessionId = "";
             let releaseHostComposer = null;
             let releaseSlashComposer = null;
@@ -10034,7 +10569,7 @@ function tavernFrameAssetBootstrap(access) {
             let initializationStateKey = "";
             function publishInitializationState() {
                 const scripts = Array.from(records.values()).flatMap(record => Array.from(record.scripts.values()).map(script => ({ record, script })));
-                const pending = scripts.filter(({ record, script }) => record.initializationWorkPending || record.initializationWorkWaiting || (!script.subscriptionsReady && !script.initializationFailed)).length;
+                const pending = scripts.filter(({ record, script }) => record.initializationWorkPending || record.initializationWorkWaiting || (!script.subscriptionsReady && !script.initializationFailed) || ((options?.ownedSp===true||options?.spOwned===true)&&script.id==='extension-sp-database'&&record.databaseReady!==true&&!script.initializationFailed&&!record.initializationWorkFailed&&!record.initializationWorkTimedOut)).length;
                 const failed = scripts.filter(({ record, script }) => script.initializationFailed || record.initializationWorkFailed || record.initializationWorkTimedOut || (script.id === record.mvuCoreId && mvuInitializationError(record))).length;
                 const mvuPending = Array.from(records.values()).some(record => record.mvuCoreId && !mvuInitializationError(record) && !mvuDataReady(record));
                 const state = scripts.length ? { sessionId: activeSessionId, phase: mvuCompanionFailure() ? "failed" : pending || mvuPending ? "initializing" : failed ? "failed" : "ready", total: scripts.length, pending, failed:Math.max(failed,mvuCompanionFailure()?1:0), spTimedOut: Array.from(records.values()).some(record => record.initializationWorkTimedOut === true) } : null;
@@ -10051,11 +10586,12 @@ function tavernFrameAssetBootstrap(access) {
                     record.initializationWorkPending = true;
                     record.initializationWorkFailed = false;
 					const ids=Array.from(record.scripts.values()).filter(script=>script.subscriptionsReady&&!script.initializationFailed).map(script=>script.id);
-                    Promise.resolve(onRecordReady(record.sessionId, ids)).catch(function(error){
+                    Promise.resolve(record.remoteOwner ? record.remoteAttached : onRecordReady(record.sessionId, ids)).catch(function(error){
                         if (records.get(record.id) !== record) return;
                         const waiting = error?.code === "DSH_TAVERN_SP_INITIALIZING" && record.scripts.has("extension-sp-database");
                         record.initializationWorkWaiting = waiting && !record.databaseReady;
                         record.initializationWorkFailed = !waiting;
+                        record.initializationWorkError=String(error?.message||error).slice(0,4000);
                         if (record.initializationWorkWaiting && !record.initializationWorkTimer) {
                             // Presentation deadline only, matching the original SP hydration window.
                             // Never bypass its authority or event/write readiness gates.
@@ -10159,6 +10695,17 @@ function tavernFrameAssetBootstrap(access) {
                 const decorated=decorateHelperContext(context);helperContextMemo=revision?{revision,context:decorated}:null;return decorated;
 			}
 			function post(record, message) {
+                if(record.remoteOwner){
+                    if(records.get(record.id)!==record)return;
+                    if(message.type==='dsh-tavern-helper-context'){record.remoteSurface?.sync?.({context:record.context});if(message.context===record.context)refreshRemoteSp(record);return;}
+                    if(message.type==='dsh-tavern-original-database-command'){
+                        void remoteSpCommand(record,{kind:'database-command',operation:message.operation}).then(result=>{
+                            databaseProviders.receive(record,{type:'dsh-tavern-original-database-result',requestId:message.requestId,ok:true,result});
+                        },error=>databaseProviders.receive(record,{type:'dsh-tavern-original-database-result',requestId:message.requestId,ok:false,error:String(error.message||error)}));return;
+                    }
+                    if(message.type==='dsh-tavern-helper-event')void emitToRecord(record,message.name,message.args,record.context,null,message.eventId).catch(error=>reportError('SP 远程事件',error));
+                    return;
+                }
 				// A module can await an authenticated RPC before the iframe load event.
                 // Events and context still wait for load; replies must break that bootstrap dependency.
                 if (records.get(record.id) !== record || (!record.loaded && !["dsh-tavern-helper-response", "dsh-tavern-mvu-dependency-state", "dsh-tavern-mvu-start-cancel"].includes(message.type)) || !record.frame.contentWindow) return;
@@ -10217,11 +10764,34 @@ function tavernFrameAssetBootstrap(access) {
 				});
 				return record.compatibilityTail;
 			}
-			function removeRecord(id) {
+            const remoteUiClosures=new Set();
+            function closeRemoteSpUi(record){
+                if(!record.remoteOwner||!record.remoteIdentity)return Promise.resolve();
+                if(record.remoteClosePromise)return record.remoteClosePromise;
+                // Start the authenticated keepalive while the viewer lease and
+                // record are still valid. Retirement waits for this reply.
+                const task=Promise.resolve(invoke('commandTavernSpOwner',{...remoteSpIdentity(record),operation:{kind:'ui',command:{operation:'close'}}},record.sessionId,{keepalive:true})).then(reply=>{if(reply?.completed!==true||reply.result?.detached!==true)throw Error('SP 原界面退出未获确认');return reply;});
+                record.remoteClosePromise=task;remoteUiClosures.add(task);
+                void task.catch(error=>reportError('SP 原界面退出',error));
+                void task.finally(()=>remoteUiClosures.delete(task)).catch(()=>{});
+                return task;
+            }
+			function removeRecord(id, retiringRecords) {
 				const record = records.get(id);
 				if (!record) return;
+                closeRemoteSpUi(record);
+                record.remoteComposer?.dispose();
                 record.releaseDisplayedMessage?.();
-                databaseProviders.remove(record);
+                if(record.remoteSurfaceTimer)hostWindow.clearTimeout(record.remoteSurfaceTimer);
+                if(record.remoteRecoveryTimer)hostWindow.clearTimeout(record.remoteRecoveryTimer);
+                for(const controller of record.remoteControllers||[])controller.abort();record.remoteControllers?.clear();
+                for(const entry of record.remoteSurfaceRequests?.values()||[])if(!entry.acknowledged){
+                    void Promise.resolve(invoke('completeTavernSpSurfaceRequest',{...remoteSpIdentity(record),id:entry.id,error:'SP 前端游戏表面已关闭，请重新打开后重同步'},record.sessionId,{keepalive:true})).catch(error=>reportError('SP 表面关闭回执',error));
+                }
+                if(record.remoteOwner&&record.remoteIdentity)void Promise.resolve(invoke('commandTavernSpOwner',{...remoteSpIdentity(record),operation:{kind:'game-state',ready:false}},record.sessionId,{keepalive:true})).catch(error=>reportError('SP 游戏表面退出回执',error));
+                record.remoteSaveRecoveryReject?.(Error('SP 保存恢复界面已退出'));delete record.remoteSaveRecoveryReject;record.remoteDialogRecoveryReject?.(Error('SP 确认恢复界面已退出'));delete record.remoteDialogRecoveryReject;record.remoteDisposed=true;record.remoteSurface?.dispose?.({close:false});
+                databaseProviders.remove(record, retiringRecords);
+                if(record.scripts.has('extension-sp-database'))tavernSpLiveSurfaces.disposeScope({sessionId:record.sessionId,lifecycleRevision:record.context.lifecycleRevision});
                 record.releaseMenu?.();
                 if(record.composerStop)record.composerStop();
 				void flushCompatibility(record);
@@ -10243,15 +10813,22 @@ function tavernFrameAssetBootstrap(access) {
 				records.delete(id);
 				announcedReadinessKey = "";
 			}
-            function closeRecordUi(record) {
+            function closeRecordUi(record, surfaceClosed = false) {
                 hostWindow.__dshTavernPendingScriptUi=(hostWindow.__dshTavernPendingScriptUi||[]).filter(p=>p.sessionId!==activeSessionId||(record&&!uiRequestMatchesRecord(p.kind||'companion',record)));
                 if(record){for(const kind of requestedUi)if(uiRequestMatchesRecord(kind,record))requestedUi.delete(kind);}else requestedUi.clear();
                 for (const item of record ? [record] : records.values()) {
                     if (item.window) item.window.hide(); else if(item.container) { item.container.hidden = true; item.container.style.display = 'none'; }
+                    if(item.remoteOwner&&!surfaceClosed)void item.remoteSurface?.close?.({notify:false}).catch(error=>reportError('SP 原界面关闭',error));
                 }
             }
             function openRecordUi(record) {
                 requestedUi.add(record.uiKind || "shared");
+                if(record.remoteOwner){
+                    if(!record.window)record.window=createTavernScriptWindow(hostWindow,record.container,()=>closeRecordUi(record),()=>retryRemoteSpSave(record).catch(error=>reportError('SP 原保存重试',error)), {key:record.id,title:record.name});
+                    record.window.open();record.frame.hidden=true;
+                    if(record.remoteSurface)void record.remoteSurface.open({recover:record.remoteUiReady!==true}).catch(error=>reportError('SP 原界面打开',error));
+                    return;
+                }
                 if(legacyMenus&&!record.uiKind){
                     if(!record.subscriptionsReady&&!record.initializationFailed)return;
                     if(legacyMenus.hasScriptEntries()){closeRecordUi(record);legacyMenus.open('extensions',hostDocument.getElementById('extensionsMenuButton'));return;}
@@ -10351,8 +10928,31 @@ function tavernFrameAssetBootstrap(access) {
 				}
                 publishInitializationState();
 			}
-			function emitToRecord(record, name, args, context, diagnostics, hostEventId, excludedScriptIds, onlyScriptIds, relay) {
+            async function awaitRemoteSpEventAttachment(record,eventId) {
+                const attached=record.remoteAttached,identity=remoteSpIdentity(record),key=record.id+'\n'+eventId;
+                if(!attached)throw Error('SP 原事件没有附着执行者');
+                if(closedEventIds.has(key)||pendingEvents.has(key))throw Error('SP 远程事件标识已使用');
+                // Keep the original call in the existing event ledger, not a replay queue.
+                if(pendingEvents.size>=128)throw Error('SP 等待附着事件容量已满，事件未执行');
+                let timer;
+                try {
+                    await new Promise((resolve,reject)=>{
+                        timer=hostWindow.setTimeout(()=>reject(Error('SP 原事件等待附着超时，事件未执行')),91000);
+                        pendingEvents.set(key,{record,timer,reject});
+                        Promise.resolve(attached).then(resolve,reject);
+                    });
+                    const current=remoteSpIdentity(record);
+                    if(records.get(record.id)!==record||record.remoteDisposed||record.remoteAttached!==attached||current.chatId!==identity.chatId||current.lifecycleRevision!==identity.lifecycleRevision||current.sourceDigest!==identity.sourceDigest||(identity.ownerId&&current.ownerId!==identity.ownerId))throw Object.assign(Error('SP 原事件等待期间身份已变化，事件未执行'),{code:'DSH_TAVERN_RUNTIME_REPLACED'});
+                    if(!record.loaded||!record.subscriptionsReady||record.initializationFailed)throw Error('SP 原事件附着未完成，事件未执行');
+                } catch(error) {closeEventId(key);throw error;}
+                finally {hostWindow.clearTimeout(timer);pendingEvents.delete(key);}
+            }
+			async function emitToRecord(record, name, args, context, diagnostics, hostEventId, excludedScriptIds, onlyScriptIds, relay) {
 				if (Array.isArray(excludedScriptIds) && Array.from(record.scripts.keys()).every(id => excludedScriptIds.includes(id))) return Promise.resolve(args);
+                if(record.remoteOwner&&(!record.loaded||!record.subscriptionsReady)&&!record.initializationFailed){
+                    hostEventId=String(hostEventId||'')||'remote-sp-event-'+(++eventSequence);
+                    await awaitRemoteSpEventAttachment(record,hostEventId);
+                }
                 const validationEvent = /^mag_(?:variable_|command_parsed|before_message_update)/.test(String(name)) || Object.values(mvuDependencyStatus()?.owner?.mvuGlobalEvents||{}).includes(String(name)) || name==='MESSAGE_RECEIVED'&&Boolean(record.mvuCoreId)&&!excludedScriptIds?.includes(record.mvuCoreId);
                 const blockedCompanion = validationEvent ? mvuCompanionFailure() : '';
                 // A durable ordinary journal can acknowledge the other records
@@ -10373,6 +10973,20 @@ function tavernFrameAssetBootstrap(access) {
 					post(record, { type: "dsh-tavern-helper-context", context: record.context });
 				}
 				if (!record.subscriptions.has(String(name))) return Promise.resolve(args);
+                if(record.remoteOwner){
+                    const eventId=String(hostEventId||'')||'remote-sp-event-'+(++eventSequence),pendingKey=record.id+'\n'+eventId;
+                    if(closedEventIds.has(pendingKey)||pendingEvents.has(pendingKey))return Promise.reject(Error('SP 远程事件标识已使用'));
+                    const delivery=new Promise((resolve,reject)=>{
+                        const timer=hostWindow.setTimeout(()=>reject(Error('SP 远程事件完成回执超时，工作状态请检查恢复记录')),Math.max(eventTimeoutMs,91000));
+                        pendingEvents.set(pendingKey,{record,timer,reject});
+                        remoteSpRequest(record,'emitTavernSpOwner',{eventId,name,args,context:record.context,excludedScriptIds,onlyScriptIds,reentrantParentId:relay?.ancestors.findLast(item=>item.record===record)?.eventId,displayedMessage:record.displayTarget?.identity}).then(resolve,reject);
+                    });
+                    return delivery.then(result=>{
+                        if(result?.completed!==true||!Array.isArray(result.args))throw Error('SP 原事件完成回执未获确认');
+                        if(Array.isArray(diagnostics)&&Array.isArray(result.diagnostics))diagnostics.push(...result.diagnostics);
+                        return result.args;
+                    }).finally(()=>{const pending=pendingEvents.get(pendingKey);if(pending)hostWindow.clearTimeout(pending.timer);pendingEvents.delete(pendingKey);closeEventId(pendingKey);});
+                }
 				const eventId = String(hostEventId || "") || "host-event-" + (++eventSequence);
                 const pendingKey = record.id + "\n" + eventId;
 				if(closedEventIds.has(pendingKey))return Promise.reject(new Error('脚本事件标识已使用，请为新的尝试使用新标识'));
@@ -10445,17 +11059,26 @@ function tavernFrameAssetBootstrap(access) {
 						if(name==="MESSAGE_RECEIVED" && record.scripts.get(record.mvuCoreId)?.system==="card-mvu" && String(hostEventId||"").startsWith("journal:") && Array.isArray(diagnostics))diagnostics.push({kind:"card-mvu-deferred-v1",name:String(name),scriptId:record.mvuCoreId,message:"卡核心尚未就绪，变量结算延后"});
 						continue;
 					}
-					current = await emitToRecord(record, name, current, context, diagnostics, hostEventId, excludedScriptIds, onlyScriptIds);
+					try { current = await emitToRecord(record, name, current, context, diagnostics, hostEventId, excludedScriptIds, onlyScriptIds); }
+                    catch(error){
+                        if(record.remoteOwner&&record.remoteIdentity){
+                            const later=[...records.values()].slice([...records.values()].indexOf(record)+1);
+                            const outstanding=later.some(next=>next.loaded&&next.subscriptionsReady&&!next.initializationFailed&&next.subscriptions.has(String(name))&&(!Array.isArray(onlyScriptIds)||onlyScriptIds.some(id=>next.scripts.has(String(id))))&&(!Array.isArray(excludedScriptIds)||![...next.scripts.keys()].every(id=>excludedScriptIds.includes(id))));
+                            if(!outstanding)error.dshSpSaveRecoveryBoundary={eventId:String(hostEventId||''),ownerId:record.remoteIdentity.ownerId,allOtherRecipientsComplete:true};
+                        }
+                        throw error;
+                    }
 				}
 				return current;
 			}
 			function clear() {
+                const retiringRecords=new Set(records.values());
                 for(const item of worldbookRefreshes.values())hostWindow.clearTimeout(item.timer);worldbookRefreshes.clear();
                 if (releaseHostComposer) { releaseHostComposer(); releaseHostComposer = null; }
                 if (releaseSlashComposer) { releaseSlashComposer(); releaseSlashComposer = null; }
                 requestedUi.clear(); sourceRequests.clear();
                 mvuDependency = null; mvuReadyOwner = null; mvuStoppedScope = null;
-				Array.from(records.keys()).forEach(removeRecord);
+				for(const record of retiringRecords)if(records.get(record.id)===record)removeRecord(record.id,retiringRecords);
                 if (gameArtifacts) { gameArtifacts.scope.dispose(); gameArtifacts = null; }
 				if (scriptWindow) scriptWindow.dispose(); scriptWindow = null;
                 for(const container of uiRoots.values()) container.remove(); uiRoots.clear();
@@ -10507,12 +11130,180 @@ function tavernFrameAssetBootstrap(access) {
                 if(records.get(record.id)!==record||record.subscriptionsReady||record.initializationFailed||record.initializationTimer)return;
                 armInitializationStage(record,stage,initializationAllowance(record,stage));
             }
+            function remoteSpIdentity(record){return {ownerId:record.remoteIdentity?.ownerId,capability:record.remoteIdentity?.capability,chatId:record.context.chatId,lifecycleRevision:Number(record.context.lifecycleRevision||0),sourceDigest:record.scriptSources[0].sourceDigest||record.scriptSources[0].content};}
+            async function remoteSpRequest(record,method,args={}){
+                if(records.get(record.id)!==record||record.remoteDisposed)throw Object.assign(Error('SP 界面已退出，操作未完成'),{code:'DSH_TAVERN_RUNTIME_REPLACED'});
+                const expected=remoteSpIdentity(record),controller=new hostWindow.AbortController();
+                (record.remoteControllers||=new Set()).add(controller);
+                let timer;
+                const nativeDialogBudget=method==='attachTavernSpOwner'||method==='commandTavernSpOwner'&&args.operation?.kind==='ui'&&['input','open'].includes(args.operation.command?.operation);
+                if(nativeDialogBudget){let remaining=91000,last=now();const check=()=>{const at=now();if(!record.remoteNativeDialogPending)remaining-=Math.max(0,at-last);last=at;if(remaining<=0){controller.abort();return}timer=hostWindow.setTimeout(check,Math.min(1000,remaining))};check()}else timer=hostWindow.setTimeout(()=>controller.abort(),91000);
+                let result;
+                try{result=await invoke(method,{...args,...expected},record.sessionId,{signal:controller.signal});}
+                finally{hostWindow.clearTimeout(timer);record.remoteControllers?.delete(controller);}
+                if(records.get(record.id)!==record||record.remoteDisposed||Number(record.context.lifecycleRevision||0)!==expected.lifecycleRevision)throw Object.assign(Error('SP 对话身份已变化'),{code:'DSH_TAVERN_RUNTIME_REPLACED'});
+                return result;
+            }
+            async function retryRemoteSpSave(record){
+                const reply=await remoteSpRequest(record,'commandTavernSpOwner',{operation:{kind:'retry-save'}});
+                if(reply?.completed!==true||reply.result?.saved!==true)throw Error('SP 仅保存恢复未获确认');
+                record.remoteSaveRecovered?.();return reply.result;
+            }
+            async function remoteSpCommand(record,operation){
+                await record.remoteAttached;
+                const reply=await remoteSpRequest(record,'commandTavernSpOwner',{operation});
+                if(reply?.completed!==true)throw Error('SP 原API操作完成回执未获确认');
+                if(reply.context)record.context=decorateHelperContext(reply.context,record.context);
+                reportMutation(record.sessionId,'commandTavernSpOwner',reply);
+                return reply.result;
+            }
+            function applyRemoteSpState(record,result){
+                const expected=remoteSpIdentity(record);
+                if(!result?.ownerId||result.sourceDigest!==expected.sourceDigest||Number(result.lifecycleRevision)!==expected.lifecycleRevision||result.loaded!==true||result.subscriptionsReady!==true||result.ready!==true||!Array.isArray(result.subscriptions)||typeof result.capability!=='string'||!result.capability)throw Error('SP 持久执行者初始化回执不完整');
+                if(record.remoteIdentity&&record.remoteIdentity.ownerId!==result.ownerId)throw Error('SP 持久执行者已替换，请重新打开界面');
+                record.remoteIdentity={ownerId:result.ownerId,capability:result.capability};
+                record.loaded=result.loaded;record.subscriptionsReady=result.subscriptionsReady;
+                record.subscriptions=new Set(result.subscriptions.map(String));
+                for(const script of record.scripts.values()){script.loaded=result.loaded;script.subscriptionsReady=result.subscriptionsReady;script.subscriptions=record.subscriptions;}
+                databaseProviders.receive(record,{type:'dsh-tavern-original-database-ready',ready:true,names:result.databaseTemplates||[]});
+                record.remoteSurface?.sync?.(result);
+            }
+            function refreshRemoteSp(record){
+                record.remoteRefreshRequested=true;
+                if(record.remoteRefreshing)return;
+                record.remoteRefreshing=(async()=>{
+                    await record.remoteAttached;
+                    while(record.remoteRefreshRequested&&records.get(record.id)===record&&!record.remoteDisposed){
+                        record.remoteRefreshRequested=false;
+                        // attach refreshes the authoritative owner view; it does not
+                        // initialize a second realm or re-emit CHAT_CHANGED.
+                        const result=await remoteSpRequest(record,'attachTavernSpOwner',{context:record.context,refresh:true});
+                        applyRemoteSpState(record,result);
+                    }
+                })().catch(error=>{if(records.get(record.id)===record&&!record.remoteDisposed){record.initializationWorkFailed=true;reportError('SP 执行者状态同步',error);publishInitializationState();}}).finally(()=>{record.remoteRefreshing=null;});
+            }
+            function remoteSpViewerCurrent(record){return records.get(record.id)===record&&!record.remoteDisposed&&record.sessionId===activeSessionId&&options?.background!==true&&hostDocument.visibilityState!=='hidden';}
+            function startRemoteSpSurfaceRequests(record){
+                record.remoteSurfaceRequests=new Map();
+                const receive=async()=>{
+                    if(records.get(record.id)!==record||record.remoteDisposed)return;
+                    try{
+                        if(!remoteSpViewerCurrent(record))return;
+                        const response=await remoteSpRequest(record,'getTavernSpSurfaceRequests');
+                        if(!Array.isArray(response.requests)||response.requests.length>32)throw Error('SP 前端表面请求批次无效');
+                        for(const request of response.requests){
+                            if(typeof request?.id!=='string'||!request.id)throw Error('SP 前端表面请求标识无效');
+                            let entry=record.remoteSurfaceRequests.get(request.id);
+                            if(['composer','slash'].includes(request.operation?.kind)){
+                                const acknowledge=async entry=>{
+                                    if(entry.acknowledging||entry.acknowledged)return;entry.acknowledging=true;
+                                    try{await remoteSpRequest(record,'completeTavernSpSurfaceRequest',{id:entry.id,...request.composerEpoch!==undefined?{composerEpoch:request.composerEpoch}:{},...entry.error?{error:entry.error}:{result:entry.result}});entry.acknowledged=true}
+                                    catch(error){if(!record.remoteDisposed)reportError('SP 原输入操作回执',error)}finally{entry.acknowledging=false}
+                                };
+                                if(entry){if(entry.settled)void acknowledge(entry);continue;}
+                                entry={id:request.id};record.remoteSurfaceRequests.set(request.id,entry);
+                                // A long /trigger must not block polling or the return
+                                // events/composer operations needed by that generation.
+                                void (async()=>{
+                                    try{
+                                        if(!remoteSpViewerCurrent(record)||Number(request.lifecycleRevision)!==Number(record.context.lifecycleRevision||0))throw Error('SP 前端输入归属已变化');
+                                        const operation=request.operation,input=migrationHost.composerInput(record.sessionId);
+                                        if(operation.kind==='slash'){
+                                            assertTavernFrameSlash(operation.line,record.trustedCardMode);
+                                            entry.result=await migrationHost.executeSlash(String(operation.line||''),record.sessionId);
+                                        }else{
+                                            const composerEpoch=record.remoteComposer.snapshot().composerEpoch;
+                                            if(request.composerEpoch!==composerEpoch||(operation.operation?.expectedComposerEpoch!==undefined&&operation.operation.expectedComposerEpoch!==composerEpoch))throw Error('SP 输入连接代次已变化，旧请求未执行');
+                                            if(operation.operation?.kind!=='read'&&operation.operation?.expectedRevision!==undefined&&operation.operation.expectedRevision!==record.remoteComposer.snapshot().revision)throw Error('输入框版本已变化，草稿已保留');
+                                            entry.result=await performTavernComposerOperation(input,operation.operation,{revision:()=>record.remoteComposer.snapshot().revision,running:migrationHost.composerRunning(record.sessionId),stop:()=>migrationHost.stopComposer(record.sessionId)});
+                                            entry.result={...entry.result,attached:true,composerEpoch};
+                                        }
+                                    }catch(error){entry.error=String(error?.message||error);}
+                                    entry.settled=true;await acknowledge(entry);
+                                })();
+                                continue;
+                            }
+                            if(!entry){
+                                entry={id:request.id};record.remoteSurfaceRequests.set(request.id,entry);
+                                try{
+                                    if(!remoteSpViewerCurrent(record)||Number(request.lifecycleRevision)!==Number(record.context.lifecycleRevision||0))throw Error('SP 前端表面已退出或生命周期已变化');
+                                    const operation=request.operation;
+                                    if(!operation||!['mount','bind','publish','unbind','dispose'].includes(operation.kind))throw Error('SP 前端表面操作无效');
+                                    const scope={sessionId:record.sessionId,chatId:record.context.chatId,lifecycleRevision:Number(record.context.lifecycleRevision||0)};
+                                    entry.result=tavernSpLiveSurfaces.command(scope,operation,async(method,query)=>{
+                                        const reply=await remoteSpRequest(record,'commandTavernSpOwner',{operation:{kind:'database-command',operation:{kind:'zero-read',method,query}}});
+                                        if(reply?.completed!==true)throw Error('SP 实时读取完成回执未确认');return reply.result;
+                                    },ready=>{
+                                        if(remoteSpViewerCurrent(record))void remoteSpRequest(record,'commandTavernSpOwner',{operation:{kind:'game-state',ready}}).then(reply=>{if(reply?.completed!==true)throw Error('SP 游戏表面回执未确认');}).catch(error=>reportError('SP 游戏表面回执',error));
+                                    });
+                                    record.spZeroLayerViewActive=!['dispose','unbind'].includes(operation.kind);
+                                }catch(error){entry.error=String(error?.message||error);}
+                            }
+                            await remoteSpRequest(record,'completeTavernSpSurfaceRequest',{id:entry.id,...entry.error?{error:entry.error}:{result:entry.result}});
+                            entry.acknowledged=true;
+                            while(record.remoteSurfaceRequests.size>256){const first=record.remoteSurfaceRequests.keys().next().value;if(!record.remoteSurfaceRequests.get(first)?.acknowledged)break;record.remoteSurfaceRequests.delete(first);}
+                        }
+                    }catch(error){if(records.get(record.id)===record&&!record.remoteDisposed)reportError('SP 真实游戏表面',error);}
+                    finally{if(records.get(record.id)===record&&!record.remoteDisposed)record.remoteSurfaceTimer=hostWindow.setTimeout(receive,500);}
+                };
+                record.remoteSurfaceTimer=hostWindow.setTimeout(receive,0);
+            }
+            function attachRemoteSp(record){
+                record.remoteAttached=(async()=>{
+                    // A cold logical game can mount its real surface while the
+                    // original's initialization is still awaiting that mount.
+                    // Observation capability is not a loaded/ready receipt.
+                    const prepared=await remoteSpRequest(record,'prepareTavernSpOwner');
+                    if(!prepared?.ownerId||typeof prepared.capability!=='string'||!prepared.capability||!Number.isSafeInteger(prepared.composerEpoch)||prepared.composerEpoch<1||prepared.sourceDigest!==remoteSpIdentity(record).sourceDigest||Number(prepared.lifecycleRevision)!==Number(record.context.lifecycleRevision||0))throw Error('SP 持久执行者观察连接身份无效');
+                    record.remoteIdentity={ownerId:prepared.ownerId,capability:prepared.capability};
+                    if(typeof createTavernSpRemoteSurface!=='function')throw Error('SP 原界面代理尚未载入');
+                    const recoveryCommand=async operation=>{
+                        if(operation?.kind==='ui'&&['recover','dialog','files','close'].includes(operation.command?.operation)){
+                            const reply=await remoteSpRequest(record,'commandTavernSpOwner',{operation});if(reply?.completed!==true)throw Error('SP 恢复界面回执未确认');if(operation.command?.operation==='dialog'&&reply.result?.delivered===true){record.remoteDialogAnswers=(record.remoteDialogAnswers||0)+1;record.remoteDialogRecovered?.();}return reply.result;
+                        }
+                        return remoteSpCommand(record,operation);
+                    };
+                    record.remoteSurface=createTavernSpRemoteSurface({window:hostWindow,document:hostDocument,container:record.container,frame:record.frame,sessionId:record.sessionId,identity:()=>remoteSpIdentity(record),command:recoveryCommand,retrySave:()=>retryRemoteSpSave(record),onClose:()=>closeRecordUi(record,true),onNativeDialogPending:pending=>{record.remoteNativeDialogPending=pending},report:error=>reportError('SP 原界面',error)});
+                    record.remoteSurface.sync?.(prepared);
+                    const recover=async()=>{
+                        if(records.get(record.id)!==record||record.remoteDisposed||record.remoteUiReady||record.initializationFailed)return;
+                        try{
+                            const result=await recoveryCommand({kind:'ui',command:{operation:'recover'}});
+                            if(result?.notices?.some(item=>item.kind==='dialog'||item.kind==='file'))openRecordUi(record);
+                        }catch(error){record.remoteRecoveryError=String(error?.message||error);openRecordUi(record);record.remoteSurface?.sync?.({recoveryError:record.remoteRecoveryError});}
+                        finally{if(records.get(record.id)===record&&!record.remoteDisposed&&!record.remoteUiReady&&!record.initializationFailed)record.remoteRecoveryTimer=hostWindow.setTimeout(recover,400);}
+                    };
+                    void recover();
+                    record.remoteComposer=installTavernSpRemoteComposer({window:hostWindow,input:migrationHost.composerInput(record.sessionId),composerEpoch:prepared.composerEpoch,getRoot:()=>migrationHost.composerRoot(record.sessionId),current:()=>remoteSpViewerCurrent(record),running:()=>migrationHost.composerRunning(record.sessionId),command:operation=>remoteSpRequest(record,'commandTavernSpOwner',{operation}).then(reply=>{if(reply?.completed!==true)throw Error('SP 输入桥回执未确认');return reply.result}),report:error=>reportError('SP 真实输入框',error)});
+                    startRemoteSpSurfaceRequests(record);
+                    let dialogAnswersBeforeAttach=record.remoteDialogAnswers||0;let result=await remoteSpRequest(record,'attachTavernSpOwner',{context:record.context});
+                    while(result?.recoveryRequired===true||result?.dialogRecoveryRequired===true){
+                        record.remoteSaveRecoveryRequired=result.recoveryRequired===true;record.remoteSurface.sync?.(result);openRecordUi(record);
+                        if(result.dialogRecoveryRequired===true){if((record.remoteDialogAnswers||0)===dialogAnswersBeforeAttach)await new Promise((resolve,reject)=>{record.remoteDialogRecovered=resolve;record.remoteDialogRecoveryReject=reject;});}
+                        else await new Promise((resolve,reject)=>{record.remoteSaveRecovered=resolve;record.remoteSaveRecoveryReject=reject;});
+                        if(!remoteSpViewerCurrent(record))throw Error('SP 保存恢复界面已退出');
+                        dialogAnswersBeforeAttach=record.remoteDialogAnswers||0;result=await remoteSpRequest(record,'attachTavernSpOwner',{context:record.context});
+                    }
+                    record.remoteSaveRecoveryRequired=false;delete record.remoteSaveRecovered;delete record.remoteSaveRecoveryReject;delete record.remoteDialogRecovered;delete record.remoteDialogRecoveryReject;
+                    applyRemoteSpState(record,result);
+                    record.remoteUiReady=true;if(record.remoteRecoveryTimer)hostWindow.clearTimeout(record.remoteRecoveryTimer);
+                    record.remoteSurface.sync?.(result);
+                    if(record.window&&!record.container.hidden||[...requestedUi].some(kind=>uiRequestMatchesRecord(kind,record)))openRecordUi(record);
+                    maybeAnnounceReady();return result;
+                })();
+                void record.remoteAttached.catch(error=>{
+                    if(records.get(record.id)!==record)return;
+                    record.initializationFailed=true;record.initializationWorkFailed=true;
+                    for(const script of record.scripts.values())script.initializationFailed=true;
+                    reportError('SP 持久执行者初始化',error);publishInitializationState();
+                });
+            }
             function createRecord(sessionId, scripts, context, trustedCardMode, recordId = "shared", uiKind = "", policy = {}) {
                 const name = uiKind ? scripts[0].name : "共享脚本沙箱";
 				const artifactOwner=token();
 				const container = ensureRoot(recordId, uiKind ? name : "原版脚本界面");
 				const frame = hostDocument.createElement("iframe");
-				const fingerprint = scripts.map(function (script) { return script.id + "\n" + (script.sourceDigest || script.content)+"\nstartup="+JSON.stringify(script.mvuInitialization||null); }).join("\n---\n") + "\ntrusted=" + String(trustedCardMode) + "\nlifecycle=" + Number(context.lifecycleRevision || 0) + "\npolicy=" + JSON.stringify(policy) + "\nmvu=" + JSON.stringify(mvuDependency);
+				const fingerprint = scripts.map(function (script) { return script.id + "\n" + (script.sourceDigest || script.content)+"\nstartup="+JSON.stringify(script.mvuInitialization||null)+'\nremoteSp='+String(script.remoteSp===true); }).join("\n---\n") + "\ntrusted=" + String(trustedCardMode) + "\nlifecycle=" + Number(context.lifecycleRevision || 0) + "\npolicy=" + JSON.stringify(policy) + "\nmvu=" + JSON.stringify(mvuDependency);
 				const record = {
 					id: recordId, container, uiKind, policy, mvuEpoch:++mvuDependencyEpoch,
 					officialMvu: scripts.some(script => officialMvuSources.has(script)),
@@ -10541,6 +11332,12 @@ function tavernFrameAssetBootstrap(access) {
 					lastRuntimeError: "",
 					scripts: new Map(scripts.map(function (script) { return [String(script.id), { id: String(script.id), sourceDigest:script.sourceDigest || script.content, system:script.system || '', mvuInitialization:script.mvuInitialization || null, name: String(script.name || script.id), loaded: false, subscriptionsReady: false, initializationFailed: false }]; }))
 				};
+                if(options?.spOwned!==true&&options?.ownedSp!==true&&scripts.length===1&&scripts[0].id==='extension-sp-database'&&scripts[0].remoteSp===true){
+                    record.remoteOwner=true;record.initializationWorkPending=true;
+                    frame.title=name;frame.sandbox='allow-scripts';
+                    container.appendChild(frame);records.set(record.id,record);
+                    attachRemoteSp(record);return record;
+                }
 				frame.title = uiKind ? name : "人物卡共享脚本沙箱";
 				if (!trustedCardMode) frame.sandbox = "allow-scripts";
 				frame.referrerPolicy = "no-referrer";
@@ -10548,7 +11345,7 @@ function tavernFrameAssetBootstrap(access) {
                 const mvuReady = dependency?.state.phase === 'ready' && !scripts.some(script => String(script.id) === mvuDependency.id) ? { events: dependency.state.events } : null;
                 const participants=scripts.map(script=>unloadAccess?.participants?.find(p=>p.scriptId===script.id&&p.sourceDigest===(script.sourceDigest||script.content)));
                 const spUnload=participants.length&&participants.every(Boolean)&&unloadAccess.lifecycleRevision===Number(context.lifecycleRevision||0)?{unloadId:unloadAccess.unloadId,participants}:null;
-                frame.srcdoc = buildTavernHelperScriptDocument({ ...(spUnload?{spUnload}:{}),token: record.token, scripts: scripts, officialMvu:Boolean(mvuDependency), mvuCoreId:mvuDependency?.id, mvuReady, background:options?.background===true, relayEvents:true, context: projectTavernScriptContext(context,scripts.map(script=>String(script.id)),policy), trustedCardMode: trustedCardMode, networkAllowed:policy.capabilities?.includes('network'),assetAccess:policy.assetAccess });
+                frame.srcdoc = buildTavernHelperScriptDocument({ ...(spUnload?{spUnload}:{}),token: record.token, scripts: scripts, officialMvu:Boolean(mvuDependency), mvuCoreId:mvuDependency?.id, mvuReady, background:options?.background===true, persistentOwner:options?.persistentOwner===true||options?.spOwned===true||options?.ownedSp===true, relayEvents:true, context: projectTavernScriptContext(context,scripts.map(script=>String(script.id)),policy), trustedCardMode: trustedCardMode, networkAllowed:policy.capabilities?.includes('network'),assetAccess:policy.assetAccess });
 				frame.addEventListener("load", function () {
 					if (records.get(record.id) !== record) return;
 					record.loaded = true;
@@ -10594,7 +11391,7 @@ function tavernFrameAssetBootstrap(access) {
                     if (mvu.status === "incompatible" || index < 0) scripts.unshift({id:mvu.scriptId || "__dsh_card_mvu_blocked__",name:"人物卡 MVU",system:"card-mvu",mvuVersionSelection:mvu,content:'throw new Error(' + JSON.stringify(mvu.message || '人物卡指定 MVU 未加载；保留原资源和剧情数据。') + ');',data:{},buttons:[],info:""});
                     else { const core = scripts.splice(index,1)[0]; scripts.unshift(Object.assign({},core,{mvuVersionSelection:mvu})); }
                 }
-				return scripts;
+				return scripts.map(script=>script.id==='extension-sp-database'&&view?.tavernSpOwned===true?{...script,remoteSp:true}:script);
 			}
 			function sync(sessionId, view) {
 				const nextSessionId = String(sessionId || "");
@@ -10604,12 +11401,14 @@ function tavernFrameAssetBootstrap(access) {
                 // Keep the acknowledged state until an equally recent view arrives.
                 const incoming=view?.tavernHelper;
                 if(incoming&&[...records.values()].some(record=>record.context.chatId===incoming.chatId&&Number(record.context.lifecycleRevision||0)===Number(incoming.lifecycleRevision||0)&&Number(record.context.stateRevision)>Number(incoming.stateRevision)))return;
+                spInputContext=incoming||null;
+                if(options?.background!==true&&migrationHost){try{releaseSpNativeInput.ensure(migrationHost.composerInput(nextSessionId))}catch(error){if(spLogical())reportError('零层输入',error)}}
 				const scripts = scriptsForView(view);
                 expectedScriptIds = scripts.map(script => script.id);
                 const dependencyCore = scripts.find(script => ["official-mvu", "card-mvu"].includes(script.system));
                 mvuDependency = dependencyCore ? { id:dependencyCore.id, source:dependencyCore.sourceDigest || dependencyCore.content, assetUrl:dependencyCore.assetUrl || "", selection:dependencyCore.mvuVersionSelection || null } : null;
 				const trustedCardMode = Boolean(view?.tavernRuntimePolicy?.trustedCardMode || Object.values(view?.tavernRuntimePolicy?.scriptPolicies || {}).some(policy=>policy.trustedCardMode));
-				readinessKey = scripts.length === 0 ? "" : nextSessionId + "\n" + scripts.map(function (script) { return script.id + "\n" + (script.sourceDigest || script.content)+"\nstartup="+JSON.stringify(script.mvuInitialization||null); }).join("\n---\n") + "\ntrusted=" + String(trustedCardMode);
+				readinessKey = scripts.length === 0 ? "" : nextSessionId + "\n" + scripts.map(function (script) { return script.id + "\n" + (script.sourceDigest || script.content)+"\nstartup="+JSON.stringify(script.mvuInitialization||null)+'\nremoteSp='+String(script.remoteSp===true); }).join("\n---\n") + "\ntrusted=" + String(trustedCardMode);
 				if (scripts.length === 0) { clear(); activeSessionId = nextSessionId; return; }
                 const composerRoot=options?.background===true?null:migrationHost?.composerRoot?.(nextSessionId);
                 if(composerRoot&&hostDocument.defaultView&&!releaseSlashComposer){
@@ -10653,7 +11452,7 @@ function tavernFrameAssetBootstrap(access) {
                 for(const [id, group] of groups) {
                     const policy = view?.tavernRuntimePolicy?.scriptPolicies?.[group.scripts[0].id] || view?.tavernRuntimePolicy || {};
                     const groupTrusted = policy.trustedCardMode === true;
-                    const fingerprint = group.scripts.map(script => script.id + '\n' + (script.sourceDigest || script.content)+'\nstartup='+JSON.stringify(script.mvuInitialization||null)).join('\n---\n') + '\ntrusted=' + String(groupTrusted) + '\nlifecycle=' + Number(context.lifecycleRevision || 0) + '\npolicy=' + JSON.stringify(policy) + '\nmvu=' + JSON.stringify(mvuDependency);
+                    const fingerprint = group.scripts.map(script => script.id + '\n' + (script.sourceDigest || script.content)+'\nstartup='+JSON.stringify(script.mvuInitialization||null)+'\nremoteSp='+String(script.remoteSp===true)).join('\n---\n') + '\ntrusted=' + String(groupTrusted) + '\nlifecycle=' + Number(context.lifecycleRevision || 0) + '\npolicy=' + JSON.stringify(policy) + '\nmvu=' + JSON.stringify(mvuDependency);
                     let record = records.get(id);
                     if(record && record.fingerprint !== fingerprint) { removeRecord(id); record = null; }
                     
@@ -10682,7 +11481,8 @@ function tavernFrameAssetBootstrap(access) {
 				const record = Array.from(records.values()).find(function (item) { return item.token === data.token && event.source === item.frame.contentWindow; });
 				if (!record) return;
                 if(data.type==='dsh-tavern-helper-context-resync'){post(record,{type:'dsh-tavern-helper-context',context:record.context,forceSnapshot:true});return;}
-                if(databaseProviders.receive(record,data)) {
+                const databaseMessage=data.type==='dsh-tavern-original-database-ready'&&(options?.ownedSp===true||options?.spOwned===true)?{...data,ready:data.ready===true}:data;
+                if(databaseProviders.receive(record,databaseMessage)) {
                     if (data.type === "dsh-tavern-original-database-ready" && data.ready === true && record.scripts.has("extension-sp-database") && (record.initializationWorkWaiting || record.initializationWorkTimedOut)) {
                         if (record.initializationWorkTimer) hostWindow.clearTimeout(record.initializationWorkTimer);
                         record.initializationWorkTimer = null;
@@ -10690,6 +11490,7 @@ function tavernFrameAssetBootstrap(access) {
                         record.initializationWorkTimedOut = false;
                         publishInitializationState();
                     }
+                    if(data.type==='dsh-tavern-original-database-ready'&&(options?.ownedSp===true||options?.spOwned===true))publishInitializationState();
                     return;
                 }
                 if(data.type==='dsh-tavern-helper-slash-commands'){
@@ -10875,7 +11676,7 @@ function tavernFrameAssetBootstrap(access) {
 				// options) must not fail MESSAGE_RECEIVED, stop the event journal and block
 				// the next turn. A script that awaits the call still gets the error; the skip
 				// is kept as a warning on the event. Calls that may write stay ordinary.
-				if (options?.background === true && foregroundOnlyMethods.has(data.method)) {
+                if (options?.background === true && foregroundOnlyMethods.has(data.method) && !(options?.persistentOwner===true&&['tavernSpZeroLayerView','tavernHelperComposer'].includes(data.method))) {
 					const script = record.scripts.get(String(data.scriptId || ''));
 					const message = '「' + data.method + '」只能在打开的游戏页面里使用；页面关闭时由后台运行脚本，此调用已跳过。';
 					const diagnostic = { kind: 'console', level: 'warn', scriptId: String(data.scriptId || ''), message: '后台跳过：脚本「' + String(script?.name || data.scriptId || '') + '」' + message };
@@ -10908,7 +11709,7 @@ function tavernFrameAssetBootstrap(access) {
 						const relay = {rootEventId: parentEvent?.rootEventId || '', ancestors,displayTarget:parentEvent?.displayTarget,displayCurrent:parentEvent?.displayCurrent};
 						let args = clone(data.args.args);
 						for (const target of records.values()) {
-							if (target === record || !target.subscriptions.has(name)) continue;
+							if (target === record || (!target.subscriptions.has(name)&&!(target.remoteOwner&&(!target.loaded||!target.subscriptionsReady)&&!target.initializationFailed))) continue;
 							const access = tavernEventRelayAccess(record, target);
 							if (!access.deliver) continue;
 							if (records.get(record.id) !== record || (data.eventId && pendingEvents.get(record.id + '\n' + data.eventId) !== parentEvent)) throw Error('脚本事件已失效');
@@ -10955,10 +11756,18 @@ function tavernFrameAssetBootstrap(access) {
                             const operation=data.method==='tavernHelperDatabaseTemplates'?mutationArgs.operation:{kind:data.method==='fillTavernScriptDatabase'?'fill':'mutate',command:mutationArgs.command,expectedRevision:mutationArgs.expectedRevision};
                             const routed=databaseProviders.request(record,{...mutationArgs,operation});if(routed)return routed;
                         }
+                        if(spOwnedTaskMethods.has(data.method)&&!(options?.persistentOwner===true&&mutationArgs.scriptId==='extension-sp-database'&&record.scripts.size===1&&record.scripts.has('extension-sp-database')))throw Error('SP 持久任务仅允许专用原包执行者调用');
                         if(data.method==='getTavernScriptResource'){
                             const key=record.sessionId+'\n'+mutationArgs.scriptId+'\n'+String(mutationArgs.digest||'')+'\n'+String(record.policy.assetAccess?.prefix || '');
                             if(!sourceRequests.has(key)){const task=invoke(data.method,mutationArgs,record.sessionId);sourceRequests.set(key,task);task.catch(()=>{if(sourceRequests.get(key)===task)sourceRequests.delete(key);});if(sourceRequests.size>24)sourceRequests.delete(sourceRequests.keys().next().value);}
                             return sourceRequests.get(key).then(result=>record.scriptSources.some(script=>script.sourceDigest===mutationArgs.digest)?Object.assign({},result,{content:scopeTavernAssetText(rewriteTavernStaticMarkup(result.content),record.policy.assetAccess)}):result);
+                        }
+                        if(data.method==='tavernSpZeroLayerView'){
+                            if(mutationArgs.scriptId!=='extension-sp-database'||!record.scripts.has('extension-sp-database')||record.sessionId!==activeSessionId||mutationArgs.expectedLifecycleRevision!==Number(record.context.lifecycleRevision||0))throw Error('零层显示调用已失效');
+                            if(options?.persistentOwner===true)return invoke(data.method,mutationArgs,record.sessionId);
+                            const operation=mutationArgs.operation,scope={sessionId:record.sessionId,chatId:record.context.chatId,lifecycleRevision:Number(record.context.lifecycleRevision||0)};
+                            const result=tavernSpLiveSurfaces.command(scope,operation,(method,query)=>databaseProviders.requestPanel(record.sessionId,{kind:'zero-read',method,query}),ready=>post(record,{type:'dsh-tavern-sp-game-state',ready}));
+                            record.spZeroLayerViewActive=operation.kind!=='dispose';return result;
                         }
                         if(data.method==='tavernHelperBrowserCache' && record.uiKind==='preset' && !mutationArgs.operation){
                             if(record.uiKind!=='preset'||!record.scripts.has(mutationArgs.scriptId)||mutationArgs.expectedLifecycleRevision!==Number(record.context.lifecycleRevision||0))throw new Error('脚本缓存调用已失效');
@@ -10967,22 +11776,29 @@ function tavernFrameAssetBootstrap(access) {
                         if(data.method==='triggerTavernSlash'){
                             assertTavernFrameSlash(mutationArgs.line,record.trustedCardMode);
                             if(!record.scripts.has(mutationArgs.scriptId)||mutationArgs.expectedLifecycleRevision!==Number(record.context.lifecycleRevision||0)||record.sessionId!==activeSessionId)throw Error('脚本调用已失效');
+                            if(options?.persistentOwner===true&&mutationArgs.scriptId==='extension-sp-database'&&record.scripts.size===1)return invoke(data.method,mutationArgs,record.sessionId);
                             if(!migrationHost)throw Error('当前没有可交互的对话窗口');
                             return migrationHost.executeSlash(String(mutationArgs.line||''),record.sessionId);
                         }
                         if(data.method==='tavernHelperComposer'){
                             if(!record.scripts.has(mutationArgs.scriptId)||mutationArgs.expectedLifecycleRevision!==Number(record.context.lifecycleRevision||0)||record.sessionId!==activeSessionId)throw new Error('脚本输入调用已失效');
+                            if(options?.persistentOwner===true&&mutationArgs.scriptId==='extension-sp-database'&&record.scripts.size===1)return invoke(data.method,mutationArgs,record.sessionId);
                             if(!migrationHost)throw new Error('当前对话输入框不可用');
                             const input=migrationHost.composerInput(record.sessionId);
+                            releaseSpNativeInput.ensure(input);
                             if(!record.composerStop){record.composerRevision=0;record.composerStop=input.state.subscribe(()=>{record.composerRevision++;post(record,{type:'dsh-tavern-composer-state',value:{draft:String(input.state.getSnapshot().draft||''),revision:record.composerRevision}})})}
-                            return performTavernComposerOperation(input,mutationArgs.operation,{revision:()=>record.composerRevision,running:migrationHost.composerRunning(record.sessionId)});
+                            return performTavernComposerOperation(input,mutationArgs.operation,{revision:()=>record.composerRevision,running:migrationHost.composerRunning(record.sessionId),stop:()=>migrationHost.stopComposer(record.sessionId)});
                         }
                         return invoke(data.method, mutationArgs, record.sessionId);
 					});
 					// Independent source/file reads can run concurrently after earlier mutations.
                     // Mutations retain their ordered acknowledgement chain.
-                    const independentRead = data.method === "triggerTavernSlash" || data.method === "getTavernScriptResource" || (data.method === "tavernScriptFiles" && ["read", "verify"].includes(mutationArgs.operation?.kind));
-                    if (!independentRead) record.rpcTail = rpcTask;
+                    const independentRead = data.method === "tavernSpWebRequest" || data.method === "triggerTavernSlash" || data.method === "getTavernScriptResource" || (data.method === "tavernScriptFiles" && ["read", "verify"].includes(mutationArgs.operation?.kind));
+                    // Dispatch waits for earlier mutations but executes the original
+                    // task, whose owner checks/checkpoints/saves reenter this RPC lane.
+                    // Its completion cannot become the prerequisite for those calls.
+                    const ownedTaskDispatch = data.method === 'dispatchTavernSpOwnedTask';
+                    if (!independentRead && !ownedTaskDispatch) record.rpcTail = rpcTask;
 					if (batch) { batch.task = rpcTask; record.queuedPromptBatch = batch; }
 				}
 				record.rpcInFlight = (record.rpcInFlight || 0) + 1;
@@ -11036,6 +11852,30 @@ function tavernFrameAssetBootstrap(access) {
 			return Object.freeze({
 				sync: sync,
 				emit: emit,
+                ownedState:function(){
+                    const record=[...records.values()].find(item=>!item.remoteOwner&&item.scripts.has('extension-sp-database'));
+                    if(!record)return null;
+                    const script=record.scripts.get('extension-sp-database');
+                    return {loaded:record.loaded,subscriptionsReady:record.subscriptionsReady,subscriptions:[...record.subscriptions],databaseReady:record.databaseReady===true,ready:record.databaseReady===true&&record.readyAnnounced===true&&!record.initializationWorkPending&&!record.initializationWorkWaiting&&!record.initializationWorkFailed&&!record.initializationWorkTimedOut&&!record.initializationFailed&&!script.initializationFailed,lifecycleRevision:Number(record.context.lifecycleRevision||0),chatId:record.context.chatId,sourceDigest:script.sourceDigest,databaseTemplates:record.databaseCatalog||[],initializationFailed:record.initializationFailed===true||record.initializationWorkFailed===true||script.initializationFailed===true,actualInitializationError:script.initializationFailed?String(script.initializationError||'SP 原包初始化失败'):record.initializationWorkFailed?String(record.initializationWorkError||'SP 原包初始化工作失败'):''};
+                },
+                emitOwned:async function(event){
+                    if(options?.spOwned!==true&&options?.ownedSp!==true)throw Error('当前执行器不是 SP 持久执行者');
+                    const diagnostics=[],args=await emit(event.name,event.args,event.context,diagnostics,event.eventId,event.excludedScriptIds,['extension-sp-database']);
+                    return {completed:true,args,diagnostics};
+                },
+                commandOwned:function(operation){
+                    if(options?.spOwned!==true&&options?.ownedSp!==true)return Promise.reject(Error('当前执行器不是 SP 持久执行者'));
+                    if(operation?.kind==='game-state'){
+                        const originals=[...records.values()].filter(record=>!record.remoteOwner&&record.scripts.has('extension-sp-database'));
+                        if(originals.length!==1)throw Error('SP 原包窗口缺失或不唯一');
+                        const record=originals[0];
+                        if(!record.loaded||record.initializationFailed)throw Error('SP 原包窗口尚未可接收表面回执');
+                        post(record,{type:'dsh-tavern-sp-game-state',ready:operation.ready===true});
+                        return {delivered:true};
+                    }
+                    return databaseProviders.requestPanel(activeSessionId,operation);
+                },
+                openOwnedUi:function(){const record=[...records.values()].find(item=>!item.remoteOwner&&item.scripts.has('extension-sp-database'));if(!record)throw Error('SP 原界面不存在');openRecordUi(record);return {opened:true};},
                 displayedMessageRecipients: function() {
                     const eligible=[...records.values()].filter(record=>record.trustedCardMode&&!record.uiKind&&!record.initializationFailed);
                     if(eligible.some(record=>!record.loaded||!record.subscriptionsReady||record.initializationWorkPending))return null;
@@ -11066,11 +11906,12 @@ function tavernFrameAssetBootstrap(access) {
                         if(!records.size||pendingEvents.size)return false;
                         let originals=0;const actual=[];
                         for(const record of records.values()){
+                            if(record.remoteOwner)continue;
                             if(record.sessionId!==activeSessionId||record.rpcInFlight||record.storagePending||record.storageFailed||record.facadePending||record.facadeFailed||!record.loaded||!record.subscriptionsReady||record.initializationFailed||record.initializationWorkPending||record.initializationWorkWaiting||record.initializationWorkFailed||record.initializationWorkTimedOut||[...record.scripts.values()].some(script=>!script.loaded||!script.subscriptionsReady||script.initializationFailed))return false;
                             for(const script of record.scripts.values())actual.push({scriptId:script.id,sourceDigest:script.sourceDigest||script.content});
-                            if(record.scripts.has('extension-sp-database'))originals++;
+                            if(record.scripts.has('extension-sp-database')&&!record.remoteOwner)originals++;
                         }
-                        if(originals!==1)return false;
+                        if(originals!==1&&![...records.values()].some(record=>record.remoteOwner))return false;
                         const expected=unloadAccess?.participants||[];
                         if(actual.length!==expected.length||actual.some(p=>!expected.some(e=>e.scriptId===p.scriptId&&e.sourceDigest===p.sourceDigest))||new Set(actual.map(p=>p.scriptId)).size!==actual.length)return false;
                         // Each realm proves and fences its own local persistence;
@@ -11079,7 +11920,7 @@ function tavernFrameAssetBootstrap(access) {
                     }catch(_){return false;}
                 },
                 drain: function(options){
-                    const original=[...records.values()].filter(record=>record.scripts.has('extension-sp-database'));
+                    const original=[...records.values()].filter(record=>!record.remoteOwner&&record.scripts.has('extension-sp-database'));
                     // An original package that is absent, never finished loading or failed
                     // to initialize has handled no event and holds nothing a save could
                     // persist; no retry could ever save from it. Releasing it is not an
@@ -11127,7 +11968,7 @@ function tavernFrameAssetBootstrap(access) {
 					if (!record) return Promise.reject(new Error("人物卡脚本尚未运行"));
 					return emitToRecord(record, buttonEvent(scriptId, name), [], record.context);
 				},
-				dispose: function () { hostWindow.removeEventListener('dsh-tavern-database-panel-command',databasePanelCommand);hostWindow.removeEventListener('beforeunload', guardPendingSettings); hostWindow.removeEventListener("dsh-tavern-open-script-ui", openScriptUi);hostWindow.removeEventListener("dsh-tavern-audio-state",audioChanged); hostWindow.removeEventListener("message", receive); clear(); releaseHostStylesheetBridge(); },
+				dispose: function () { releaseSpNativeInput();hostWindow.removeEventListener('dsh-tavern-database-panel-command',databasePanelCommand);hostWindow.removeEventListener('beforeunload', guardPendingSettings); hostWindow.removeEventListener("dsh-tavern-open-script-ui", openScriptUi);hostWindow.removeEventListener("dsh-tavern-audio-state",audioChanged); hostWindow.removeEventListener("message", receive); clear(); releaseHostStylesheetBridge(); },
 				inspect: function () {
 					const record = records.get("shared");
 					const scripts = Array.from(records.values()).flatMap(r => Array.from(r.scripts.values()).map(function (script) { return { id: script.id, system:script.system, loaded: script.loaded, subscriptionsReady: script.subscriptionsReady, initializationFailed: script.initializationFailed, ...(r.mvuFirstStartWaiting === true && r.mvuGateAttempt !== true && !script.subscriptionsReady && !script.initializationFailed ? { awaitingCore: true } : {}) }; }));
@@ -11137,8 +11978,9 @@ function tavernFrameAssetBootstrap(access) {
 					// initialization failure. Companions are still told the core failed, but the
 					// runtime only reports "not ready", so settlements defer and resume after the retry.
 					const downloadPaused = record?.mvuLoadState?.phase === "failed" && record.mvuLoadState.canRetry === true;
-					const initializationError = downloadPaused ? "" : mvuInitializationError(record);
-					return { sessionId: activeSessionId, lifecycleRevision:Number(record?.context?.lifecycleRevision||0), ...(mvuCompanionFailure()?{initializationBlocked:true,initializationBlockReason:mvuCompanionFailure()}:{}), frameCount: records.size, scriptIds: scripts.map(function (script) { return script.id; }), scripts: scripts, ...(record && record.mvuCoreId ? { mvuDataReady: mvuDataReady(record), mvuVersionSelection:record.mvuVersionSelection } : {}), ...(record && record.mvuLoadState ? { mvuLoadState: record.mvuLoadState } : {}), ...(mvuCoreFailed ? { mvuCoreFailed: true } : {}), ...(initializationError ? { initializationError: initializationError } : {}) };
+					const ownedInitializationError=(options?.ownedSp===true||options?.spOwned===true)?[...records.values()].filter(item=>!item.remoteOwner).map(item=>item.scripts.get('extension-sp-database')).find(script=>script?.initializationFailed):null;
+					const initializationError = ownedInitializationError?String(ownedInitializationError.initializationError||'SP 原包初始化失败'):downloadPaused ? "" : mvuInitializationError(record);
+					return { sessionId: activeSessionId, lifecycleRevision:Number(record?.context?.lifecycleRevision||0), ...((options?.ownedSp===true||options?.spOwned===true)?{spDatabaseReady:[...records.values()].some(item=>!item.remoteOwner&&item.scripts.has('extension-sp-database')&&item.databaseReady===true)}:{}), ...(mvuCompanionFailure()?{initializationBlocked:true,initializationBlockReason:mvuCompanionFailure()}:{}), frameCount: records.size, scriptIds: scripts.map(function (script) { return script.id; }), localScriptIds:[...records.values()].filter(record=>!record.remoteOwner).flatMap(record=>[...record.scripts.keys()]), scripts: scripts, ...(record && record.mvuCoreId ? { mvuDataReady: mvuDataReady(record), mvuVersionSelection:record.mvuVersionSelection } : {}), ...(record && record.mvuLoadState ? { mvuLoadState: record.mvuLoadState } : {}), ...(mvuCoreFailed ? { mvuCoreFailed: true } : {}), ...(initializationError ? { initializationError: initializationError } : {}) };
 				}
 			});
 		}
@@ -11247,7 +12089,7 @@ function tavernFrameAssetBootstrap(access) {
                 const displayJobs=displayedQueue.clear();
                 for(const job of displayJobs)void Promise.resolve(invoke('cancelTavernDisplayedMessage',{eventId:job.packet.eventId,runtimeId:previousLease?.id},job.packet.sessionId)).catch(error=>console.warn('正文显示取消失败',error));
                 let drain;
-                if(previousLease&&previousRuntime?.inspect().scriptIds?.includes('extension-sp-database')){
+                if(previousLease&&(previousRuntime?.inspect().localScriptIds||previousRuntime?.inspect().scriptIds)?.includes('extension-sp-database')){
                     let unloadRequest;
                     if(idlePagehide&&!quarantineError&&options?.background!==true&&previousLease.unloadAccess&&!previousLease.workDeadline&&!previousLease.displayExecuting&&!pendingReleases.size){
                         const hostIdle=previousRuntime.prepareUnload?.()===true;
@@ -11259,8 +12101,8 @@ function tavernFrameAssetBootstrap(access) {
                 }
                 else if(previousLease?.displayExecuting){
                     drainingLeases.add(previousLease);
-                    previousRuntime.dispose();
-                    drain=Promise.resolve(previousLease.idle).finally(()=>{drainingLeases.delete(previousLease);return releaseLease(previousLease);});
+                    const detached=previousRuntime.dispose();
+                    drain=Promise.all([previousLease.idle,detached]).finally(()=>{drainingLeases.delete(previousLease);return releaseLease(previousLease);});
                 }
 				lease = null;
 				if(visibilityListening){hostDocument.removeEventListener('visibilitychange',onVisibility);hostDocument.removeEventListener('resume',onVisibility);visibilityListening=false;}
@@ -11274,7 +12116,7 @@ function tavernFrameAssetBootstrap(access) {
 				workStop = null;
 				if (heartbeatTimer !== null) stopHeartbeat(heartbeatTimer);
 				heartbeatTimer = null;
-				if (runtime&&!drain) runtime.dispose();
+				if (runtime&&!drain){const detached=runtime.dispose();if(previousLease&&detached)drain=Promise.resolve(detached).then(()=>releaseLease(previousLease));}
 				runtime = null;
 				if (options && options.onMvuLoadState) options.onMvuLoadState(null);
                 if(!quarantineError)options?.onInitializationState?.(null);
@@ -11293,8 +12135,8 @@ function tavernFrameAssetBootstrap(access) {
 				lease = { sessionId: sessionId, id: hostWindow.crypto && typeof hostWindow.crypto.randomUUID === "function" ? hostWindow.crypto.randomUUID() : String(Date.now()) + ":" + String(Math.random()) };
 				const currentLease = lease;
 				runtime = createRuntime({
-                    window: hostWindow, background:options?.background===true, rpc: (method,args,id,requestOptions)=>{
-                        if(currentLease.quarantined&&!(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline&&args.spRecoveryToken===currentLease.recoveryToken&&args.scriptId==='extension-sp-database'&&['saveTavernChatData','saveTavernExtensionSettings','publishTavernSpAuthorityCache'].includes(method)))return Promise.reject(new Error('SP 执行已隔离，仅允许显式保存重试（RPC: '+method+'; recoveryToken: '+(args.spRecoveryToken?'present':'missing')+'; recoveryWindow: '+(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline?'valid':'expired')+'）'));
+                    window: hostWindow, spOwned:options?.spOwned===true||options?.ownedSp===true, background:options?.background===true, persistentOwner:options?.persistentOwner===true||options?.spOwned===true||options?.ownedSp===true, rpc: (method,args,id,requestOptions)=>{
+                        if(currentLease.quarantined&&!(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline&&args.spRecoveryToken===currentLease.recoveryToken&&args.scriptId==='extension-sp-database'&&['saveTavernChatData','saveTavernExtensionSettings','publishTavernSpAuthorityCache','assertTavernSpOwnedTask','prepareTavernSpOwnedSaveRetry','checkpointTavernSpOwnedTask'].includes(method)&&(!currentLease.recoveryTaskId||!args.payload?.taskId||args.payload.taskId===currentLease.recoveryTaskId)&&(method!=='checkpointTavernSpOwnedTask'||['completed','failed'].includes(args.payload?.phase))))return Promise.reject(new Error('SP 执行已隔离，仅允许显式保存重试（RPC: '+method+'; recoveryToken: '+(args.spRecoveryToken?'present':'missing')+'; recoveryWindow: '+(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline?'valid':'expired')+'）'));
                         return invoke(method,{...args,runtimeId:currentLease.id},id,requestOptions);
                     }, onMutation: invalidate,
 					onMvuLoadState: function (state) {
@@ -11350,7 +12192,7 @@ function tavernFrameAssetBootstrap(access) {
 					}, delay);
 				}
 				async function claimWork() {
-				if (!lease || !runtime || !input || !input.sessionId || !hasScriptRuntime(input.view)) return;
+				if (!lease || lease.quarantined || !runtime || !input || !input.sessionId || !hasScriptRuntime(input.view)) return;
 				const currentLease = lease;
 				const currentRuntime = runtime;
 				if (claimBusy === currentLease) { claimRequested = true; return; }
@@ -11429,7 +12271,7 @@ function tavernFrameAssetBootstrap(access) {
 					if (currentEvent) {
                         if(currentEvent.displayedMessage)displayedQueue.finish(currentEvent.id,error);
 						try {
-								await invoke("completeTavernHelperEvent", { eventId: currentEvent.id, leaseToken: leaseToken, args: currentEvent.args, error: String(error && error.message || error), runtimeId: currentLease.id, diagnostics: diagnostics }, currentLease.sessionId);
+								await invoke("completeTavernHelperEvent", { eventId: currentEvent.id, leaseToken: leaseToken, args: currentEvent.args, error: String(error && error.message || error), runtimeId: currentLease.id, diagnostics: diagnostics, ...(error?.dshSpSaveRecoveryBoundary?{spSaveRecoveryBoundary:error.dshSpSaveRecoveryBoundary}:{}) }, currentLease.sessionId);
 							} catch (completeError) { console.warn("Tavern Helper 失败回执同步失败", completeError); }
 						}
 						scheduleClaimRetry(currentLease);
@@ -11471,8 +12313,28 @@ function tavernFrameAssetBootstrap(access) {
 			}
 			return Object.freeze({
 				sync: sync, dispose: dispose,
+                ownedState:()=>runtime?.ownedState?.()||null,
+                emitOwned:event=>{if((options?.spOwned!==true&&options?.ownedSp!==true)||!runtime||!active)return Promise.reject(Error('SP 持久执行者未取得执行权'));return runtime.emitOwned(event);},
+                commandOwned:operation=>{if((options?.spOwned!==true&&options?.ownedSp!==true)||!runtime||!active)return Promise.reject(Error('SP 持久执行者未取得执行权'));return runtime.commandOwned(operation);},
+                openOwnedUi:()=>{if((options?.spOwned!==true&&options?.ownedSp!==true)||!runtime||!active)throw Error('SP 持久执行者未取得执行权');return runtime.openOwnedUi();},
                 presentDisplayedMessage: function(target){displayedQueue.add(target);void claimWork();},
-                quarantine:error=>dispose({quarantineError:error||"SP 执行已隔离"}),
+                quarantine:error=>{
+                    if((options?.spOwned===true||options?.ownedSp===true)&&lease&&runtime){lease.quarantined=true;lease.quarantineError=String(error||"SP 执行已隔离");delete lease.recoveryToken;return {retained:true};}
+                    return dispose({quarantineError:error||"SP 执行已隔离"});
+                },
+                beginOwnedSaveRecovery:permit=>{
+                    if(!lease?.quarantined||!runtime||permit?.runtimeId!==lease.id||typeof permit.token!=='string'||!permit.token||!permit.taskId)throw Error('SP 原保存恢复租约已失效');
+                    lease.recoveryToken=permit.token;lease.recoveryTaskId=permit.taskId;lease.recoveryDeadline=monotonicNow()+Math.min(91000,permit.timeoutMs||91000);return {reserved:true};
+                },
+                finishOwnedSaveRecovery:token=>{
+                    if(!lease?.quarantined||lease.recoveryToken!==token||monotonicNow()>=lease.recoveryDeadline)throw Error('SP 原保存恢复确认已失效');
+                    lease.recoveryCommitted=true;return {committed:true};
+                },
+                resumeOwnedSaveRecovery:token=>{
+                    if(!lease?.quarantined||!lease.recoveryCommitted||lease.recoveryToken!==token||monotonicNow()>=lease.recoveryDeadline)throw Error('SP save recovery resume expired');
+                    lease.quarantined=false;delete lease.quarantineError;delete lease.recoveryCommitted;delete lease.recoveryToken;delete lease.recoveryTaskId;options?.onInitializationState?.(null);void heartbeat();void claimWork();return {resumed:true};
+                },
+                cancelOwnedSaveRecovery:token=>{if(lease?.recoveryToken===token){delete lease.recoveryToken;delete lease.recoveryTaskId;}},
                 retrySpDrain:recovery=>pendingReleases.size?Promise.all([...pendingReleases.values()].map(entry=>entry.retry(recovery))):invoke('retryTavernBackgroundScriptDrain',{},input?.sessionId).then(result=>{if(result.released){options?.onInitializationState?.(null);void claimWork();}return [result];}),
 				networkSources: function (frame) { return [...new Set([...(active&&runtime?runtime.networkSources(frame):[]),...[...pendingReleases.values()].filter(entry=>!entry.terminal&&!entry.lease.quarantined).flatMap(entry=>(entry.runtime.networkSources?.(frame)||[]).filter(id=>id==='extension-sp-database'))])]; },
                 takeOver: async function(){
@@ -11507,7 +12369,7 @@ function tavernFrameAssetBootstrap(access) {
 			});
 		}
 		function tavernScriptRuntimeReady(inspection) {
-			if (inspection && (inspection.initializationError || inspection.mvuDataReady === false)) return false;
+			if (inspection && (inspection.initializationError || inspection.mvuDataReady === false || inspection.spDatabaseReady === false)) return false;
 			const scripts = inspection && Array.isArray(inspection.scripts) ? inspection.scripts : [];
 			return scripts.length > 0 && scripts.every(function (script) {
 				if (script && (script.id === "__dsh_official_mvu__" || script.system === "card-mvu") && script.initializationFailed === true) return false;
@@ -11914,6 +12776,8 @@ function tavernFrameAssetBootstrap(access) {
                     if (previous) { previous.disconnect(); frameSizeObservers.delete(document.token); }
 					if (!node) {touchRelay.stop();document.dropSourceCache();documents.delete(document);}
 					channel.attach(node);
+                    document.releaseSpSurface?.();
+                    document.releaseSpSurface=node?tavernSpLiveSurfaces.register({node,token:document.token,hold:false,identity:{sessionId:props.sessionId,lifecycleRevision:Number(helperContext?.lifecycleRevision||0),messageId:Number(helperContext?.turnMessageIds?.[String(props.turn)]??-1)},current:()=>Boolean(listener&&document===visible&&channels.get(document.token)===channel)}):null;
                     document.releaseDisplayedMessage?.();
                     document.releaseDisplayedMessage = node && document.trustedCardMode ? tavernDisplayedMessages.bind(node.contentWindow,()=>({
                         trusted:true,current:Boolean(listener && document===visible && channels.get(document.token)===channel),
@@ -11947,7 +12811,7 @@ function tavernFrameAssetBootstrap(access) {
 				};
 				return document;
 			}
-            function canSuspend(){return props.eager!==true&&props.persistent!==true&&props.preserveInstance!==true&&!visible?.userState&&!pending?.userState;}
+            function canSuspend(){return props.eager!==true&&props.persistent!==true&&props.preserveInstance!==true&&!tavernSpLiveSurfaces.isHeld(channels.get(visible?.token)?.element())&&!visible?.userState&&!pending?.userState;}
             function suspend(){
                 if(suspended||!canSuspend())return false;
                 suspended=true;lifetime++;cancelRuntimeReport();touchRelay.stop();
@@ -12193,7 +13057,7 @@ function tavernFrameAssetBootstrap(access) {
                                 composerRevision++;
                                 for (const [token, active] of channels) active.element()?.contentWindow?.postMessage({type:'dsh-tavern-composer-state',token,value:{draft:String(input.state.getSnapshot().draft||''),revision:composerRevision}},'*');
                             });
-                            return performTavernComposerOperation(input,data.args?.operation,{revision:()=>composerRevision,running:migrationHost.composerRunning(props.sessionId)});
+                            return performTavernComposerOperation(input,data.args?.operation,{revision:()=>composerRevision,running:migrationHost.composerRunning(props.sessionId),stop:()=>migrationHost.stopComposer(props.sessionId)});
                         }).then(result => { if(current()) event.source.postMessage({type:'dsh-tavern-helper-response',token:data.token,requestId:data.requestId,ok:true,result},'*'); }, error => { if(current()) event.source.postMessage({type:'dsh-tavern-helper-response',token:data.token,requestId:data.requestId,ok:false,error:error.message},'*'); });
                         return;
                     }
@@ -12495,6 +13359,7 @@ function tavernFrameAssetBootstrap(access) {
 					key: document.token,
 					ref: document.ref,
 					className: "dsh-tavern-message-frame",
+                    'data-dsh-tavern-frame-token':document.token,
 					title: hidden ? "正在准备人物卡消息界面" : "人物卡消息界面",
 					"aria-hidden": hidden || undefined,
 					"data-dsh-tavern-content-height": document.height,
@@ -12886,7 +13751,7 @@ function tavernFrameAssetBootstrap(access) {
 				const time = Number.isFinite(Number(data.time)) ? new Date(Number(data.time)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
 				return React.createElement("div", { className: "dsh-tavern-user-row" },
 					React.createElement("div", { className: "dsh-tavern-user-stack" }, renderedImages, (text !== "" || extras.length > 0) ? React.createElement("div", { className: "dsh-tavern-user-bubble" }, userDisplay, extras) : null),
-					React.createElement("div", { className: "dsh-tavern-user-actions" }, React.createElement(TavernUserInputEditor,{sessionId:props.sessionId,turn:turn,useSession:props.useSession}), time ? React.createElement("span", null, time) : null, React.createElement(DshUi.Tooltip, { label: copied ? "已复制" : "复制", side: "bottom" }, React.createElement("button", { type: "button", className: "dsh-tavern-user-copy", "aria-label": copied ? "已复制" : "复制", onClick: copy }, React.createElement(copied ? DshUi.IconCheckOutline16 : DshUi.IconCopyOutline16, null))))
+					React.createElement("div", { className: "dsh-tavern-user-actions" }, React.createElement(TavernUserInputEditor,{sessionId:props.sessionId,turn:turn,useSession:props.useSession}), time ? React.createElement("span", null, time) : null, React.createElement(DshUi.Tooltip, { label: copied ? "已复制" : "复制", side: "bottom" }, React.createElement("button", { type: "button", className: "dsh-tavern-user-copy", "aria-label": copied ? "已复制" : "复制", onClick: copy }, React.createElement(copied ? DshUi.IconCheckOutlineRegular : DshUi.IconCopyOutlineRegular, null))))
 				);
 			}
 			function openSceneImagePreview(url, opener) {
@@ -13078,7 +13943,7 @@ function tavernFrameAssetBootstrap(access) {
 				const mvuReceiptNode = mvuReceipt ? React.createElement(TavernMvuReceipt, { receipt: mvuReceipt, sessionId: props.sessionId, turn: storyTurn, canRetry: storyTurn === liveState.view?.latestAssistantTurn }) : null;
 				const sceneImagesEnabled = Boolean(liveState.view && liveState.view.releaseCapabilities && liveState.view.releaseCapabilities.sceneImages);
 				const illustration = sceneImagesEnabled && settled && storyTurn > 0 && isPlayMode(liveState.view && liveState.view.mode) && !sessionTransitioning ? React.createElement(SceneIllustration, { key: props.sessionId + ":" + storyTurn, sessionId: props.sessionId, turn: storyTurn }) : null;
-				return React.createElement("div", { className: "dsh-tavern-assistant", "data-streaming": data.status === "running" || undefined }, rendered, illustration, mvuReceiptNode);
+				return React.createElement(TavernSpCarrierSurface,{identity:adopted&&!sessionTransitioning&&Number.isInteger(logicalId)?{sessionId:props.sessionId,messageId:logicalId,lifecycleRevision:Number(liveState.view?.tavernHelper?.lifecycleRevision||0),bodyId,swipeId:Number(liveState.view?.tavernHelper?.messages?.[logicalId]?.swipe_id||0)}:null},React.createElement("div", { className: "dsh-tavern-assistant", "data-streaming": data.status === "running" || undefined }, rendered, illustration, mvuReceiptNode));
 			}
 			function TavernForkAssistantAction(props) {
 				const liveState = useLiveTavernView(props.sessionId, String(props.messageId || ""));
@@ -13099,7 +13964,7 @@ function tavernFrameAssetBootstrap(access) {
 				}
 				return React.createElement(DshUi.Tooltip, { label: forking ? "正在分叉…" : "从这一轮分叉", side: "bottom" },
 					React.createElement("button", { type: "button", className: "dsh-tavern-message-fork", "aria-label": "从这一轮分叉", disabled: forking, onClick: fork },
-						React.createElement(DshUi.IconBranchOutline16, null)));
+						React.createElement(DshUi.IconBranchOutlineRegular, null)));
 			}
 			function register(input) {
 				const scriptOwner = createTavernScriptSessionOwner({ sessions: input.ctx.sessions });

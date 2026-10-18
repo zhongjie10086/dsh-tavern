@@ -12,13 +12,15 @@ export function projectionVersion(value) {
 
 // The storage reader already validates file versions. Its immutable snapshot
 // identity is a version token; fresh mutable wrappers must not rehash every
-// unchanged history branch. Mutable dependencies still get a complete comparison.
-function sameVersion(a,b) {
+// unchanged history branch. Live dependencies can produce fresh immutable JSON
+// wrappers; validate their complete values while retaining input identity rules.
+function sameVersion(a,b,compareFrozen=false) {
  if(Object.is(a,b))return true
  if(!a||!b||typeof a!=='object'||typeof b!=='object'||Array.isArray(a)!==Array.isArray(b))return false
- if(isFrozenJson(a)&&isFrozenJson(b))return false
+ if(Array.isArray(a)&&a.length!==b.length)return false
+ if(!compareFrozen&&isFrozenJson(a)&&isFrozenJson(b))return false
  const keys=Object.keys(a)
- return keys.length===Object.keys(b).length&&keys.every(key=>Object.hasOwn(b,key)&&sameVersion(a[key],b[key]))
+ return keys.length===Object.keys(b).length&&keys.every(key=>Object.hasOwn(b,key)&&sameVersion(a[key],b[key],compareFrozen))
 }
 
 /** Memoize the expensive projection, never the reads which establish its validity.
@@ -33,7 +35,7 @@ export function createDependencyProjectionCache({maxEntries=4,maxBytes=512*1024*
   catch(error){return{value:{message:String(error?.message||error),code:error?.code,status:error?.status},error}}
  }
  async function valid(dependencies) {
-  for(const dependency of dependencies){const current=await observe(dependency.read);if(Boolean(current.error)!==dependency.failed||!sameVersion(dependency.value,current.value))return false}
+  for(const dependency of dependencies){const current=await observe(dependency.read);if(Boolean(current.error)!==dependency.failed||!sameVersion(dependency.value,current.value,true))return false}
   return true
  }
  async function read(key,input,build) {

@@ -1,4 +1,4 @@
-import {originalSpTableFields,originalSp129MaterialFields,originalSp129RecoveryFields} from './sp-original-fields.js'
+import {originalSpTableFields,originalSp129MaterialFields,originalSp129CarrierFields,originalSp129RecoveryFields} from './sp-original-fields.js'
 import {createHash,randomUUID} from 'node:crypto'
 import {publicSpTables,validateTableData} from './sp-database.js'
 
@@ -31,7 +31,7 @@ export function captureOriginalSpPersistence(chat){
 // Same canonical form as the original's rollback-deletion receipt (key order free).
 export const originalSpFieldsDigest=value=>JSON.stringify(value,(key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.keys(item).sort().map(name=>[name,item[name]])):item)
 export const originalSpFloorFields=originalSp129RecoveryFields
-export function originalSpFloorCarries(message){return [...tableFields.slice(0,4),...originalSp129MaterialFields].some(key=>Object.hasOwn(message?.tavernPluginData||{},key))}
+export function originalSpFloorCarries(message){return [...tableFields.slice(0,4),...originalSp129MaterialFields,...originalSp129CarrierFields].some(key=>Object.hasOwn(message?.tavernPluginData||{},key))}
 export function restoreOriginalSpPersistence(chat,saved,{deletion}={}){
  const receiptFields=deletion?.receipt?.fieldNames
  if(receiptFields!==undefined&&JSON.stringify(receiptFields)!==JSON.stringify(originalSp129RecoveryFields))throw Error('SP 原包删楼字段契约无效，未回退')

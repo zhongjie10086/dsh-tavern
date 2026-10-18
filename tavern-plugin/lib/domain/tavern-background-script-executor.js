@@ -1,6 +1,7 @@
 import {isMvuSettlementWork} from './tavern-script-dispatch.js'
 import {prepareMvuStartupView} from './mvu-companion-plan.js'
 import {randomUUID} from 'node:crypto'
+import {isDeepStrictEqual} from 'node:util'
 import {spAuthorityStamp} from './sp-authority.js'
 import {createBackgroundContext,launchBackgroundBrowser,installBackgroundNetworkBoundary,backgroundFrameSources,createBackgroundBrowserOwner} from './background-browser.js'
 import {readFile} from 'node:fs/promises'
@@ -12,15 +13,28 @@ const origin='http://dsh-helper.localhost'
 // Present in a visible page only (R8 Z61). The page skips the ones that cannot write;
 // a refusal here names the method instead of a generic scope error.
 const pageOnlyMethods=new Set(['tavernHelperComposer','triggerTavernSlash'])
-const methods=new Set(['setTavernMvuActivity','tavernHelperAudio','getSession','claimTavernScriptWork','startTavernScriptWork','completeTavernHelperEvent','heartbeatTavernScriptRuntime','releaseTavernHelperRuntime','reserveTavernHelperRuntime','quarantineTavernHelperRuntime','tavernHelperWorldbookLibrary','tavernScriptStorage','fillTavernScriptDatabase','getTavernScriptResource','editTavernRuntimeScripts','startTavernHelperGeneration','pollTavernHelperGeneration','stopTavernHelperGeneration','listTavernHelperModels','commitTavernScriptDatabase','tavernScriptFiles','tavernScriptImages','tavernHelperChatFiles','tavernHelperDatabaseTemplates','tavernHelperPresets','tavernHelperIzumiConnection','tavernHelperIzumiAdvice','getTavernScriptLibrary','changeTavernScriptLibrary','generateTavernHelperRaw','updateTavernHelperPrompts','updateTavernHelperVariables','updateTavernHelperMessages','createTavernHelperMessages','mutateTavernHelperHistory','getTavernHelperWorldbook','replaceTavernHelperWorldbook','saveTavernExtensionSettings','loadTavernWorldInfo','saveTavernWorldInfo','saveTavernChatData','recordMvuRuntimeDiagnostic','recordTavernCompatibilityCalls'])
+const methods=new Set(['tavernSpWebRequest','setTavernMvuActivity','tavernHelperAudio','getSession','claimTavernScriptWork','startTavernScriptWork','completeTavernHelperEvent','heartbeatTavernScriptRuntime','releaseTavernHelperRuntime','reserveTavernHelperRuntime','quarantineTavernHelperRuntime','tavernHelperWorldbookLibrary','tavernScriptStorage','fillTavernScriptDatabase','getTavernScriptResource','editTavernRuntimeScripts','startTavernHelperGeneration','pollTavernHelperGeneration','stopTavernHelperGeneration','listTavernHelperModels','commitTavernScriptDatabase','tavernScriptFiles','tavernScriptImages','tavernHelperChatFiles','tavernHelperDatabaseTemplates','tavernHelperPresets','tavernHelperIzumiConnection','tavernHelperIzumiAdvice','getTavernScriptLibrary','changeTavernScriptLibrary','generateTavernHelperRaw','updateTavernHelperPrompts','updateTavernHelperVariables','updateTavernHelperMessages','createTavernHelperMessages','mutateTavernHelperHistory','getTavernHelperWorldbook','replaceTavernHelperWorldbook','saveTavernExtensionSettings','loadTavernWorldInfo','saveTavernWorldInfo','saveTavernChatData','recordMvuRuntimeDiagnostic','recordTavernCompatibilityCalls'])
+/** Filter executable sources only; complete Helper context and permissions are retained. */
+export function projectOwnedSpBackgroundView(view){
+ if(!view)return view
+ const scripts=(view.tavernHelperScripts||[]).filter(script=>script.id==='extension-sp-database')
+ if(scripts.length!==1)throw new Error('SP 专用后台需要唯一原SP脚本')
+ return {...view,tavernHelperScripts:scripts,tavernMvuRuntime:null,tavernSpOwnedRealm:true}
+}
 /** Start the same script/lease implementation only when no visible executor owns the game. */
 for(const method of ['getSpDatabase','beginTavernSpAuthority','chooseTavernSpAuthority','publishTavernSpAuthorityCache','prepareTavernOriginalDatabaseMutation'])methods.add(method)
 const generationMethods=new Set(['startTavernHelperGeneration','startTavernFrontendGeneration','startTavernFrontendMainGeneration'])
 for(const method of [...generationMethods,'selectTavernFrontendWorldInfo','tavernHelperBrowserCache'])methods.add(method)
-export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,networkPolicy=async()=>false,launch=launchBackgroundBrowser,timeoutMs=91000,idleMs=180000,maxInstances=3,maxRetained=3,retryCooldownMs=30000,onRetainedDiscarded,maxQueuedPerSession=16,monotonicNow=()=>performance.now()}) {
+for(const method of ['prepareTavernSpOwner','inspectTavernSpOwner','attachTavernSpOwner','emitTavernSpOwner','commandTavernSpOwner','spOwnedUiTavern','getTavernSpSurfaceRequests','completeTavernSpSurfaceRequest'])methods.add(method)
+export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,ownedSp=false,ownedUiFactory,networkPolicy=async()=>false,launch=launchBackgroundBrowser,timeoutMs=91000,idleMs=180000,maxInstances=3,maxRetained=3,retryCooldownMs=30000,onRetainedDiscarded,maxQueuedPerSession=16,monotonicNow=()=>performance.now()}) {
+ // Opt-in instances receive a DIFFERENT dispatch/lease from the seven frontend scripts.
+ const ownedMode=ownedSp!==false,ownedOptions=typeof ownedSp==='object'?ownedSp:{}
+ const allowedMethods=new Set([...methods,...(ownedOptions.rpcMethods||[])])
+ const projectView=value=>ownedMode?projectOwnedSpBackgroundView(value):prepareMvuStartupView(value)
  timeoutMs=Math.max(1,Math.min(91000,Number(timeoutMs)||91000))
  const instances=new Map(),admitted=new Set(),pending=new Map(),queues=new Map(),queued=new Map(),metrics=[],discarded=[],browserOwner=createBackgroundBrowserOwner(launch);let closed=false
  const persistenceMethods=new Set(['saveTavernChatData','saveTavernExtensionSettings','publishTavernSpAuthorityCache'])
+ const saveRecoveryMethods=new Set([...persistenceMethods,'assertTavernSpOwnedTask','prepareTavernSpOwnedSaveRetry','checkpointTavernSpOwnedTask'])
  const liveInstances=()=>[...instances.values()].filter(row=>!row.closed)
  const retainedInstances=()=>liveInstances().filter(row=>row.quarantined||row.drainError||row.initializationBlocked)
  const retainedCapacityError=()=>new Error('SP/脚本初始化失败状态的保留容量已满，请先安全恢复已有实例后再启动新的游戏')
@@ -78,7 +92,8 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
  }
  function quarantineOne(instance,error){
   if(!instance||instance.closed)return
-  if(instance.quarantined)return
+  if(instance.quarantined){instance.quarantineRevision=(instance.quarantineRevision||0)+1;instance.errors.push(String(error?.message||error));return}
+  instance.quarantineRevision=(instance.quarantineRevision||0)+1
   instance.quarantined=true;instance.retainedAt=monotonicNow();instance.drainError=String(error?.message||error||'SP 执行已隔离');instance.errors.push(instance.drainError)
   clearTimeout(instance.timer);instance.unsubscribe?.();instance.unsubscribe=null
   if(instance.runtimeId)dispatch.quarantine?.(instance.sessionId,instance.runtimeId,instance.drainError)
@@ -128,6 +143,7 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
  // save that fails retains the realm (see the drain branch of disposeOne).
  function failOne(instance,error,{retain=false}={}){
   if(!instance||instance.closed)return
+  if(ownedMode&&instance.hasOriginal&&instance.page){quarantineOne(instance,error);return}
   if(instance.hasMvu&&instance.engineStarted&&!instance.crashed&&(instance.starting||instance.initializationBlocked||retain)){preserveInitialization(instance,error,{cancel:retain});return}
   if(instance.hasOriginal&&instance.page){
    if(retain||instance.quarantined)quarantineOne(instance,error)
@@ -158,8 +174,11 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
    try{
     if(instance.runtimeId)dispatch.dispose(instance.sessionId,instance.runtimeId)
     await Promise.allSettled([...instance.generations.values()].map(args=>Promise.resolve().then(()=>rpc('stopTavernHelperGeneration',args))))
-    await instance.context?.close().catch(()=>{})
-    await instance.browserLease?.release()
+    if(instance.ownedUi)try{await instance.ownedUi.dispose()}catch(error){instance.errors.push(String(error.message||error))}
+    let contextClosed=!instance.context
+    if(instance.context)try{await instance.context.close();contextClosed=true}catch(error){instance.errors.push(String(error.message||error));if(ownedMode)throw error}
+    try{if(ownedMode&&contextClosed&&!instance.ownedRetirementNotified){await ownedOptions.onRetired?.(instance.sessionId,{runtimeId:instance.runtimeId});instance.ownedRetirementNotified=true}}finally{await instance.browserLease?.release()}
+    if(ownedMode)return {released:true}
    }finally{
     instance.disposed=true
     // A cancelled startup may still be acquiring its context. Hold capacity
@@ -171,14 +190,24 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
  // Every automatic retirement checks the live realm, not only the boolean
  // cached at initial boot. New guards can fail after a view refresh/heartbeat.
  async function retireIdle(instance){
-  if(!instance||instance.closed||instance.busy||instance.generations.size)return {released:false};
+  if(!instance||instance.closed||instance.busy||instance.generations.size||instance.ownedCommands)return {released:false};
+  if(ownedMode){
+   if(instance.ownedUiPromise)await instance.ownedUiPromise
+   if(instance.ownedUi?.isBusy?.()===true)return {released:false,ownedSp:true,reason:'original browser interaction pending'}
+   if(typeof ownedOptions.canRetire!=='function')return {released:false,ownedSp:true,reason:'retirement policy unavailable'}
+   const state=await instance.page.evaluate(()=>window.__dshBackgroundEngine?.ownedState?.())
+   const originals=[];for(const frame of instance.page.frames()){const value=await frame.evaluate(()=>window.__dshOriginalExtensionState?.id==='sp-database'?window.AutoCardUpdaterAPI?.__dshIsPersistenceIdle?.()===true:null);if(value!==null)originals.push(value)}
+   if(instance.ownedUi?.isBusy?.()===true)return {released:false,ownedSp:true}
+   if(!state||originals.length!==1||originals[0]!==true||instance.ownedCommands||!await ownedOptions.canRetire(instance.sessionId,{runtimeId:instance.runtimeId,state,originalIdle:true}))return {released:false,ownedSp:true}
+  }
+  if(!instance||instance.closed||instance.busy||instance.generations.size||instance.ownedCommands)return {released:false};
   if(instance.hasMvu&&instance.engineStarted&&!instance.crashed){
    try{await refreshInitialization(instance)}catch(error){preserveInitialization(instance,error);return {released:false};}
   }
   if(instance.busy||instance.initializationBlocked)return {released:false};
   return disposeOne(instance,{drain:true});
  }
- function armIdle(instance){if(!instance||instance.closed||instance.quarantined||instance.initializationBlocked)return;clearTimeout(instance.timer);instance.lastUsed=Date.now();instance.timer=setTimeout(()=>{if(!instance.busy)void retireIdle(instance).catch(error=>instance.errors.push(String(error.message||error)))},idleMs);instance.timer.unref?.()}
+ function armIdle(instance){if(!instance||instance.closed||instance.quarantined||instance.initializationBlocked)return;clearTimeout(instance.timer);instance.lastUsed=Date.now();instance.timer=setTimeout(()=>{if(!instance.busy)void retireIdle(instance).then(result=>{if(ownedMode&&result?.released===false)armIdle(instance)}).catch(error=>{instance.errors.push(String(error.message||error));if(ownedMode)armIdle(instance)})},idleMs);instance.timer.unref?.()}
  async function start(sessionId,cancelled=()=>false){
   if(closed)throw new Error('脚本后台执行器已停止')
   // A startup reservation is not a ready realm. Join its promise before looking
@@ -187,34 +216,37 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
   const existing=instances.get(sessionId)
   if(existing?.initializationBlocked&&!existing.closed)return refreshInitialization(existing,{retry:true})
   if(existing?.drainError){
+   if(ownedMode)throw new Error(existing.drainError||'SP 专用后台保存待显式重试，原窗口保留')
    // A visible page that owns the game has already fenced the retained realm's
    // identity: it can never write again, so it must not fail this game's events.
-   if(dispatch.availableFrontend?.(sessionId)){await discardRetained(existing,'前台页面已接管本局，后台未保存的 SP 实例已放弃');return null}
+   if(!ownedMode&&dispatch.availableFrontend?.(sessionId)){await discardRetained(existing,'前台页面已接管本局，后台未保存的 SP 实例已放弃');return null}
    if(!await recoverRetained(existing))throw new Error(existing.drainError||'SP 原包尚未保存')
    return start(sessionId,cancelled)
   }
   if(existing?.closePromise){await existing.closePromise;return start(sessionId,cancelled)}if(existing&&!existing.closed){clearTimeout(existing.timer);return existing.hasMvu?refreshInitialization(existing):existing}
   if(dispatch.available(sessionId))return null
   const task=(async()=>{
-   const initial=prepareMvuStartupView(await view(sessionId));if(cancelled())throw new Error('后台脚本启动已取消');if(!initial)throw new Error('当前游戏不存在')
+   const initial=projectView(await view(sessionId));if(cancelled())throw new Error('后台脚本启动已取消');if(!initial)throw new Error('当前游戏不存在')
    const hasOriginal=initial.tavernHelperScripts?.some(script=>script.id==='extension-sp-database')
    const hasMvu=['official','card'].includes(initial.tavernMvuRuntime?.owner)||initial.tavernHelperScripts?.some(script=>['official-mvu','card-mvu'].includes(script.system))
    const working=()=>liveInstances().filter(row=>!row.quarantined&&!row.drainError&&!row.initializationBlocked)
    for(;;){
     if(closed||cancelled())throw new Error('后台脚本启动已取消')
-    if(dispatch.availableFrontend?.(sessionId))return null
-    if((hasOriginal||hasMvu)&&retainedInstances().length>=maxRetained){await recoverRetainedCapacity(cancelled);continue}
+    if(!ownedMode&&dispatch.availableFrontend?.(sessionId))return null
+    if((hasOriginal||hasMvu)&&retainedInstances().length>=maxRetained){if(ownedMode)throw retainedCapacityError();await recoverRetainedCapacity(cancelled);continue}
     if(working().length<maxInstances&&admitted.size<maxInstances+maxRetained)break
     const idle=working().filter(row=>!row.busy).sort((a,b)=>a.lastUsed-b.lastUsed)[0]
     if(!idle)throw new Error('后台脚本执行器正忙')
-    await retireIdle(idle)
+    const retired=await retireIdle(idle)
+    if(ownedMode&&!idle.closed)throw new Error('SP 专用后台容量已满；活动查看者、任务或交互阻止回收')
     // Failed retirement can fill retained capacity; recheck after every await.
    }
    // No await between the checks and insertion: concurrent views/startups must
    // see this working-slot reservation before acquiring a browser context.
-   const instance={sessionId,hasOriginal,hasMvu,starting:true,closed:false,busy:true,lastUsed:Date.now(),runtimeId:'',errors:[],generations:new Map()};instances.set(sessionId,instance);admitted.add(instance)
+   const instance={sessionId,hasOriginal,hasMvu,starting:true,ownedLeaseRegistered:false,closed:false,busy:true,lastUsed:Date.now(),runtimeId:'',errors:[],generations:new Map()};instances.set(sessionId,instance);admitted.add(instance)
    let yieldStartup;const frontendAcquired=new Promise(resolve=>{yieldStartup=()=>resolve('foreground')})
    try{
+    if(ownedMode){if(typeof ownedOptions.scope!=='function')throw new Error('SP 专用后台缺少canonical scope提供者');instance.ownedScope=await ownedOptions.scope(sessionId)}
     instance.browserLease=browserOwner.acquire(()=>{void disposeOne(instance)})
     const browser=await instance.browserLease.browser.catch(error=>{throw new Error('无法启动脚本后台浏览器：'+error.message)});if(instance.closed||instance.quarantined||closed||cancelled())throw new Error('后台脚本启动已取消')
     instance.browser=browser
@@ -234,7 +266,7 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
       if(instance.closed||instance.quarantined){await route.fulfill({status:403,body:'Retained runtime resources are quarantined'});return}
       const engineDocument=path==='/'&&isNavigationRequest&&request.frame()===instance.page?.mainFrame()
       if(request.method()!=='GET'||!engineDocument&&(isNavigationRequest||['document','iframe','frame','object','embed'].includes(resourceType)||headers['sec-fetch-mode']==='navigate'||['document','iframe','frame','object','embed'].includes(headers['sec-fetch-dest']))){await route.fulfill({status:403,body:'Helper resources are read-only and cannot be navigated',headers:{'x-content-type-options':'nosniff'}});return}
-      if(path==='/'){if(!engineDocument){await route.fulfill({status:403,body:'Helper document is private'});return}await route.fulfill({status:200,contentType:'text/html',body:'<!doctype html><html><meta charset="utf-8"><title>DSH 脚本后台</title><link rel="icon" href="data:,"><body><script>window.__dshTavernBackground=true;window.__ModuleLoader__={load:d=>{window.__dshHelper=d.factory(()=>({}))}}</script><script src="/client.js"></script></body></html>'});return}
+      if(path==='/'){if(!engineDocument){await route.fulfill({status:403,body:'Helper document is private'});return}await route.fulfill({status:200,contentType:'text/html',body:'<!doctype html><html><meta charset="utf-8"><title>DSH 脚本后台</title><link rel="icon" href="data:,"><body><script>window.__dshTavernBackground=true;window.__dshTavernOwnedSp='+JSON.stringify(ownedMode)+';window.__ModuleLoader__={load:d=>{window.__dshHelper=d.factory(()=>({}))}}</script><script src="/client.js"></script></body></html>'});return}
       if(path==='/client.js')file={body:client,mediaType:'application/javascript'}
       else if(path===OFFICIAL_MVU_VERSION.assetUrl)file=await readOfficialMvuBundle()
       else if(path.startsWith(FULL_PROMPT_TEMPLATE_ASSET_PREFIX))file=await readFullPromptTemplateAsset(path)
@@ -243,6 +275,13 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
      }catch {await route.fulfill({status:404,body:'Helper resource unavailable'}).catch(()=>{})}
     })
     const page=instance.page=await context.newPage();page.on('pageerror',error=>{instance.errors.push(error.stack||error.message);if(instance.errors.length>30)instance.errors.shift()})
+    if(ownedMode){
+     if(typeof ownedUiFactory!=='function')throw new Error('SP 原UI浏览器桥未接入')
+     // Playwright auto-dismisses dialogs without a listener. Install the private
+     // retained bridge before navigation or any original script can open one.
+     instance.ownedUiPromise=Promise.resolve(ownedUiFactory({page,sessionId,runtimeId:()=>instance.runtimeId})).then(ui=>instance.ownedUi=ui)
+     await instance.ownedUiPromise
+    }
     // A crashed renderer no longer holds the original realm: nothing is left to save.
     page.on('crash',()=>{
      if(instance.closed||instance.crashed)return
@@ -254,17 +293,25 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
     })
     await page.exposeBinding('__dshHelperRpc',async({frame},method,args={})=>{
      if(frame!==page.mainFrame())throw new Error('脚本子页面不能直接调用宿主桥接')
-     if(instance.closed)throw new Error('脚本执行器已结束');if(!methods.has(method)&&pageOnlyMethods.has(method))throw new Error('后台实例不提供「'+method+'」：它只能在打开的游戏页面里使用');if(!methods.has(method)||args.sessionId!==sessionId)throw new Error('脚本后台操作超出当前游戏范围')
-     if(['claimTavernScriptWork','heartbeatTavernScriptRuntime'].includes(method)){if(!String(args.runtimeId).startsWith('background:'))throw new Error('后台执行身份无效');instance.runtimeId=args.runtimeId}
+     if(instance.closed)throw new Error('脚本执行器已结束');if(!allowedMethods.has(method)&&pageOnlyMethods.has(method))throw new Error('后台实例不提供「'+method+'」：它只能在打开的游戏页面里使用');if(!allowedMethods.has(method)||args.sessionId!==sessionId)throw new Error('脚本后台操作超出当前游戏范围')
+     if(ownedMode&&args.scriptId&&args.scriptId!=='extension-sp-database')throw new Error('SP 专用后台不能调用其他脚本身份');
+     if(ownedMode&&args.scriptScope==='frame'){const currentScope=await ownedOptions.scope(sessionId);if(!isDeepStrictEqual(currentScope,instance.ownedScope)||args.expectedLifecycleRevision!==undefined&&args.expectedLifecycleRevision!==currentScope.lifecycleRevision)throw new Error('SP 专用后台原包、卡片或剧情身份已变化')}
+
+     if(['claimTavernScriptWork','heartbeatTavernScriptRuntime'].includes(method)){if(!String(args.runtimeId).startsWith('background:')||ownedMode&&instance.runtimeId&&instance.runtimeId!==args.runtimeId)throw new Error('后台执行身份无效');instance.runtimeId=args.runtimeId}
      if(instance.quarantined){
       const control=['heartbeatTavernScriptRuntime','reserveTavernHelperRuntime','quarantineTavernHelperRuntime','releaseTavernHelperRuntime'].includes(method)
-      const recovery=instance.recoveryToken&&monotonicNow()<instance.recoveryDeadline&&args.spRecoveryToken===instance.recoveryToken&&args.scriptId==='extension-sp-database'&&persistenceMethods.has(method)
+      const ownedRecovery=instance.ownedSaveRecovery;
+      const ownedSave=ownedRecovery&&monotonicNow()<ownedRecovery.deadline&&args.spRecoveryToken===ownedRecovery.token&&args.scriptId==='extension-sp-database'&&saveRecoveryMethods.has(method)&&(!args.payload?.taskId||args.payload.taskId===ownedRecovery.taskId)&&(!(method==='checkpointTavernSpOwnedTask')||['completed','failed'].includes(args.payload?.phase));
+      const recovery=ownedSave||instance.recoveryToken&&monotonicNow()<instance.recoveryDeadline&&args.spRecoveryToken===instance.recoveryToken&&args.scriptId==='extension-sp-database'&&persistenceMethods.has(method)
       if(!control&&!recovery)throw new Error('SP 执行已隔离，仅允许当前显式保存重试')
       if(method==='reserveTavernHelperRuntime'&&!(instance.recoveryToken&&args.recoveryToken===instance.recoveryToken&&monotonicNow()<instance.recoveryDeadline))throw new Error('SP 保存重试窗口已失效')
      }
+     const registrationOrigin=ownedMode&&method==='registerTavernSpOwnedTask'?dispatch.executingEvent?.(sessionId,instance.runtimeId,args.apiCallOrigin?.eventId):null;
      let result
      try{result=await rpc(method,args)}catch(error){if(method==='pollTavernHelperGeneration'){instance.generations.delete(args.id);if(!instance.busy)armIdle(instance)}throw error}
-     if(method==='getSession'&&result?.view)result={...result,view:prepareMvuStartupView(result.view)}
+     if(ownedMode&&['claimTavernScriptWork','heartbeatTavernScriptRuntime'].includes(method)&&result?.active===true)instance.ownedLeaseRegistered=true;
+     if(registrationOrigin&&result?.taskId){if(!instance.ownedTaskOrigins)instance.ownedTaskOrigins=new Map();instance.ownedTaskOrigins.set(result.taskId,registrationOrigin);}
+     if(method==='getSession'&&result?.view)result={...result,view:projectView(result.view)}
      if(method==='getSession'&&(['official','card'].includes(result?.view?.tavernMvuRuntime?.owner)||result?.view?.tavernHelperScripts?.some(script=>['official-mvu','card-mvu'].includes(script.system)))){
       if(!instance.hasMvu&&retainedInstances().length>=maxRetained)throw retainedCapacityError();
       instance.hasMvu=true;
@@ -275,12 +322,13 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
       if(!instance.hasOriginal&&retainedInstances().length>=maxRetained)throw retainedCapacityError()
       instance.hasOriginal=true
      }
+     if(ownedMode&&['claimTavernScriptWork','heartbeatTavernScriptRuntime'].includes(method)&&result?.active===true&&!instance.ownedOwnerBound){await ownedOptions.onOwner?.(sessionId,{runtimeId:instance.runtimeId});instance.ownedOwnerBound=true}
      if(['claimTavernScriptWork','heartbeatTavernScriptRuntime'].includes(method)&&result?.active===true&&args.mvuValidation?.blocked===true){
       // Only the acknowledged owner can add this retention state. A later
       // heartbeat does not clear it without checking the current realm.
       preserveInitialization(instance,args.mvuValidation.reason);
      }
-     if(['claimTavernScriptWork','heartbeatTavernScriptRuntime'].includes(method)&&result?.active===false&&dispatch.availableFrontend?.(sessionId))yieldStartup()
+     if(!ownedMode&&['claimTavernScriptWork','heartbeatTavernScriptRuntime'].includes(method)&&result?.active===false&&dispatch.availableFrontend?.(sessionId))yieldStartup()
      if(generationMethods.has(method)&&result?.id){
       const stop={sessionId,scriptId:args.scriptId,expectedLifecycleRevision:args.expectedLifecycleRevision,id:result.id}
       instance.generations.set(result.id,stop)
@@ -293,19 +341,20 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
     await page.goto(origin,{waitUntil:'load',timeout:timeoutMs})
     if(instance.closed||instance.quarantined||cancelled())throw new Error('后台脚本启动已取消')
     instance.engineStarted=true;
-    await page.evaluate(async({sessionId,initial})=>{
+    await page.evaluate(async({sessionId,initial,ownedMode})=>{
      const ui=window.__dshHelper,id=crypto.randomUUID?.bind(crypto)||(()=>Date.now().toString(36)+'-'+Math.random().toString(36).slice(2));Object.defineProperty(crypto,'randomUUID',{value:()=> 'background:'+id(),configurable:true})
-     const invoke=(method,args,_sessionId)=>window.__dshHelperRpc(method,{...args,sessionId})
+     // Match the existing foreground HTTP JSON wire contract before Playwright can preserve undefined.
+     const invoke=(method,args,_sessionId)=>window.__dshHelperRpc(method,ownedMode?JSON.parse(JSON.stringify({...args,sessionId})):{...args,sessionId})
      let syncing=null,refreshRequested=false
      const update=()=>{refreshRequested=true;return syncing ||= (async()=>{do{refreshRequested=false;const {view}=await invoke('getSession',{});engine.sync(sessionId,view);}while(refreshRequested)})().finally(()=>{syncing=null})}
      const listeners=new Map()
      window.__dshBackgroundSignal=signal=>{for(const receive of [...(listeners.get(signal.kind)||[])])receive(signal)}
-     const engine=window.__dshBackgroundEngine=ui.createTavernScriptExecutionModule({window,background:true,rpc:invoke,invalidate:()=>{void update().catch(console.error)},signals:{subscribe(_id,kind,receive){let set=listeners.get(kind);if(!set){set=new Set();listeners.set(kind,set)}set.add(receive);return()=>{set.delete(receive);if(!set.size)listeners.delete(kind)}}},heartbeatIntervalMs:1000})
+     const engine=window.__dshBackgroundEngine=ui.createTavernScriptExecutionModule({window,background:true,ownedSp:ownedMode,rpc:invoke,invalidate:()=>{void update().catch(console.error)},signals:{subscribe(_id,kind,receive){let set=listeners.get(kind);if(!set){set=new Set();listeners.set(kind,set)}set.add(receive);return()=>{set.delete(receive);if(!set.size)listeners.delete(kind)}}},heartbeatIntervalMs:1000})
      engine.sync(sessionId,initial);window.__dshBackgroundRefresh=update
-    },{sessionId,initial})
+    },{sessionId,initial,ownedMode})
     instance.unsubscribe=dispatch.subscribeWork?.(sessionId,signal=>{if(!instance.closed)void page.evaluate(signal=>window.__dshBackgroundSignal?.(signal),signal).catch(error=>{if(!instance.closed){instance.errors.push(error.message);if(instance.errors.length>30)instance.errors.shift()}})})
     const readiness=await Promise.race([frontendAcquired,page.waitForFunction(()=>{const state=window.__dshBackgroundEngine?.inspect();return state?.active&&window.__dshHelper.tavernScriptRuntimeReady(state.runtime)||Boolean(state?.runtime?.initializationError||state?.runtime?.initializationBlocked||state?.runtime?.mvuLoadState?.canRetry)},{},{timeout:timeoutMs}).then(async handle=>{await handle.dispose();return 'ready'})])
-    if(readiness==='foreground'||dispatch.availableFrontend?.(sessionId)){await disposeOne(instance);return null}
+    if(readiness==='foreground'||!ownedMode&&dispatch.availableFrontend?.(sessionId)){await disposeOne(instance);return null}
     if(instance.hasMvu){await refreshInitialization(instance);instance.busy=false;if(instance.initializationBlocked)return instance;}
     else {const initializationError=await page.evaluate(()=>window.__dshBackgroundEngine.inspect().runtime?.initializationError||'');if(initializationError)throw new Error(initializationError)}
     instance.busy=false;armIdle(instance);return instance
@@ -362,7 +411,7 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
     }
     if(!result.handled){
      // After a dispatch timeout the event may still be running in the page.
-     if(input.returnFailure){failOne(instance,new Error(result.error||'脚本事件执行失败'),{retain:result.timedOut===true});return result}
+     if(input.returnFailure){if(ownedMode)instance.failedOwnedEvent={eventId:input.work?.eventId,error:result.error,phase:result.phase,args:result.args,diagnostics:result.diagnostics};failOne(instance,new Error(result.error||'脚本事件执行失败'),{retain:result.timedOut===true});return result}
      throw Object.assign(new Error(result.error||(result.timedOut?'脚本事件执行超时':'脚本没有可用的事件执行者，请重新打开游戏')),{retainOriginal:result.timedOut===true})
     }
     // Script saves can invalidate during an in-flight refresh. Synchronize the
@@ -398,6 +447,7 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
   finally{clearTimeout(timer)}
  }
  async function yieldToFrontend(sessionId,runtimeId,{takeover=false}={}){
+  if(ownedMode)return {yielded:false,ownedSp:true};
   if(String(runtimeId).startsWith('background:'))return;const instance=instances.get(sessionId);if(!instance||instance.busy||instance.generations.size)return
   // The last poll is not the script's completion. Its response templates,
   // callbacks and acknowledged writes still own this original realm.
@@ -437,6 +487,150 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
   catch(error){instance.drainError=error.message;return {released:false,drainError:error.message}}
   finally{clearTimeout(timer);delete instance.recoveryToken;if(!instance.closed&&instance.runtimeId)dispatch.quarantine?.(sessionId,instance.runtimeId,instance.drainError)}
  }
+ function requireOwned(){if(!ownedMode)throw new Error('SP 专用后台模式未启用')}
+ function nativeDialogPending(sessionId){const instance=instances.get(sessionId);return !!instance&&!instance.closed&&!instance.crashed&&!instance.quarantined&&dispatch.available(sessionId,instance.runtimeId)&&instance.ownedUi?.hasNativeDialog?.()===true}
+ function retainedNativeDialogPending(sessionId){const instance=instances.get(sessionId);return !!instance&&!instance.closed&&!instance.crashed&&dispatch.retainedOwner(sessionId,instance.runtimeId)&&instance.ownedUi?.hasNativeDialog?.()===true}
+ function keepNativeDialogAlive(sessionId){
+  // Called only after the controller validates a live current viewer. Preserve
+  // the existing live lease while its renderer is suspended; never revive an
+  // expired/replaced lease or advertise initialization/work as ready.
+  if(!nativeDialogPending(sessionId))return false
+  const instance=instances.get(sessionId)
+  if(instance.initializationBlocked||instance.drainError||dispatch.status(sessionId).initializationError)return false
+  return dispatch.heartbeat(sessionId,instance.runtimeId,false,'',2).active===true
+ }
+ async function assertOwnedOwner(sessionId,runtimeId){
+  requireOwned();const instance=instances.get(sessionId)
+  if(!instance||instance.closed||instance.crashed||instance.quarantined||instance.runtimeId!==runtimeId||!String(runtimeId).startsWith('background:')||!dispatch.available(sessionId,runtimeId))throw new Error('SP 专用后台执行权已失效')
+  return true
+ }
+ async function assertRetainedUiOwner(sessionId,instance){
+  const valid=()=>instances.get(sessionId)===instance&&!instance.closed&&!instance.crashed&&!!instance.page&&String(instance.runtimeId).startsWith('background:')&&dispatch.retainedOwner(sessionId,instance.runtimeId);
+  if(!valid())throw new Error('SP 原恢复界面身份已失效');
+  if(!isDeepStrictEqual(await ownedOptions.scope(sessionId),instance.ownedScope)||!valid())throw new Error('SP 原恢复界面剧情或执行者已变化');
+ }
+ async function recoverStartingMetadata(sessionId,instance,authorizeUi,initializingScope){
+  const initial=initializingScope?.();
+  const cold=()=>instance?instance.starting===true&&instance.ownedLeaseRegistered===false&&!instance.quarantined&&!instance.initializationBlocked:!!initial;
+  const current=()=>instances.get(sessionId)===instance&&!closed&&(!instance||!instance.closed&&!instance.crashed);
+  if(!cold())return null;
+  const expected=instance?.ownedScope||initial;
+  const actual=await ownedOptions.scope(sessionId);
+  if(!instance&&initial)instance=instances.get(sessionId);
+  if(!cold())return null;
+  if(!current()||!expected||!isDeepStrictEqual(actual,expected)||instance?.ownedScope&&!isDeepStrictEqual(instance.ownedScope,expected))throw new Error('SP 首次观察剧情或执行者已变化');
+  const validate=typeof authorizeUi==='function'?await authorizeUi():null;
+  validate?.();initializingScope?.();
+  if(!instance&&initial)instance=instances.get(sessionId);
+  if(instance?.ownedScope&&!isDeepStrictEqual(instance.ownedScope,expected))throw new Error('SP initial metadata scope changed');
+  if(!current())throw new Error('SP 首次观察执行者已变化');if(!cold())return null;
+  const metadata=instance?.ownedUi?await instance.ownedUi.operate({operation:'recover'},{validate}):{revision:0,notices:[],sessionId,runtimeId:instance?.runtimeId||null};
+  return {...metadata,ready:false,initializing:true};
+ }
+ async function assertSaveRecovery(sessionId,runtimeId,recovery){
+  const instance=instances.get(sessionId),permit=instance?.ownedSaveRecovery;
+  if(!instance||instance.closed||instance.crashed||instance.runtimeId!==runtimeId||!instance.quarantined||!permit||permit.token!==recovery?.token||permit.taskId!==recovery?.taskId||monotonicNow()>=permit.deadline||permit.revision!==instance.quarantineRevision)throw new Error('SP 专用保存恢复能力已失效');
+  if(!isDeepStrictEqual(await ownedOptions.scope(sessionId),instance.ownedScope))throw new Error('SP 保存恢复剧情身份已变化');
+  if(instances.get(sessionId)!==instance||instance.closed||instance.crashed||instance.ownedSaveRecovery!==permit||permit.revision!==instance.quarantineRevision||monotonicNow()>=permit.deadline)throw new Error('SP 专用保存恢复能力已失效');
+  return true;
+ }
+ async function withSaveRecovery(sessionId,{runtimeId,taskId},work){
+  requireOwned();const instance=instances.get(sessionId);
+  if(instance&&!instance.quarantined){await assertOwnedOwner(sessionId,runtimeId);return work(undefined);}
+  if(!instance||instance.closed||instance.crashed||instance.runtimeId!==runtimeId||!instance.quarantined||instance.ownedSaveRecovery||typeof taskId!=='string'||!taskId)throw new Error('SP 原保存恢复窗口不可用');
+  await instance.quarantinePromise;
+  if(!isDeepStrictEqual(await ownedOptions.scope(sessionId),instance.ownedScope))throw new Error('SP 保存恢复剧情身份已变化');
+  const permit={token:randomUUID(),taskId,runtimeId,deadline:monotonicNow()+timeoutMs,revision:instance.quarantineRevision};
+  dispatch.beginOwnedSaveRecovery(sessionId,runtimeId,permit.token,taskId,timeoutMs);instance.ownedSaveRecovery=permit;
+  let resumed=false;
+  try{
+   await instance.page.evaluate(permit=>window.__dshBackgroundEngine.beginOwnedSaveRecovery(permit),{token:permit.token,taskId,runtimeId,timeoutMs});
+   const result=await work({token:permit.token,taskId,runtimeId});
+   await assertSaveRecovery(sessionId,runtimeId,permit);
+   if(result?.saved!==true||result.taskId!==taskId||result.recoveryComplete!==true)throw new Error('SP 仅保存恢复未获得任务完成及安全恢复双确认');
+   if(typeof result.recoveryError!=='string'||!result.recoveryError||!instance.drainError?.endsWith(result.recoveryError))throw new Error('SP 已保存，但当前隔离还包含另一故障，未恢复普通执行');
+   const origin=instance.ownedTaskOrigins?.get(taskId),failed=instance.failedOwnedEvent;
+   if(result.hostEvent&&(!origin||result.hostEvent.eventId!==origin.id||result.hostEvent.name!==origin.name||result.hostEvent.runtimeId!==runtimeId))throw new Error('SP 保存恢复持久来源与原宿主事件不一致');
+   if(failed&&(!origin||origin.id!==failed.eventId||typeof failed.error!=='string'||!failed.error.endsWith(result.recoveryError)))throw new Error('SP 已保存，但任务与失败事件缺少同一真实执行编号证明');
+   if(typeof ownedOptions.completeSaveRecovery!=='function')throw new Error('SP 保存恢复事件确认入口不可用');
+   await ownedOptions.completeSaveRecovery(sessionId,{runtimeId,taskId,eventId:failed?origin.id:undefined,recoveryError:result.recoveryError,identity:instance.ownedScope,args:failed?.args});
+   dispatch.finishOwnedSaveRecovery(sessionId,runtimeId,permit.token,{resume:true});
+   await instance.page.evaluate(token=>window.__dshBackgroundEngine.finishOwnedSaveRecovery(token),permit.token);
+   await assertSaveRecovery(sessionId,runtimeId,permit);
+   instance.quarantined=false;
+   await instance.page.evaluate(token=>window.__dshBackgroundEngine.resumeOwnedSaveRecovery(token),permit.token);
+   if(instance.quarantineRevision!==permit.revision)throw new Error('SP 保存恢复期间发生另一隔离');
+   delete instance.drainError;delete instance.retainedAt;delete instance.failedOwnedEvent;resumed=true;
+   instance.unsubscribe=dispatch.subscribeWork?.(sessionId,signal=>{if(!instance.closed)void instance.page.evaluate(signal=>window.__dshBackgroundSignal?.(signal),signal).catch(error=>instance.errors.push(error.message))});
+   armIdle(instance);return result;
+  }catch(error){if(!instance.closed){instance.quarantined=true;dispatch.quarantine?.(sessionId,runtimeId,instance.drainError);await instance.page.evaluate(reason=>window.__dshBackgroundEngine.quarantine(reason),instance.drainError).catch(failure=>instance.errors.push(failure.message));}throw error}
+  finally{if(!resumed){try{dispatch.finishOwnedSaveRecovery(sessionId,runtimeId,permit.token)}catch{}await instance.page.evaluate(token=>window.__dshBackgroundEngine.cancelOwnedSaveRecovery(token),permit.token).catch(error=>instance.errors.push(error.message));}if(instance.ownedSaveRecovery===permit)delete instance.ownedSaveRecovery;}
+ }
+ async function ownedEnsure(sessionId){requireOwned();const instance=await ensure(sessionId);if(!instance)throw new Error('SP 专用后台未取得执行权');await assertOwnedOwner(sessionId,instance.runtimeId);return {active:true,runtimeId:instance.runtimeId,initialized:true}}
+ async function ownedEmit(sessionId,eventOrName,args=[],work={}){
+  requireOwned();const event=typeof eventOrName==='string'?{...work,name:eventOrName,args}:eventOrName
+  if(!event||typeof event.name!=='string')throw new Error('SP 专用后台事件无效')
+  if(String(event.eventId||'').startsWith('display-render:'))throw new Error('正文显示改写专用事件不能派发给SP')
+  if(event.name==='CHAT_CHANGED'&&event.initialization===true){await ownedEnsure(sessionId);return {handled:true,alreadyInitialized:true,args:event.args||[]}}
+  // The runtime already has the freshly synchronized complete Helper context.
+  // Passing a whole session view here would overwrite it with the wrong shape.
+  const {name,args:eventArgs=[],context:_unusedContext,...eventWork}=event
+  return execute({sessionId,name,args:eventArgs,context:null,work:{...eventWork,general:true,onlyScriptIds:['extension-sp-database']},returnFailure:true})
+ }
+ // Internal callback only: never expose this object through a browser RPC.
+ async function withOwnedInstance(sessionId,fn){
+  requireOwned();let instance=instances.get(sessionId);if(!instance?.page||!instance.runtimeId)instance=await ensure(sessionId)
+  if(!instance||instance.closed||instance.crashed)throw new Error('SP 专用后台原窗口不可用')
+  if(typeof ownedOptions.scope!=='function')throw new Error('SP 专用后台缺少canonical scope提供者')
+  return fn({page:instance.page,runtimeId:instance.runtimeId,scope:await ownedOptions.scope(sessionId),hostAvailable:!instance.quarantined&&dispatch.available(sessionId,instance.runtimeId),quarantined:!!instance.quarantined,drainError:instance.drainError||null,errors:instance.errors.slice()})
+ }
+ async function ownedCommand(sessionId,command,{authorizeUi,initializingScope}={}){
+  requireOwned();const composerCommand=command?.kind==='composer-state'||command?.kind==='composer-intent',recoveryUi=command?.kind==='ui'&&['recover','dialog','files','close'].includes(command.command?.operation);let instance=command?.kind==='save-retry'||composerCommand||recoveryUi?instances.get(sessionId):await ensure(sessionId);if(command?.kind==='save-retry'&&(!instance||instance.closed||instance.crashed||!instance.page||command.runtimeId&&command.runtimeId!==instance.runtimeId))throw new Error('SP original save realm no longer available');if(command?.kind==='ui'&&command.command?.operation==='recover'&&(!instance||instance.starting===true&&instance.ownedLeaseRegistered===false)){const starting=await recoverStartingMetadata(sessionId,instance,authorizeUi,initializingScope);if(starting!==null)return starting;instance=instances.get(sessionId);}if(!instance)throw new Error('SP 专用后台不可用');if(command?.kind==='save-retry'&&instance.quarantined)await assertSaveRecovery(sessionId,instance.runtimeId,command.recovery);else if(recoveryUi&&['recover','dialog','close'].includes(command.command?.operation))await assertRetainedUiOwner(sessionId,instance);else await assertOwnedOwner(sessionId,instance.runtimeId)
+  // Commands, including real UI actions, must prevent idle retirement. A task
+  // may wait for another command, so no common serial queue spans these awaits.
+  instance.ownedCommands=(instance.ownedCommands||0)+1
+  try{
+   if(command?.kind==='database-command')return await instance.page.evaluate(operation=>window.__dshBackgroundEngine.commandOwned(operation),command.operation||command.command)
+   if(command?.kind==='open-ui')return await instance.page.evaluate(()=>window.__dshBackgroundEngine.openOwnedUi())
+   if(command?.kind==='ui'){
+    // Replies to a native dialog must not evaluate into its suspended renderer.
+    // Opening is an explicit operation; capture/answers use the existing bridge.
+    // The bridge performs openOwnedUi exactly once for operation "open".
+    if(typeof ownedUiFactory!=='function')throw new Error('SP 原UI浏览器桥未接入')
+    if(!instance.ownedUiPromise)instance.ownedUiPromise=Promise.resolve(ownedUiFactory({page:instance.page,sessionId,runtimeId:instance.runtimeId})).then(ui=>instance.ownedUi=ui).catch(error=>{delete instance.ownedUiPromise;throw error})
+    const ui=await instance.ownedUiPromise;
+    if(!recoveryUi&&command.command?.operation!=='capture'&&!(command.command?.operation==='open'&&ui.hasNativeDialog?.())){
+     if(!await instance.page.evaluate(()=>window.__dshBackgroundEngine.ownedState()?.ready===true))throw new Error('SP 原插件尚未完整初始化，输入未执行')
+    }
+    const validateUi=typeof authorizeUi==='function'?await authorizeUi():null;
+    if(validateUi!==null&&typeof validateUi!=='function')throw new Error('SP 原界面最终认证回执无效');
+    validateUi?.();return await ui.operate(command.command,{validate:validateUi})
+   }
+   const matches=[]
+   for(const frame of instance.page.frames())if(await frame.evaluate(()=>window.__dshOriginalExtensionState?.id==='sp-database'))matches.push(frame)
+   if(matches.length!==1)throw new Error('SP 专用后台原包窗口缺失或不唯一')
+   return await matches[0].evaluate(async command=>{
+    if(command?.kind==='composer-state'||command?.kind==='composer-intent'){if(!window.__dshOwnedComposerBridgeReady)throw Error('SP 原输入框桥未安装');const bridge=await window.__dshOwnedComposerBridgeReady;if(!bridge)throw Error('SP 原输入框桥不可用');const value={...command.value,composerEpoch:command.composerEpoch};if(command.kind==='composer-intent')return bridge.intent(value);bridge.apply(value);return {delivered:true}}
+    if(command?.kind==='task'){if(typeof window.AutoCardUpdaterAPI?.__dshExecuteOwnedTask!=='function')throw Error('SP owned-task API unavailable');return window.AutoCardUpdaterAPI.__dshExecuteOwnedTask(command.task)}
+    if(command?.kind==='save-retry'){if(typeof window.AutoCardUpdaterAPI?.__dshRetryOwnedTaskSave!=='function')throw Error('SP save retry API unavailable');return window.AutoCardUpdaterAPI.__dshRetryOwnedTaskSave(command.taskId,command.recovery)}
+    if(command?.kind==='task-prepare'){if(typeof window.AutoCardUpdaterAPI?.__dshPrepareQueuedOwnedTask!=='function')throw Error('SP queued preparation API unavailable');return window.AutoCardUpdaterAPI.__dshPrepareQueuedOwnedTask(command.task)}
+    if(command?.kind==='task-command'){if(typeof window.AutoCardUpdaterAPI?.__dshOwnedTaskCommand!=='function')throw Error('SP owned-command API unavailable');return window.AutoCardUpdaterAPI.__dshOwnedTaskCommand(command.command)}
+    throw Error('Unsupported SP owner command')
+   },command)
+  }finally{instance.ownedCommands--;armIdle(instance)}
+ }
+ async function ownedInspect(sessionId){
+  requireOwned();const instance=instances.get(sessionId);if(!instance)return {active:false}
+  const original=[]
+  for(const frame of instance.page?.frames()||[])try{const state=await frame.evaluate(()=>{
+   if(window.__dshOriginalExtensionState?.id!=='sp-database')return null
+   const api=window.AutoCardUpdaterAPI,detail=api?.__dshPersistenceDiagnostics?.()
+   return {phase:window.__dshOriginalExtensionState.phase,ready:window.__dshOriginalExtensionState.ready,work:api?.__dshPendingWork?.(),persistenceIdle:detail?.idle===true,checks:detail?.checks||null,ui:typeof window.__dshSpOwnedBackgroundInspect==='function'?window.__dshSpOwnedBackgroundInspect():null}
+  });if(state)original.push(state)}catch(error){original.push({inspectionFailed:true,error:String(error.message||error)})}
+  const ownedState=await instance.page.evaluate(()=>window.__dshBackgroundEngine?.ownedState?.()||null)
+  const hostAvailable=!instance.closed&&!instance.crashed&&!instance.quarantined&&dispatch.available(sessionId,instance.runtimeId)
+  return {active:!instance.closed&&!instance.crashed,hostAvailable,ready:hostAvailable&&ownedState?.ready===true,runtimeId:instance.runtimeId,busy:instance.busy,commands:instance.ownedCommands||0,quarantined:!!instance.quarantined,drainError:instance.drainError||null,errors:instance.errors.slice(),ownedState,original}
+ }
  async function diagnose(){return {instances:await Promise.all([...instances.values()].map(async instance=>{
   const original=[];
   for(const frame of instance.page?.frames?.()||[])try{
@@ -468,5 +662,5 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,n
   await browserOwner.dispose()
   return {disposed:true,...(errors.length?{errors}:{})}
  }
- return {execute,ensure,yieldToFrontend,retryDrain,diagnose,inspect:()=>({instances:[...instances.values()].map(i=>({sessionId:i.sessionId,busy:i.busy,lastUsed:i.lastUsed,...(i.initializationBlocked?{initializationBlocked:true,initializationBlockReason:i.initializationBlockReason}:{}),...(i.drainError?{drainError:i.drainError}:{})})),metrics:[...metrics],discarded:[...discarded]}),dispose}
+ return {withOwnedInstance,owned:ownedMode?Object.freeze({ensure:ownedEnsure,nativeDialogPending,retainedNativeDialogPending,keepNativeDialogAlive,emit:ownedEmit,command:ownedCommand,inspect:ownedInspect,assertOwner:assertOwnedOwner,assertSaveRecovery,withSaveRecovery,retire:sessionId=>retireIdle(instances.get(sessionId))}):null,execute,ensure,yieldToFrontend,retryDrain,diagnose,inspect:()=>({instances:[...instances.values()].map(i=>({sessionId:i.sessionId,busy:i.busy,lastUsed:i.lastUsed,...(i.initializationBlocked?{initializationBlocked:true,initializationBlockReason:i.initializationBlockReason}:{}),...(i.drainError?{drainError:i.drainError}:{})})),metrics:[...metrics],discarded:[...discarded]}),dispose}
 }

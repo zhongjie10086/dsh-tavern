@@ -1,4 +1,4 @@
-import {originalSpTableFields,originalSp129MaterialFields} from './sp-original-fields.js'
+import {originalSpTableFields,originalSp129MaterialFields,originalSp129CarrierFields} from './sp-original-fields.js'
 // SP 1.2.9 recovery adapter. Native replay/writers remain the authority.
 function walk(node,visit){if(!node||typeof node!=='object')return;visit(node);for(const value of Object.values(node))if(Array.isArray(value))value.forEach(n=>walk(n,visit));else if(value&&typeof value==='object')walk(value,visit)}
 function matches(root,predicate){const found=[];walk(root,n=>{if(predicate(n))found.push(n)});return found}
@@ -64,7 +64,7 @@ export function adaptSp129Recovery(ctx){
  const vault=only(matches(capture,n=>n.type==='AssignmentExpression'&&n.left.type==='Identifier'&&n.right.type==='ObjectExpression'&&n.right.properties.some(p=>p.key.name==='entriesByIsolationKey')),'checkpoint vault').left.name;
  ctx.insert(ctx.root.start+1,'function __dshResetCheckpointVault(){'+vault+'=null;}');
  const live=ctx.symbolFromSetter('_set_currentJsonTableData_ACU'),settings=ctx.symbolFromSetter('_set_settings_ACU');
- let injected=checkpointInjection+'\nconst __dshRecoveryFields=[...new Set([...'+JSON.stringify(migrationFields)+',...'+materialFields+'])];\n'+deletionInjection;
+ let injected=checkpointInjection+'\nconst __dshRecoveryFields=[...new Set([...'+JSON.stringify([...migrationFields,...originalSp129CarrierFields])+',...'+materialFields+'])];\n'+deletionInjection;
  injected=injected.replaceAll('__dshCommitSpMigrationInPlace(chat,originalChat);','__dshCommitSpMigrationInPlace(chat,originalChat,__dshRecoveryFields);').replaceAll('resetCheckpointVault_ACU','__dshResetCheckpointVault').replaceAll('currentJsonTableData_ACU',live).replaceAll('_set_'+live,'_set_currentJsonTableData_ACU').replaceAll('settings_ACU',settings).replaceAll("Object.defineProperty(api,",'Object.defineProperty('+ctx.apiName+',');
  const recoveryFields=injected.indexOf('const __dshRecoveryFields=');
  const checkpointApi=injected.indexOf('Object.defineProperty('),deletionVar=injected.indexOf('var __dshRollbackDeleting'),deletionApi=injected.indexOf('Object.defineProperty(',checkpointApi+1);

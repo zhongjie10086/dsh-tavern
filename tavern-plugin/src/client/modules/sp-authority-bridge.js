@@ -51,6 +51,10 @@ function createTavernSpAuthorityBridge(options) {
   const {confirmed}=stale;
   await queue(async()=>{if(!stale)return;try{return await publish(confirmed,call,'flush')}catch(error){status('unavailable',error);throw error}});
  }
+ function persistenceState(detail=false){
+  const checks={};let persisted=true;const check=(name,read)=>{if(!detail&&!persisted)return;const value=read();checks[name]=Boolean(value);persisted=Boolean(persisted&&value)};
+  try{const api=options.getOriginalApi();check('apiPresent',()=>api);check('ready',()=>ready);check('open',()=>!closed);check('unclaimed',()=>!claim);check('fresh',()=>!stale);check('queueEmpty',()=>!queued);check('publishingEmpty',()=>!publishing.size);check('receiptPresent',()=>lastReceipt);check('stampMatches',()=>lastStamp===stamp(api.exportTableAsJson()));check('scopeMatches',()=>lastScope===scope(api));return detail?{persisted,checks,queued,publishing:publishing.size}:persisted}catch(_){return detail?{persisted:false,checks,probeFailed:true}:false}
+ }
  return {
   connect:()=>queue(async()=>{try{const api=options.getOriginalApi();if(!api)throw new Error('SP 原包未就绪，当前仅可查看缓存。');const state=await options.call('beginTavernSpAuthority',request(await api.exportTableAsJson(),scope(api)));revision=state.revision;status(state.phase);return state}catch(error){status('unavailable',error);throw error}}),
   choose:side=>queue(async()=>{try{const choice=await options.call('chooseTavernSpAuthority',{side,lifecycle:options.lifecycle,expectedRevision:revision});revision=choice.revision??revision;if(choice.alreadyChosen)return choice;claim=choice.claimId;status('claiming');await options.importOriginal(choice.importToOriginal);return await publish(false,options.call,'choose')}catch(error){status('unavailable',error);throw error}}),
@@ -70,7 +74,8 @@ function createTavernSpAuthorityBridge(options) {
   note,
   trace:()=>trace,
   getState:()=>({ready,revision,claim,closed,stale:Boolean(stale)}),
-  isPersisted:()=>{try{const api=options.getOriginalApi();return Boolean(api&&ready&&!closed&&!claim&&!stale&&!queued&&!publishing.size&&lastReceipt&&lastStamp===stamp(api.exportTableAsJson())&&lastScope===scope(api));}catch(_){return false;}},
+  isPersisted:()=>persistenceState(),
+  persistenceDiagnostics:()=>persistenceState(true),
   close:()=>{closed=true;status('closed')}
  };
 }
@@ -156,7 +161,7 @@ async function connectTavernSpSingleAuthority(win,options,nativeDatabase,descrip
  // the fault and the repair waits for the game's page, which has no such
  // budget. Returns whether the tables changed, so the caller publishes them.
  async function repairHiddenColumns(){
-  let dropped=[],left=[],failure='';const started=Date.now(),deferred=options.background===true;
+  let dropped=[],left=[],failure='';const started=Date.now(),deferred=options.background===true&&options.persistentOwner!==true;
   try{
    const template=structuredClone(project(api.exportTableAsJson()));({dropped,left}=dropGhostHiddenColumns(template));
    if(dropped.length&&!deferred){
@@ -231,7 +236,12 @@ async function connectTavernSpSingleAuthority(win,options,nativeDatabase,descrip
  // `awaitOriginalWork` is false only for an ordinary event on a visible page: the
  // original's deferred table fill then stays parallel to the next send.
  win.__dshFlushOriginalDatabase=async({retry=false,recoveryCall,awaitOriginalWork=true}={})=>{if(awaitOriginalWork)await api.__dshFlushPendingWork?.();if(retry){if(hydration)throw Error('SP 原包正在加载本局表格，当前仅可查看缓存。');const failedHydration=hydrationFailure;hydrationFailure=null;await bridge.publish(true,recoveryCall,failedHydration?'hydration':'retry')}await bridge.flush({settle:awaitOriginalWork,call:recoveryCall});await options.flushSettings?.(recoveryCall);};
- Object.defineProperty(win,'__dshOriginalDatabaseIsPersisted',{value:()=>{try{return connected&&!internal&&!hydration&&!hydrationFailure&&!state.retired&&state.ready===true&&win.AutoCardUpdaterAPI===api&&Number(options.context().lifecycleRevision)===lifecycle&&api.__dshIsPersistenceIdle?.()===true&&bridge.isPersisted();}catch(_){return false;}}});
+ function originalPersistenceState(detail=false){
+  const checks={};let persisted=true;const check=(name,read)=>{if(!detail&&!persisted)return;const value=read();checks[name]=Boolean(value);persisted=Boolean(persisted&&value)};
+  try{check('connected',()=>connected);check('external',()=>!internal);check('hydrationIdle',()=>!hydration);check('hydrationHealthy',()=>!hydrationFailure);check('active',()=>!state.retired);check('ready',()=>state.ready===true);check('apiMatches',()=>win.AutoCardUpdaterAPI===api);check('lifecycleMatches',()=>Number(options.context().lifecycleRevision)===lifecycle);check('coreIdle',()=>api.__dshIsPersistenceIdle?.()===true);check('authorityPersisted',()=>bridge.isPersisted());return detail?{epoch:Date.now(),persisted,checks,core:api.__dshPersistenceDiagnostics?.(),authority:bridge.persistenceDiagnostics()}:persisted}catch(_){return detail?{epoch:Date.now(),persisted:false,checks,probeFailed:true}:false}
+ }
+ Object.defineProperty(win,'__dshOriginalDatabaseIsPersisted',{value:()=>originalPersistenceState()});
+ Object.defineProperty(win,'__dshOriginalDatabasePersistenceDiagnostics',{value:()=>originalPersistenceState(true)});
  const initial=await bridge.connect();connected=true;
  if(initial.phase==='choice'||initial.phase==='claiming'){
   conflictPanel=win.document.createElement('section');conflictPanel.setAttribute('role','alert');conflictPanel.style.cssText='position:fixed;inset:12px 12px auto;z-index:2147483647;background:Canvas;color:CanvasText;padding:16px;border:1px solid #b88';
@@ -247,7 +257,14 @@ async function connectTavernSpSingleAuthority(win,options,nativeDatabase,descrip
  win.__dshOriginalDatabaseCatalogChanged=()=>{const names=api.getTemplatePresetNames?.()||[],signature=JSON.stringify(names);if(signature!==announced){announced=signature;options.post?.({type:'dsh-tavern-original-database-ready',ready:state.ready===true,names})}};
  win.__dshOriginalDatabaseCommand=async operation=>{
   if(operation.kind==='list')return {success:true,names:api.getTemplatePresetNames?.()||[]};
+  if(operation.kind==='zero-stop'){if(state.retired||win.AutoCardUpdaterAPI!==api||Number(options.context().lifecycleRevision)!==lifecycle)throw Error('零层实例已变化，停止已取消');api.stopZeroLayer();return {stopped:true}}
   if(hydration||hydrationFailure||state.retired||win.AutoCardUpdaterAPI!==api||Number(options.context().lifecycleRevision)!==lifecycle)throw Error('SP 原包正在加载本局表格、加载失败或所属实例已变化，当前仅可查看缓存。');
+  if(operation.kind==='zero-input'){
+   const carrier=win.SillyTavern.getContext().chat.find(row=>Object.hasOwn(row,'_acu_zero_layer_v1'))?._acu_zero_layer_v1;
+   if(!carrier?.enabled||carrier.exitManifest)throw Error('零层未启用或退出尚未完成，输入已保留');
+   const result=await api.submitZeroLayerInput(operation.text);await options.flushSettings?.();return result;
+  }
+  if(operation.kind==='zero-read')return operation.method==='history'?api.zeroLayer.readHistory(operation.query):api.zeroLayer.getSnapshot(operation.query);
   const result=await bridge.mutate(operation);await options.flushSettings?.();win.__dshOriginalDatabaseCatalogChanged();
   const {database}=await options.call('getSpDatabase');return {...result,names:api.getTemplatePresetNames?.()||[],database};
  };

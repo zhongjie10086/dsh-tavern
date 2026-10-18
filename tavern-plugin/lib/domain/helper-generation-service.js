@@ -1,5 +1,7 @@
+import {projectTemplateMessages,restoreTemplateMessages} from './full-prompt-template-request.js'
+import {projectFullPromptTemplateState,applyFullPromptTemplateState} from './full-prompt-template-state.js'
 import { randomUUID } from 'node:crypto'
-import { generateHelperRaw } from './helper-generation.js'
+import { generateHelperRaw, compileHelperGeneration, helperWireMessages } from './helper-generation.js'
 import { mainGenerationSampling } from './preset-sampling.js'
 import { safeOutboundFetch, readBoundedResponse, validateCustomModelFields } from './outbound-network-policy.js'
 import {readJsonEventStream} from './json-event-stream.js'
@@ -15,7 +17,7 @@ export async function callHelperCustomApi(options, fetcher, network = {}) {
   const api = options.customApi || {}, key = String(api.key || '')
   if (!String(api.model || '').trim()) throw new Error('请填写自定义 API 模型')
   if (api.source && !['openai', 'custom', 'deepseek', 'mistralai'].includes(api.source)) throw new Error('此独立连接需要 OpenAI 兼容接口：' + api.source)
-  const messages = [...(options.system ? [{role:'system',content:[{type:'text',text:options.system}]}] : []),...options.messages].map(m => ({ role: m.role, content: m.content.map(part => part.type === 'image' ? { type: 'image_url', image_url: { url: part.url } } : { type: 'text', text: part.text }) }))
+  const messages = helperWireMessages([...(options.system ? [{role:'system',content:[{type:'text',text:options.system}]}] : []),...options.messages])
   const body = { model: api.model, messages, stream: true }
   for (const field of ['max_tokens', 'temperature', 'frequency_penalty', 'presence_penalty', 'top_p', 'top_k']) if (typeof api[field] === 'number') body[field] = api[field]
   if (options.tools) { body.tools = options.tools; body.tool_choice = options.toolChoice || 'auto' }
@@ -52,7 +54,46 @@ export async function callHelperCustomApi(options, fetcher, network = {}) {
   if (!text.trim()) throw new Error('自定义 API 返回为空')
   return text
 }
-export function createHelperGenerationService({ context, callModel, selection, fetcher, lookup, allowedModelOrigins, networkPolicy=async()=>({}), store, assertOwner = async () => {}, scope, admitBackground = async () => {} }) {
+// Only SP's quiet capture needs OpenAI-compatible history. Resolve host-owned
+// images through the attachment service; never expose an unreadable reference.
+export async function spQuietHistory(projected,sources,readImage){
+ const originals=sources.filter(row=>row&&typeof row==='object');
+ return Promise.all(projected.map(async(row,index)=>{
+  const parts=[{type:'text',text:row.message}];
+  for(const part of originals[index]?.inputAttachments||[]){
+   if(part?.type==='text')continue;
+   if(part?.type!=='image')throw new Error('SP 正文上下文不支持此历史附件类型');
+   if(part.attachment){
+    const image=await readImage(part.attachment),mediaType=part.attachment.mediaType;
+    if(!/^image\/(png|jpeg|webp|gif)$/.test(mediaType)||!image?.data)throw new Error('历史图片不可读取');
+    parts.push({type:'image',url:'data:'+mediaType+';base64,'+Buffer.from(image.data).toString('base64')});
+   }else if(typeof part.url==='string')parts.push(structuredClone(part));
+   else throw new Error('历史图片缺少有效引用');
+  }
+  return {role:row.role,...(parts.length>1?{content:parts}:{text:row.message})};
+ }));
+}
+// The same full-template stage/commit protocol as native history: evaluate before
+// mutable prompt events, but publish staged persistence only at actual dispatch.
+export function createSpQuietTemplatePreparation({readChat,enabled,stage,update,flush,envelope,serviceContext,assertOwner}){
+ return async(sessionId,messages,{scriptId,lifecycleRevision})=>{
+  const chat=await readChat(sessionId);
+  if(!await enabled(chat,{texts:messages.flatMap(row=>row.content.filter(part=>part.type==='text').map(part=>part.text))}))return {messages};
+  const staged=await stage(chat,{kind:'request',type:'quiet',messages:projectTemplateMessages(messages)},{envelope:await envelope(sessionId,chat),serviceContext:await serviceContext(sessionId,chat)});
+  const state=projectFullPromptTemplateState(staged.chat),baseEffects=JSON.stringify(chat.fullPromptTemplateEffects||[]);
+  return {messages:restoreTemplateMessages(messages,staged.result.messages),commit:async()=>{
+   await assertOwner(sessionId,scriptId,lifecycleRevision);
+   await update(chat.id,current=>{
+    if(JSON.stringify(current.fullPromptTemplateEffects||[])!==baseEffects)throw new Error('模板副作用队列已变化，请重新准备零层请求');
+    const next=applyFullPromptTemplateState(current,chat,state);
+    next.fullPromptTemplateEffects=structuredClone(staged.chat.fullPromptTemplateEffects||[]);return next;
+   },{source:'sp-quiet.template-request'});
+   await flush(sessionId);
+  }};
+ };
+}
+export function createHelperGenerationService({ context, callModel, selection, fetcher, lookup, allowedModelOrigins, networkPolicy=async()=>({}), store, assertOwner = async () => {}, scope, admitBackground = async () => {}, prepareSpQuietTemplate = async (_sessionId,messages) => ({messages}) }) {
+  const quietPreparations = new Map();
   const jobs = new Map(), journalFile = 'helper-generation-jobs.json'
   let disposed = false
   async function remember(job, admission = false) {
@@ -97,7 +138,7 @@ export function createHelperGenerationService({ context, callModel, selection, f
       throw error
     }
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(300000)])
-    job.promise = Promise.resolve().then(() => generateHelperRaw(config, { ...state, raw, sessionId, signal, onDelta: delta => {
+    job.promise = Promise.resolve().then(() => generateHelperRaw(config, { ...state, raw, contentParts:exactMessages&&scriptId==='extension-sp-database',nativeTools:exactMessages&&scriptId==='extension-sp-database', sessionId, signal, onDelta: delta => {
       signal.throwIfAborted()
       if (typeof delta !== 'string' || job.bytes + Buffer.byteLength(delta) > 8000000) { controller.abort(new Error('生成结果超过 8MB')); signal.throwIfAborted() }
       job.bytes += Buffer.byteLength(delta); job.text += delta
@@ -176,5 +217,60 @@ export function createHelperGenerationService({ context, callModel, selection, f
     }
     return {status:job?.settled?job.status:job?'running':'interrupted',result:job?.settled?job.result:undefined,error:job?.error,notice:'这里保存的是模型返回值，不代表脚本后续写入已经完成。核对不会重新请求模型或自动写入剧情。'}
   }
-  return { start, poll, stop, stopSession, models, list, recovery, completeEvent, busy(scriptId,sessionId){return [...jobs.values()].some(job=>!job.settled&&(!scriptId||job.owner.endsWith(':'+scriptId))&&(!sessionId||job.owner.startsWith(sessionId+':')))}, dispose() { disposed = true; for (const job of jobs.values()) job.controller.abort(); jobs.clear() } }
+  async function quietOwner(sessionId,scriptId,lifecycleRevision){
+    if(disposed)throw new Error('脚本模型服务已停止');
+    if(scriptId!=='extension-sp-database')throw new Error('零层提示词准备仅用于原数据库');
+    await assertOwner(sessionId,scriptId,lifecycleRevision);
+  }
+  async function prepareSpQuiet(sessionId,quietPrompt,scriptId,lifecycleRevision){
+    await quietOwner(sessionId,scriptId,lifecycleRevision);
+    if(typeof quietPrompt!=='string')throw new Error('quiet_prompt 必须是字符串');
+    for(const [id,row]of quietPreparations)if(row.status!=='running'&&Date.now()-row.at>120000)quietPreparations.delete(id);
+    if(quietPreparations.size>=64)throw new Error('零层准备过多，请处理已有请求');
+    const preparedScope=await scope?.(sessionId,{scriptId,background:false});
+    const state=await context(sessionId,{user_input:quietPrompt},scriptId,lifecycleRevision,{spQuiet:true});
+    const compiled=compileHelperGeneration({user_input:quietPrompt},{...state,raw:false,contentParts:true});
+    const staged=await prepareSpQuietTemplate(sessionId,compiled.messages,{scriptId,lifecycleRevision});
+    await quietOwner(sessionId,scriptId,lifecycleRevision);
+    const currentScope=await scope?.(sessionId,{scriptId,background:false,anchor:preparedScope});
+    if(preparedScope&&!sameHelperGenerationScope(preparedScope,currentScope))throw new Error('零层上下文准备期间剧情已变化');
+    const id=randomUUID(),owner=sessionId+':'+scriptId;
+    const row={id,owner,lifecycleRevision,at:Date.now(),status:'prepared',runtimeId:'sp-quiet:'+id,scope:preparedScope,staged,consume:state.consumePrompts};
+    quietPreparations.set(id,row);
+    return {id,messages:staged.messages.map(message=>({role:message.role,content:message.content.length===1&&message.content[0].type==='text'?message.content[0].text:message.content.map(part=>part.type==='image'?{type:'image_url',image_url:{url:part.url}}:structuredClone(part))}))};
+  }
+  async function quietPreparation(sessionId,id,scriptId,lifecycleRevision){
+    await quietOwner(sessionId,scriptId,lifecycleRevision);
+    const row=quietPreparations.get(id);
+    if(!row||row.owner!==sessionId+':'+scriptId||row.lifecycleRevision!==lifecycleRevision)throw new Error('零层准备已过期，不能重发');
+    const current=await scope?.(sessionId,{scriptId,background:false,anchor:row.scope});
+    if(row.scope&&!sameHelperGenerationScope(row.scope,current))throw new Error('零层准备归属已变化，不能发送');
+    return row;
+  }
+  async function dispatchSpQuiet(sessionId,id,scriptId,lifecycleRevision){
+    const row=await quietPreparation(sessionId,id,scriptId,lifecycleRevision);
+    if(row.status!=='prepared')throw new Error('零层准备已经尝试发送，不能重发');
+    row.status='running';
+    try{await remember(row,true);await row.staged.commit?.();await quietPreparation(sessionId,id,scriptId,lifecycleRevision)}
+    catch(error){row.status='failed';row.at=Date.now();await remember(row);throw error}
+    return {id:row.id};
+  }
+  async function completeSpQuiet(sessionId,id,scriptId,lifecycleRevision,failed,attempted=true){
+    let row;
+    try{row=await quietPreparation(sessionId,id,scriptId,lifecycleRevision)}
+    catch(error){
+      const pending=quietPreparations.get(id);
+      if(pending?.owner===sessionId+':'+scriptId&&pending.lifecycleRevision===lifecycleRevision&&pending.status==='running'){
+        pending.status='interrupted';pending.at=Date.now();await remember(pending);
+      }
+      throw error;
+    }
+    if(row.status!=='running')throw new Error('零层请求没有待确认的实际调用');
+    row.status='settling';
+    try{if(attempted)await row.consume?.();row.status=attempted?(failed?'failed':'completed'):'cancelled';row.received=true}
+    catch(error){row.status='interrupted';throw error}
+    finally{row.at=Date.now();await remember(row)}
+    return {completed:true};
+  }
+  return { prepareSpQuiet, dispatchSpQuiet, completeSpQuiet, start, poll, stop, stopSession, models, list, recovery, completeEvent, busy(scriptId,sessionId){return [...jobs.values()].some(job=>!job.settled&&(!scriptId||job.owner.endsWith(':'+scriptId))&&(!sessionId||job.owner.startsWith(sessionId+':')))}, dispose() { disposed = true; quietPreparations.clear(); for (const job of jobs.values()) job.controller.abort(); jobs.clear() } }
 }

@@ -1,3 +1,4 @@
+import {applyWorldSimulationProjection} from './sp-world-simulation-projection.js'
 import {cardMvuContextIdentity} from './card-mvu-work-identity.js'
 import { resourceSaveSummary, observeResourceSave } from './resource-save-summary.js'
 import { templateInputView, persistTemplateInputView } from './full-prompt-template-input.js'
@@ -396,10 +397,11 @@ export function createTavernScriptHostAdapter(options = {}) {
     })
   }
 
-  async function saveChatData(sessionId, request, eventId) {
+  async function saveChatData(sessionId, request, eventId, scriptId) {
     const validation=request?.reload===true?{...request}:request
     if(request?.reload===true)delete validation.reload
     const revisions = validateChatPluginRequest(validation)
+    if(request.worldSimulationProjection){if(scriptId!=='extension-sp-database'||!options.assertSp129ProjectionOwner)throw Error('正文投影仅允许固定原版 SP');await options.assertSp129ProjectionOwner(sessionId,scriptId,request.lifecycleRevision)}
     const chat = await resolveChat(sessionId)
     await assertScriptEnabled(chat)
     if (chat.id !== request.chatId) throw new Error('聊天已切换，插件数据未保存')
@@ -414,13 +416,34 @@ export function createTavernScriptHostAdapter(options = {}) {
     // this request; historical revisions still pass through retention checks.
     const baselines = new Map(await Promise.all(revisions.map(async revision => [revision,
       revision === chat._storageRevision ? chat : await options.readChatRevision(chat.id, revision)])))
-    const saved = await options.updateChat(chat.id, async function (latest) {
+    const mutate = async function (latest) {
       await assertScriptEnabled(latest)
       if (latest.sessionId && str(latest.sessionId) !== str(sessionId)) throw new Error('聊天绑定已变化，插件数据未保存')
-      return applyChatPluginData(latest, baselines, request)
-    }, { source: 'tavern-helper.chat-plugin-data' })
+      const currentView = templateInputView(latest)
+      const projectedBaselines = new Map([...baselines].map(([revision, baseline]) => {
+        const view = templateInputView(baseline)
+        if (view.input && request.messages.some(row => row.stateRevision === revision && row.message_id === view.input.floor)
+          && (!currentView.input || currentView.input.operationId !== view.input.operationId
+            || currentView.input.branchId !== view.input.branchId || currentView.input.lifecycleRevision !== view.input.lifecycleRevision)) {
+          throw new Error('正在发送的输入身份已变化，插件数据未保存')
+        }
+        return [revision, view.chat]
+      }))
+      if(request.worldSimulationProjection)await options.assertSp129ProjectionOwner(sessionId,scriptId,request.lifecycleRevision)
+      const merged=applyChatPluginData(currentView.chat, projectedBaselines, request)
+      return persistTemplateInputView(applyWorldSimulationProjection(currentView.chat,merged,projectedBaselines,request), currentView.input)
+    }
+    let saved
+    if(request.worldSimulationProjection){
+      if(!options.history?.mutate)throw Error('推演正文投影未连接原生历史事务')
+      const result=await options.history.mutate(chat,async draft=>{const merged=await mutate(draft);for(const key of Object.keys(draft))if(!Object.hasOwn(merged,key))delete draft[key];Object.assign(draft,merged);return [request.worldSimulationProjection.message_id]},{template:false,preserveTimeline:true})
+      saved=result.chat
+    }else{
+      if(chat.nativeHistoryEdit)throw Error('原生历史保存等待恢复，插件数据未保存')
+      saved=await options.updateChat(chat.id,mutate,{source:'tavern-helper.chat-plugin-data'})
+    }
     if (!saved) throw new Error('聊天已不存在，插件数据未保存')
-    return { updated: true, context: projectTavernHelperContext(saved) }
+    return { updated: true, context: projectTavernHelperContext(templateInputView(saved).chat) }
   }
 
   function assertTemplateChat(chat) {

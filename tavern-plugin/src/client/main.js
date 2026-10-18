@@ -122,6 +122,7 @@ window.__ModuleLoader__.load({
 		// @include modules/sp-companion.js
 		// @include modules/sp-advanced.js
 		// @include modules/script-generation-bridge.js
+        // @include modules/sp-host-generation.js
 // @include modules/script-storage-bridge.js
 // @include modules/script-file-bridge.js
 // @include modules/slash-syntax.cjs
@@ -1540,6 +1541,9 @@ window.__ModuleLoader__.load({
 
 		// @include modules/status-display-refresh.js
 		// @include modules/displayed-message.js
+        // @include modules/sp-live-surfaces.js
+        // @include modules/sp-remote-surface.js
+        const tavernSpLiveSurfaces=createTavernSpLiveSurfaces();
 		const tavernDisplayedMessages = createTavernDisplayedMessageRegistry({MutationObserver:window.MutationObserver,reportError:error=>tavernErrorHub.report('正文显示改写',error)});
 		window.__dshTavernRetrieveDisplayedMessage = (caller,id) => tavernDisplayedMessages.retrieve(caller,id);
 		function installTavernStatusRefresh(token, staticDisplay) {
@@ -2163,19 +2167,48 @@ window.__ModuleLoader__.load({
 			let chat = [], metadata = {}, rows = [], metadataBase = {}, metadataRevision = 0;
 			let binding = "", chatId = "", lifecycleRevision = 0, lastRevision = -1;
 			let tail = Promise.resolve(), saving = false, deferred = null, pendingSaves=0, failedSave=false;
+            const historyUpdates = new Set();
+            function historyUpdate(work) {
+                const receipt=Promise.resolve().then(work);historyUpdates.add(receipt);
+                receipt.then(()=>historyUpdates.delete(receipt),()=>historyUpdates.delete(receipt));
+                return receipt;
+            }
 			function reportSave(){try{options.onSaveState?.({pending:pendingSaves,failed:failedSave?1:0});}catch(_) {}}
 			function keyOf(value) { return String(value.chatId || "") + ":" + Number(value.lifecycleRevision || 0); }
 			function set(target, key, value) {
 				Object.defineProperty(target, key, { value: copy(value), writable: true, configurable: true, enumerable: true });
 			}
+            // Original SP retains frozen evidence/scope snapshots inside writable
+            // chat data. Equal snapshots need no writes; changed readonly branches
+            // get detached replacements, keeping the old snapshot and its integrity.
+            function detachedView(source, previous) {
+                const next=copy(source);
+                function integrity(value, prior) {
+                    if(!value||!prior||typeof value!=='object'||typeof prior!=='object')return;
+                    for(const key of Object.keys(value))if(own(prior,key)){
+                        integrity(value[key],prior[key]);
+                        const descriptor=Object.getOwnPropertyDescriptor(prior,key);
+                        if(descriptor&&'value' in descriptor&&(!descriptor.writable||!descriptor.configurable))Object.defineProperty(value,key,{value:value[key],writable:descriptor.writable,configurable:descriptor.configurable,enumerable:true});
+                    }
+                    if(Object.isFrozen(prior))Object.freeze(value);
+                    else if(Object.isSealed(prior))Object.seal(value);
+                    else if(!Object.isExtensible(prior))Object.preventExtensions(value);
+                }
+                integrity(next,previous);return next;
+            }
+            function putView(target,key,value){Object.defineProperty(target,key,{value,writable:true,configurable:true,enumerable:true});}
 			function reconcile(target, source) {
+                const readonly=!Object.isExtensible(target)||Object.keys(target).some(key=>{const d=Object.getOwnPropertyDescriptor(target,key);return !d.configurable||!('value' in d)||!d.writable});
+                if(readonly)return same(target,source)?target:detachedView(source,target);
 				for (const key of Object.keys(target)) if (!own(source, key)) delete target[key];
 				for (const key of Object.keys(source)) {
 					const a = own(target, key) ? target[key] : undefined, b = source[key];
 					if (a && b && typeof a === "object" && typeof b === "object" && Array.isArray(a) === Array.isArray(b)) {
-						reconcile(a, b); if (Array.isArray(a)) a.length = b.length;
+                        const next=reconcile(a,b);if(next!==a)putView(target,key,next);
 					} else set(target, key, b);
 				}
+                if(Array.isArray(target))target.length=source.length;
+                return target;
 			}
 			const opaque = new Set(['id','is_hidden','extra','swipes_info']);
 			function pluginData(value, base = {}) {
@@ -2189,7 +2222,7 @@ window.__ModuleLoader__.load({
 					if (own(target, key) !== own(base, key) || !same(target[key], base[key])) continue;
 					if (!own(remote, key)) delete target[key];
 					else if (target[key] && remote[key] && typeof target[key] === "object" && typeof remote[key] === "object" && Array.isArray(target[key]) === Array.isArray(remote[key])) {
-						reconcile(target[key], remote[key]); if (Array.isArray(target[key])) target[key].length = remote[key].length;
+						const next=reconcile(target[key], remote[key]);if(next!==target[key])putView(target,key,next);
 					} else set(target, key, remote[key]);
 				}
 			}
@@ -2250,7 +2283,7 @@ window.__ModuleLoader__.load({
 				const nextRows = (value.messages || []).map(function (message, index) {
 					const core = coreOf(message), remote = copy(message.pluginData || {});
 					let row = rows[index];
-					if (!row || !same(identity(row.core), identity(core))) {
+					if (!row || !same(identity(row.core), identity(core)) && acknowledged?.worldSimulationProjection?.message_id!==core.message_id) {
 						const view = copy(remote); for (const key of Object.keys(core)) set(view, key, core[key]);
                         const created = { view: view, core: core, base: remote, revision: revision };
                         renewCopy(created); return created;
@@ -2280,16 +2313,25 @@ window.__ModuleLoader__.load({
                     throw new Error("saveChat 不支持新增、删除、替换或重排历史消息");
                 }
 				const messages = [];
+                let worldSimulationProjection;
 				for (const row of rows) {
+                    const changedBody=!same(row.view.mes,row.core.mes)||!same(row.view.message,row.core.message)||!same(row.view.swipes,row.core.swipes);
+                    if(changedBody){
+                        const desired=row.view.mes!==row.core.mes?row.view.mes:row.view.message,swipe=row.core.swipe_id||0,expected=copy(row.core.swipes);expected[swipe]=desired;
+                        if(worldSimulationProjection||row.core.role!=="assistant"||typeof desired!=="string"||!same(row.view.swipes,expected)||![row.core.message,desired].includes(row.view.message)||![row.core.mes,desired].includes(row.view.mes))throw Error("saveChat 不支持任意正文或消息版本修改");
+                        worldSimulationProjection={message_id:row.core.message_id,stateRevision:row.revision,message:desired};
+                    }
                     if (!own(row.view, copyMarker) || row.view[copyMarker] !== row.generation) throw staleCopy();
 					for (const key of reserved) {
 						const baseline=opaque.has(key)&&!own(row.core,key)?row.base:row.core;
-						if (own(row.view,key)!==own(baseline,key)||!same(row.view[key],baseline[key])) throw new Error("saveChat 只保存插件数据，不支持修改正文、身份或消息版本: " + key);
+						if (changedBody && ["mes","message","swipes"].includes(key)) continue;
+                        if (own(row.view,key)!==own(baseline,key)||!same(row.view[key],baseline[key])) throw new Error("saveChat 只保存插件数据，不支持修改正文、身份或消息版本: " + key);
 					}
 					const data = pluginData(row.view, row.base);
 					if (!same(data, row.base)) messages.push({ message_id: row.core.message_id, stateRevision: row.revision, data: data });
 				}
 				const result = { chatId: chatId, lifecycleRevision: lifecycleRevision, messages: messages };
+                if(worldSimulationProjection){if(!rows.some(row=>row.view._qrf_world_simulation?.task?.status==="completed"))throw Error("saveChat 只支持原推演联合提交的正文投影");result.worldSimulationProjection=worldSimulationProjection;}
 				if (!same(metadata, metadataBase)) result.metadata = { stateRevision: metadataRevision, data: copy(metadata) };
 				return result;
 			}
@@ -2297,9 +2339,10 @@ window.__ModuleLoader__.load({
 				const requestedBinding = binding;
 				pendingSaves++;reportSave();
 				const task = tail.catch(function () {}).then(async function () {
+					while(historyUpdates.size)await Promise.all([...historyUpdates]);
 					if (binding !== requestedBinding) throw new Error("聊天已切换，已取消旧聊天的排队保存");
 					const submitted = snapshot();
-					if (!submitted.messages.length && !submitted.metadata) return;
+					if (!submitted.messages.length && !submitted.metadata && !submitted.worldSimulationProjection) return;
 					saving = true;
 					try {
 						const result = await retryRequest("saveTavernChatData", { request: submitted });
@@ -2338,10 +2381,10 @@ window.__ModuleLoader__.load({
 			}
 			sync(options.context());
 			function isPersisted(){try{
-                if(!binding||binding!==keyOf(options.context())||saving||deferred||pendingSaves||failedSave||copyConflict||markerCollision||dirty())return false;
+                if(!binding||binding!==keyOf(options.context())||saving||deferred||pendingSaves||historyUpdates.size||failedSave||copyConflict||markerCollision||dirty())return false;
                 return rows.every(row=>own(row.view,copyMarker)&&row.view[copyMarker]===row.generation&&[...reserved].every(key=>{const base=opaque.has(key)&&!own(row.core,key)?row.base:row.core;return own(row.view,key)===own(base,key)&&same(row.view[key],base[key]);}));
             }catch(_){return false;}}
-            return { isPersisted:isPersisted,sync: sync, save: () => save(), retry: retryRequest => save(retryRequest), reload: reload, flush:()=>tail, failed:()=>failedSave, updateMetadata: updateMetadata, chat: () => chat, metadata: () => metadata };
+            return { historyUpdate:historyUpdate,isPersisted:isPersisted,sync: sync, save: () => save(), retry: retryRequest => save(retryRequest), reload: reload, flush:()=>tail, failed:()=>failedSave, updateMetadata: updateMetadata, chat: () => chat, metadata: () => metadata };
 		}
 
 		function installTavernCompatibilityDiagnostics(options) {
@@ -2359,6 +2402,10 @@ window.__ModuleLoader__.load({
 					options.post({ type: "dsh-tavern-helper-compatibility", scriptId: scriptId, capabilityId: entry.id, count: count, argumentTypes: argumentTypes });
 				}
 				if (entry.policy === "missing") {
+					// A stale host catalog must never replace an installed capability.
+					// Inspect descriptors without invoking plugin getters during installation.
+					const installed = Object.getOwnPropertyDescriptor(target, entry.name);
+					if (installed && (installed.get || installed.value !== undefined)) continue;
 					// Preserve typeof-based fallbacks. This records a lookup, never a successful call.
 					Object.defineProperty(target, entry.name, { configurable: true, get: function () { record([]); return undefined; },
 						set: function (value) { Object.defineProperty(target, entry.name, { value: value, configurable: true, writable: true }); } });
@@ -2579,6 +2626,17 @@ window.__ModuleLoader__.load({
 					if (type === "confirm" && legacyCleanup) return Promise.resolve(0);
 					return new HelperPopup(content, type, title, options).show();
 				},
+                // Original SP calls this through SillyTavern.getContext(), while
+                // Helper exposes the same authenticated history update on window.
+                setChatMessages: function (patches, option) {
+                    if (!Array.isArray(patches)) throw new TypeError('消息更新必须是数组');
+                    const normalized = copy(patches);
+                    for (const patch of normalized) if (patch && Object.prototype.hasOwnProperty.call(patch, 'mes')) {
+                        if (Object.prototype.hasOwnProperty.call(patch, 'message') && patch.message !== patch.mes) throw new Error('消息正文别名不一致');
+                        patch.message = patch.mes; delete patch.mes;
+                    }
+                    return window.setChatMessages(normalized, option);
+                },
 				saveChat: chatData.save,
 				reloadCurrentChat: chatData.reload,
 				saveMetadata: chatData.save,
@@ -2599,6 +2657,7 @@ window.__ModuleLoader__.load({
 				chatMetadata: { enumerable: true, get: chatData.metadata },
 				name2: { enumerable: true, get: function () { return String(context().characterName || "角色"); } }
 			});
+            options.installSpHostGeneration?.(window, sillyTavern, {context,request:call,owner:options.generationOwner,track:options.trackGeneration});
 			options.installCompatibility({ catalog: context().compatibilityCapabilities, surfaces: { TavernHelper: helper, SillyTavern: sillyTavern }, window: window, currentScript: options.currentScript, post: options.post });
 			window.SillyTavern = Object.freeze(sillyTavern);
 			window.getContext = sillyTavern.getContext;
@@ -2623,7 +2682,7 @@ window.__ModuleLoader__.load({
 			// attempt can fail the caller, an old failure is never rethrown forever.
 			async function settleSettings(retryCall){await settingsTail.catch(function(){});if(settingsFailed)await saveExtensionSettings(retryCall);}
 			async function settleChat(retryCall){await chatData.flush().catch(function(){});if(chatData.failed())await (retryCall?chatData.retry(retryCall):chatData.save());}
-			return { isPersisted:isPersisted,retry:flushAll,sync: chatData.sync, flushSettings: settleSettings,flush:retryCall=>Promise.all([settleChat(retryCall),settleSettings(retryCall)]) };
+			return { historyUpdate:chatData.historyUpdate,isPersisted:isPersisted,retry:flushAll,sync: chatData.sync, flushSettings: settleSettings,flush:retryCall=>Promise.all([settleChat(retryCall),settleSettings(retryCall)]) };
 		}
 
         // Bounded, value-free timings shared by every card's initialization.
@@ -2765,7 +2824,11 @@ window.__ModuleLoader__.load({
 					const run = async function () {
 						const previousEventId = activeHostEventId,previousEventName=activeHostEventName;
                         const eventBody=window.document&&window.document.body, previousInert=eventBody&&eventBody.inert;
-                        if(eventBody)eventBody.inert=true;
+                        // Visible SP listeners may await a foreground turn; their real stop UI
+                        // must remain usable. Hydration and retirement still lock the realm,
+                        // and other extensions retain their existing event synchronization.
+                        const lockEventBody=window.__dshOriginalExtensionState?.id!=="sp-database"||metadata.background===true&&metadata.persistentOwner!==true||data.name==="CHAT_CHANGED"||data.name==="DSH_SP_DRAIN";
+                        if(eventBody&&lockEventBody)eventBody.inert=true;
 						activeHostEventId = String(data.eventId || "");activeHostEventName=String(data.name||"");
                         let finishOriginalHydration,originalHydrationError,awaitOriginalStartup=false;
 						try {
@@ -2812,7 +2875,7 @@ window.__ModuleLoader__.load({
                                 // deferred work and prove its persistence, or fail. A visible page
                                 // stays alive: a table fill must not hold the next send, and a
                                 // failed save is reported and retried instead of failing the event.
-                                const releasing=metadata.background===true||data.name==="DSH_SP_DRAIN";
+                                const releasing=metadata.background===true&&metadata.persistentOwner!==true||data.name==="DSH_SP_DRAIN";
                                 const persistOriginal=async function(){
                                     if(retry)await facade?.retry(recoveryCall);
                                     if(!data.reentrantParentId)await window.__dshFlushOriginalDatabase?.({retry,recoveryCall,awaitOriginalWork:releasing});
@@ -2825,7 +2888,7 @@ window.__ModuleLoader__.load({
                                 await transport.drainEvent(String(data.eventId||''));
                             }
                             catch(error) { if(!finishOriginalHydration||!originalHydrationError)throw error;console.error(error); }
-                            finally { activeHostEventId = previousEventId;activeHostEventName=previousEventName; if(eventBody)eventBody.inert=previousInert; }
+                            finally { activeHostEventId = previousEventId;activeHostEventName=previousEventName; if(eventBody&&lockEventBody)eventBody.inert=previousInert; }
                         }
 					};
 					// A listener may await a different event emitted by a companion. Only
@@ -3083,7 +3146,7 @@ window.__ModuleLoader__.load({
 				return copy(next);
 			};
 			window.getButtonEvent = buttonEvent;
-			window.getCharData = function () { return copy(state.character || null); };
+			window.getCharData = function () { const character = copy(state.character || null); if (character && !character.avatar) character.avatar = String(character.path || ""); return character; };
 			window.getCurrentCharacterName = function () { return String(state.characterName || state.character && state.character.name || ""); };
 			window.getCurrentMessageId = function () { throw new Error('getCurrentMessageId 只能在聊天楼层 iframe 中使用'); };
 			window.getLastMessageId = lastId;
@@ -3176,7 +3239,9 @@ window.__ModuleLoader__.load({
             }
             window.setChatMessages = async function(patches,option) {
                 const refresh=refreshOption(option),plain=copy(patches||[]);
-                const result=await call('updateTavernHelperMessages',{messages:plain});
+                // The transport synchronizes context before this receipt resolves.
+                // Release the facade barrier before refresh handlers can save.
+                const result=await facade.historyUpdate(()=>call('updateTavernHelperMessages',{messages:plain}));
                 await refreshHistory(result,refresh,'MESSAGE_UPDATED');
             };
             window.generateRaw = function(config){return call('generateTavernHelperRaw',{config:copy(config)}).then(result=>result.text);};
@@ -3228,7 +3293,7 @@ window.__ModuleLoader__.load({
 					target[parts[parts.length - 1]] = copy(value);
 				}
 				const mappings = { uid: "uid", comment: "name", enabled: "enabled", content: "content", probability: "probability", type: "strategy.type", keys: "strategy.keys", filters: "strategy.keys_secondary.keys", logic: "strategy.keys_secondary.logic", scan_depth: "strategy.scan_depth", order: "position.order", exclude_recursion: "recursion.prevent_incoming", prevent_recursion: "recursion.prevent_outgoing", sticky: "effect.sticky", cooldown: "effect.cooldown", delay: "effect.delay", group: "extra.group", display_index: "extra.displayIndex" };
-				for (const key of Object.keys(mappings)) if (Object.prototype.hasOwnProperty.call(patch, key)) set(mappings[key], patch[key]);
+				for (const key of Object.keys(mappings)) if (Object.prototype.hasOwnProperty.call(patch, key)) set(mappings[key], key === "type" && patch[key] === "keyword" ? "selective" : patch[key]);
 				for (const pair of [["case_sensitive", "caseSensitive"], ["match_whole_words", "matchWholeWords"]]) if (Object.prototype.hasOwnProperty.call(patch, pair[0])) set("extra." + pair[1], patch[pair[0]] === "same_as_global" ? null : patch[pair[0]]);
 				if (patch.depth !== undefined && patch.depth !== null) set("position.depth", patch.depth);
 				if (patch.position !== undefined) {
@@ -3374,7 +3439,8 @@ window.__ModuleLoader__.load({
 					.replace(/{{\s*user\s*}}/gi, String(state.playerName || "你"))
 					.replace(/{{\s*char\s*}}/gi, String(state.characterName || "角色"));
 			};
-			facade = modules.installFacade({ token:token,installCompatibility: modules.installCompatibility, currentScript: currentScript, post: transport.post, createChatData: modules.createChatData, window: window, copy: copy, request: call, context: function () { return state; },
+			facade = modules.installFacade({ token:token,installSpHostGeneration:modules.installSpHostGeneration,installCompatibility: modules.installCompatibility, currentScript: currentScript, post: transport.post, createChatData: modules.createChatData, window: window, copy: copy, request: call, context: function () { return state; },
+                generationOwner:()=>({scriptId:currentScript().id,lifecycleRevision:Number(state.lifecycleRevision)||0,eventId:activeHostEventId}),trackGeneration:transport.trackTask,
 				retrieveDisplayed:metadata.trustedResource===true && metadata.background!==true ? id=>parent.__dshTavernRetrieveDisplayedMessage?.(window,id) || [] : null,
 				Popup: modules.createPopup({ document: window.document, parent: parent, token: token,hostDocument:metadata.trustedHostDocument===true }) });
 			let regexSaveTimer = null;
@@ -3459,7 +3525,7 @@ window.__ModuleLoader__.load({
                 return {...helper,getWorldbook:read,replaceWorldbook:async(name,entries)=>{const expectedEntries=baselines.has(name)?copy(baselines.get(name)):await read(name);if(window._.isEqual(entries,expectedEntries))return;const saved=await call('replaceTavernHelperWorldbook',{name,entries:copy(entries),expectedEntries},owner);if(saved.worldbook)baselines.set(name,copy(saved.worldbook.entries||[]))}};
             };
             window.__dshReadIzumiBrowserCache=()=>call('tavernHelperBrowserCache',{});
-            if(metadata.requiresComposer)window.__dshTavernComposerReady=modules.installComposer(window,call,token);
+            if(metadata.requiresComposer){window.__dshTavernComposerReady=modules.installComposer(window,call,token,{owned:metadata.persistentOwner===true});if(metadata.persistentOwner===true)window.__dshOwnedComposerBridgeReady=window.__dshTavernComposerReady;}
             audioBridge=modules.installAudioBridge({window,context:()=>state,call,currentScript});
             modules.installMirror({window,token,post:transport.post});
             window.getProxyPresetNames = () => copy(state.proxyPresetNames || []);
@@ -3467,9 +3533,9 @@ window.__ModuleLoader__.load({
             modules.installGenerationBridge(window, call, events, () => ({ scriptId: currentScript().id, lifecycleRevision: Number(state.lifecycleRevision || 0), eventId: activeHostEventId }), owner => drainPromptWrites(owner.scriptId), transport.trackTask);
             scriptLibraryBridge = modules.installScriptLibraryBridge({ window, call, context: () => state, currentScript, scriptList, buttonEvent, writer: writerOrigin, recordUnverifiedWrite });
             modules.installSlash({window,call,assertSlash:modules.assertSlash,trusted:metadata.trustedResource,currentScript,publish:transport.post});
-            // Read by the projected original package: only a background instance keeps
-            // its deferred work on the ledger until the event epilogue drains it.
-            window.__dshAwaitOriginalWork=metadata.background===true;
+            // Ordinary background events drain their settled work in the epilogue.
+            // Persistent owners retain pending/errors but release successful work.
+            window.__dshAwaitOriginalWork=metadata.background===true&&metadata.persistentOwner!==true;
             Object.defineProperty(window,'__dshTavernIsPersisted',{value:()=>{try{return !activeHostEventId&&transport.isIdle()&&facade.isPersisted()&&scriptStorageBridge?.isPersisted()===true&&![...promptWritesByScript.values()].some(w=>w.pending.size||w.failures.size)&&window.__dshTavernGenerationBusy?.()!==true;}catch(_){return false;}}});
             if(unloadFetch&&metadata.spUnload){
                 window.addEventListener('pagehide',event=>{
@@ -3482,13 +3548,13 @@ window.__ModuleLoader__.load({
                     for(const participant of metadata.spUnload.participants)void unloadFetch(new Request(participant.path,{method:'POST',mode:'no-cors',credentials:'omit',keepalive:true,body:''})).catch(()=>{});
                 },{capture:true});
             }
-            modules.installExtensionHost(window,{token:metadata.token,background:metadata.background===true,post:transport.post,call,context:()=>state,flushSettings:retryCall=>facade.flushSettings(retryCall),connectSingleAuthority:modules.connectSpSingleAuthority,createAuthorityBridge:modules.createSpAuthorityBridge});
+            modules.installExtensionHost(window,{token:metadata.token,background:metadata.background===true,persistentOwner:metadata.persistentOwner===true,post:transport.post,call,captureOwner:()=>({eventId:activeHostEventId}),context:()=>state,flushSettings:retryCall=>facade.flushSettings(retryCall),connectSingleAuthority:modules.connectSpSingleAuthority,createAuthorityBridge:modules.createSpAuthorityBridge});
             modules.installGithubExtensionHost(window,{call,context:()=>state});
             databaseBridge = modules.createDatabaseBridge({ window: window, context: function () { return state; }, call: call, loadSqlCode: function () { return call("getTavernSqlCode",{}).then(function(result){return result.sqlCode;}); }, openVisualizer: function () { transport.post({ type: "dsh-tavern-helper-open-database" }); } });
             addEventListener('message',async event=>{if(event.source===parent&&event.data?.token===token&&event.data.type==='dsh-tavern-izumi-open'){if(window.__dshIzumiWasShutdown===true){await window.__dshTavernFlushScriptStorage?.();transport.post({type:'dsh-tavern-helper-reload-request'});return}window.__dshOpenIzumi?.();if(event.data.quick)window.__dshOpenIzumiQuick?.()}});
             window.__dshTavernReadScriptSource = digest => call("getTavernScriptResource", { digest }).then(result => result.content);
             const scriptTreesReady = state.scriptTreesDigest ? window.__dshTavernReadScriptSource(state.scriptTreesDigest).then(content => { state.scriptTrees = JSON.parse(content); }) : Promise.resolve();
-            window.__dshTavernHelperReady = initializationTiming.wait("dependencies", Promise.all([ready, databaseBridge.ready, scriptTreesReady,presetBridge.ready,nativePresetBridge.ready]));
+            window.__dshTavernHelperReady = initializationTiming.wait("dependencies", Promise.all([ready, databaseBridge.ready, scriptTreesReady,presetBridge.ready,nativePresetBridge.ready,metadata.persistentOwner===true?window.__dshTavernComposerReady:undefined]));
             if(typeof parent!=="undefined")parent.postMessage({type:"dsh-tavern-helper-initialization-progress",token,stage:"dependencies"},"*");
 			void window.__dshTavernHelperReady.catch(function (error) {
 				parent.postMessage({ type: "dsh-tavern-helper-bootstrap-failed", token: token, message: String(error && error.message || error || "人物卡脚本依赖加载失败") }, "*");
@@ -3916,10 +3982,11 @@ window.__ModuleLoader__.load({
 				token: String(input && input.token || ""),
 				relayEvents: input.relayEvents === true,
                 background: input.background === true,
+                persistentOwner: input.persistentOwner === true,
                 ...(input.spUnload?{spUnload:input.spUnload}:{}),
                 trustedHostDocument: input.trustedCardMode===true&&!scripts.some(s=>s.uiKind||s.originalUi),
                 trustedResource:input.trustedCardMode === true,
-                requiresComposer: input.background!==true && !input.previewScope && scripts.some(s=>s.uiKind||s.originalUi||/\b(send_textarea|send_but)\b/.test(s.content||"")),
+                requiresComposer: (input.background!==true||input.persistentOwner===true&&scripts.length===1&&scripts[0].id==='extension-sp-database') && !input.previewScope && scripts.some(s=>s.uiKind||s.originalUi||/\b(send_textarea|send_but)\b/.test(s.content||"")),
 				officialMvu: input.officialMvu === true || scripts.some(function (script) { return script && ["official-mvu", "card-mvu"].includes(script.system); }),
                 mvuCoreId: input.mvuCoreId || scripts.find(script => ["official-mvu", "card-mvu"].includes(script.system))?.id || "",
                 mvuReady: input.mvuReady && typeof input.mvuReady === "object" ? { events: Object.assign({}, input.mvuReady.events) } : null,
@@ -3965,6 +4032,7 @@ window.__ModuleLoader__.load({
                 + 'installScriptLibraryBridge:' + installTavernScriptLibraryBridge.toString() + ','
                 + 'installAudioBridge:' + installTavernHelperAudioBridge.toString() + ','
                 + 'installGenerationBridge:' + installTavernGenerationBridge.toString() + ','
+                + 'installSpHostGeneration:' + installTavernSpHostGeneration.toString() + ','
 				+ 'installFacade:' + installTavernHelperFacade.toString() + '});';
 			const modules = scripts.map(function (script) {
 				return { id: String(script && script.id || ""), system: String(script && script.system || ""), mvuVersionSelection:script.mvuVersionSelection || null, mvuInitialization: script.mvuInitialization || null, sourceDigest: String(script && script.sourceDigest || ""), assetUrl: String(script && script.assetUrl || ""), content: String(script && script.content || "") };
@@ -4035,14 +4103,21 @@ window.__ModuleLoader__.load({
             const databaseProviders = createTavernDatabaseProviderRouter({ records, post, schedule:hostWindow.setTimeout.bind(hostWindow), cancel:hostWindow.clearTimeout.bind(hostWindow) });
             function databasePanelCommand(event){const detail=event.detail;if(!detail||detail.sessionId!==activeSessionId||detail.accepted)return;detail.accepted=true;databaseProviders.requestPanel(detail.sessionId,detail.operation).then(detail.resolve,detail.reject)}
             hostWindow.addEventListener('dsh-tavern-database-panel-command',databasePanelCommand);
+            const spProvider=()=>[...records.values()].find(record=>record.sessionId===activeSessionId&&record.scripts.has('extension-sp-database'));
+            let spInputContext=null;
+            const spLogical=()=>{const record=spProvider();return !!record?.spZeroLayerViewActive||((record?.context||spInputContext)?.messages||[]).some(message=>{const value=message.pluginData?._acu_zero_layer_v1||message._acu_zero_layer_v1;return value&&value.exitManifest?.phase!=='committed'})};
+            const releaseSpNativeInput=installTavernSpNativeInputGate(hostWindow,{identity:()=>activeSessionId,getRoot:()=>migrationHost?.composerRoot(activeSessionId),getInput:()=>migrationHost?.composerInput(activeSessionId),logical:spLogical,submit:async(text,sessionId,signal)=>{signal?.throwIfAborted();const provider=spProvider(),expected={id:provider?.id,chatId:provider?.context.chatId,lifecycleRevision:Number(provider?.context.lifecycleRevision||0)};const abort=()=>{void databaseProviders.requestPanel(sessionId,{kind:'zero-stop'},expected).catch(error=>reportError('零层停止',error))};signal?.addEventListener('abort',abort,{once:true});try{return await databaseProviders.requestPanel(sessionId,{kind:'zero-input',text},expected)}finally{signal?.removeEventListener('abort',abort)}},report:error=>reportError('零层输入',error)});
             const sourceRequests = new Map();
 			const closedEventIds = new Set();
 			const closedEventOrder = [];
 			const reportedEventTimeouts = new Set();
-			const allowedMethods = new Set(["prepareTavernOriginalDatabaseMutation","setTavernMvuActivity","selectTavernFrontendWorldInfo","startTavernFrontendGeneration","startTavernFrontendMainGeneration","tavernHelperBrowserCache","tavernHelperComposer","triggerTavernSlash","tavernHelperDatabaseTemplates","tavernHelperChatFiles","tavernHelperIzumiConnection","tavernHelperPresets","tavernHelperIzumiAdvice","tavernHelperAudio","mutateTavernHelperHistory","tavernHelperWorldbookLibrary","tavernScriptStorage", "fillTavernScriptDatabase", "getTavernScriptResource", "editTavernRuntimeScripts", "startTavernHelperGeneration", "pollTavernHelperGeneration", "stopTavernHelperGeneration", "listTavernHelperModels", "commitTavernScriptDatabase", "tavernScriptImages", "tavernScriptFiles", "getTavernScriptLibrary", "changeTavernScriptLibrary", "generateTavernHelperRaw", "updateTavernHelperPrompts", "updateTavernHelperVariables", "updateTavernHelperMessages", "createTavernHelperMessages", "getTavernHelperWorldbook", "replaceTavernHelperWorldbook", "saveTavernExtensionSettings", "loadTavernWorldInfo", "saveTavernWorldInfo", "saveTavernChatData"]);
+			const allowedMethods = new Set(["tavernSpWebRequest","prepareTavernSpQuietPrompt","prepareTavernOriginalDatabaseMutation","setTavernMvuActivity","selectTavernFrontendWorldInfo","startTavernFrontendGeneration","startTavernFrontendMainGeneration","tavernHelperBrowserCache","tavernHelperComposer","triggerTavernSlash","tavernHelperDatabaseTemplates","tavernHelperChatFiles","tavernHelperIzumiConnection","tavernHelperPresets","tavernHelperIzumiAdvice","tavernHelperAudio","mutateTavernHelperHistory","tavernHelperWorldbookLibrary","tavernScriptStorage", "fillTavernScriptDatabase", "getTavernScriptResource", "editTavernRuntimeScripts", "startTavernHelperGeneration", "pollTavernHelperGeneration", "stopTavernHelperGeneration", "listTavernHelperModels", "commitTavernScriptDatabase", "tavernScriptImages", "tavernScriptFiles", "getTavernScriptLibrary", "changeTavernScriptLibrary", "generateTavernHelperRaw", "updateTavernHelperPrompts", "updateTavernHelperVariables", "updateTavernHelperMessages", "createTavernHelperMessages", "getTavernHelperWorldbook", "replaceTavernHelperWorldbook", "saveTavernExtensionSettings", "loadTavernWorldInfo", "saveTavernWorldInfo", "saveTavernChatData"]);
 			for(const method of ['beginTavernSpAuthority','chooseTavernSpAuthority','publishTavernSpAuthorityCache','getSpDatabase'])allowedMethods.add(method);
+            const spOwnedTaskMethods=new Set(['getTavernSpOwnedTaskIdentity','registerTavernSpOwnedTask','cancelTavernSpOwnedTask','dispatchTavernSpOwnedTask','checkpointTavernSpOwnedTask','modelTavernSpOwnedTask','assertTavernSpOwnedTask','commandTavernSpOwnedTask','prepareTavernSpOwnedSaveRetry']);
+            for(const method of spOwnedTaskMethods)allowedMethods.add(method);
 			// Page-only calls that cannot write host state; a background runtime skips them (R8 Z61).
 			const foregroundOnlyMethods = new Set(["tavernHelperComposer"]);
+            allowedMethods.add('tavernSpZeroLayerView');foregroundOnlyMethods.add('tavernSpZeroLayerView');
 			let activeSessionId = "";
             let releaseHostComposer = null;
             let releaseSlashComposer = null;
@@ -4086,7 +4161,7 @@ window.__ModuleLoader__.load({
             let initializationStateKey = "";
             function publishInitializationState() {
                 const scripts = Array.from(records.values()).flatMap(record => Array.from(record.scripts.values()).map(script => ({ record, script })));
-                const pending = scripts.filter(({ record, script }) => record.initializationWorkPending || record.initializationWorkWaiting || (!script.subscriptionsReady && !script.initializationFailed)).length;
+                const pending = scripts.filter(({ record, script }) => record.initializationWorkPending || record.initializationWorkWaiting || (!script.subscriptionsReady && !script.initializationFailed) || ((options?.ownedSp===true||options?.spOwned===true)&&script.id==='extension-sp-database'&&record.databaseReady!==true&&!script.initializationFailed&&!record.initializationWorkFailed&&!record.initializationWorkTimedOut)).length;
                 const failed = scripts.filter(({ record, script }) => script.initializationFailed || record.initializationWorkFailed || record.initializationWorkTimedOut || (script.id === record.mvuCoreId && mvuInitializationError(record))).length;
                 const mvuPending = Array.from(records.values()).some(record => record.mvuCoreId && !mvuInitializationError(record) && !mvuDataReady(record));
                 const state = scripts.length ? { sessionId: activeSessionId, phase: mvuCompanionFailure() ? "failed" : pending || mvuPending ? "initializing" : failed ? "failed" : "ready", total: scripts.length, pending, failed:Math.max(failed,mvuCompanionFailure()?1:0), spTimedOut: Array.from(records.values()).some(record => record.initializationWorkTimedOut === true) } : null;
@@ -4103,11 +4178,12 @@ window.__ModuleLoader__.load({
                     record.initializationWorkPending = true;
                     record.initializationWorkFailed = false;
 					const ids=Array.from(record.scripts.values()).filter(script=>script.subscriptionsReady&&!script.initializationFailed).map(script=>script.id);
-                    Promise.resolve(onRecordReady(record.sessionId, ids)).catch(function(error){
+                    Promise.resolve(record.remoteOwner ? record.remoteAttached : onRecordReady(record.sessionId, ids)).catch(function(error){
                         if (records.get(record.id) !== record) return;
                         const waiting = error?.code === "DSH_TAVERN_SP_INITIALIZING" && record.scripts.has("extension-sp-database");
                         record.initializationWorkWaiting = waiting && !record.databaseReady;
                         record.initializationWorkFailed = !waiting;
+                        record.initializationWorkError=String(error?.message||error).slice(0,4000);
                         if (record.initializationWorkWaiting && !record.initializationWorkTimer) {
                             // Presentation deadline only, matching the original SP hydration window.
                             // Never bypass its authority or event/write readiness gates.
@@ -4211,6 +4287,17 @@ window.__ModuleLoader__.load({
                 const decorated=decorateHelperContext(context);helperContextMemo=revision?{revision,context:decorated}:null;return decorated;
 			}
 			function post(record, message) {
+                if(record.remoteOwner){
+                    if(records.get(record.id)!==record)return;
+                    if(message.type==='dsh-tavern-helper-context'){record.remoteSurface?.sync?.({context:record.context});if(message.context===record.context)refreshRemoteSp(record);return;}
+                    if(message.type==='dsh-tavern-original-database-command'){
+                        void remoteSpCommand(record,{kind:'database-command',operation:message.operation}).then(result=>{
+                            databaseProviders.receive(record,{type:'dsh-tavern-original-database-result',requestId:message.requestId,ok:true,result});
+                        },error=>databaseProviders.receive(record,{type:'dsh-tavern-original-database-result',requestId:message.requestId,ok:false,error:String(error.message||error)}));return;
+                    }
+                    if(message.type==='dsh-tavern-helper-event')void emitToRecord(record,message.name,message.args,record.context,null,message.eventId).catch(error=>reportError('SP 远程事件',error));
+                    return;
+                }
 				// A module can await an authenticated RPC before the iframe load event.
                 // Events and context still wait for load; replies must break that bootstrap dependency.
                 if (records.get(record.id) !== record || (!record.loaded && !["dsh-tavern-helper-response", "dsh-tavern-mvu-dependency-state", "dsh-tavern-mvu-start-cancel"].includes(message.type)) || !record.frame.contentWindow) return;
@@ -4269,11 +4356,34 @@ window.__ModuleLoader__.load({
 				});
 				return record.compatibilityTail;
 			}
-			function removeRecord(id) {
+            const remoteUiClosures=new Set();
+            function closeRemoteSpUi(record){
+                if(!record.remoteOwner||!record.remoteIdentity)return Promise.resolve();
+                if(record.remoteClosePromise)return record.remoteClosePromise;
+                // Start the authenticated keepalive while the viewer lease and
+                // record are still valid. Retirement waits for this reply.
+                const task=Promise.resolve(invoke('commandTavernSpOwner',{...remoteSpIdentity(record),operation:{kind:'ui',command:{operation:'close'}}},record.sessionId,{keepalive:true})).then(reply=>{if(reply?.completed!==true||reply.result?.detached!==true)throw Error('SP 原界面退出未获确认');return reply;});
+                record.remoteClosePromise=task;remoteUiClosures.add(task);
+                void task.catch(error=>reportError('SP 原界面退出',error));
+                void task.finally(()=>remoteUiClosures.delete(task)).catch(()=>{});
+                return task;
+            }
+			function removeRecord(id, retiringRecords) {
 				const record = records.get(id);
 				if (!record) return;
+                closeRemoteSpUi(record);
+                record.remoteComposer?.dispose();
                 record.releaseDisplayedMessage?.();
-                databaseProviders.remove(record);
+                if(record.remoteSurfaceTimer)hostWindow.clearTimeout(record.remoteSurfaceTimer);
+                if(record.remoteRecoveryTimer)hostWindow.clearTimeout(record.remoteRecoveryTimer);
+                for(const controller of record.remoteControllers||[])controller.abort();record.remoteControllers?.clear();
+                for(const entry of record.remoteSurfaceRequests?.values()||[])if(!entry.acknowledged){
+                    void Promise.resolve(invoke('completeTavernSpSurfaceRequest',{...remoteSpIdentity(record),id:entry.id,error:'SP 前端游戏表面已关闭，请重新打开后重同步'},record.sessionId,{keepalive:true})).catch(error=>reportError('SP 表面关闭回执',error));
+                }
+                if(record.remoteOwner&&record.remoteIdentity)void Promise.resolve(invoke('commandTavernSpOwner',{...remoteSpIdentity(record),operation:{kind:'game-state',ready:false}},record.sessionId,{keepalive:true})).catch(error=>reportError('SP 游戏表面退出回执',error));
+                record.remoteSaveRecoveryReject?.(Error('SP 保存恢复界面已退出'));delete record.remoteSaveRecoveryReject;record.remoteDialogRecoveryReject?.(Error('SP 确认恢复界面已退出'));delete record.remoteDialogRecoveryReject;record.remoteDisposed=true;record.remoteSurface?.dispose?.({close:false});
+                databaseProviders.remove(record, retiringRecords);
+                if(record.scripts.has('extension-sp-database'))tavernSpLiveSurfaces.disposeScope({sessionId:record.sessionId,lifecycleRevision:record.context.lifecycleRevision});
                 record.releaseMenu?.();
                 if(record.composerStop)record.composerStop();
 				void flushCompatibility(record);
@@ -4295,15 +4405,22 @@ window.__ModuleLoader__.load({
 				records.delete(id);
 				announcedReadinessKey = "";
 			}
-            function closeRecordUi(record) {
+            function closeRecordUi(record, surfaceClosed = false) {
                 hostWindow.__dshTavernPendingScriptUi=(hostWindow.__dshTavernPendingScriptUi||[]).filter(p=>p.sessionId!==activeSessionId||(record&&!uiRequestMatchesRecord(p.kind||'companion',record)));
                 if(record){for(const kind of requestedUi)if(uiRequestMatchesRecord(kind,record))requestedUi.delete(kind);}else requestedUi.clear();
                 for (const item of record ? [record] : records.values()) {
                     if (item.window) item.window.hide(); else if(item.container) { item.container.hidden = true; item.container.style.display = 'none'; }
+                    if(item.remoteOwner&&!surfaceClosed)void item.remoteSurface?.close?.({notify:false}).catch(error=>reportError('SP 原界面关闭',error));
                 }
             }
             function openRecordUi(record) {
                 requestedUi.add(record.uiKind || "shared");
+                if(record.remoteOwner){
+                    if(!record.window)record.window=createTavernScriptWindow(hostWindow,record.container,()=>closeRecordUi(record),()=>retryRemoteSpSave(record).catch(error=>reportError('SP 原保存重试',error)), {key:record.id,title:record.name});
+                    record.window.open();record.frame.hidden=true;
+                    if(record.remoteSurface)void record.remoteSurface.open({recover:record.remoteUiReady!==true}).catch(error=>reportError('SP 原界面打开',error));
+                    return;
+                }
                 if(legacyMenus&&!record.uiKind){
                     if(!record.subscriptionsReady&&!record.initializationFailed)return;
                     if(legacyMenus.hasScriptEntries()){closeRecordUi(record);legacyMenus.open('extensions',hostDocument.getElementById('extensionsMenuButton'));return;}
@@ -4403,8 +4520,31 @@ window.__ModuleLoader__.load({
 				}
                 publishInitializationState();
 			}
-			function emitToRecord(record, name, args, context, diagnostics, hostEventId, excludedScriptIds, onlyScriptIds, relay) {
+            async function awaitRemoteSpEventAttachment(record,eventId) {
+                const attached=record.remoteAttached,identity=remoteSpIdentity(record),key=record.id+'\n'+eventId;
+                if(!attached)throw Error('SP 原事件没有附着执行者');
+                if(closedEventIds.has(key)||pendingEvents.has(key))throw Error('SP 远程事件标识已使用');
+                // Keep the original call in the existing event ledger, not a replay queue.
+                if(pendingEvents.size>=128)throw Error('SP 等待附着事件容量已满，事件未执行');
+                let timer;
+                try {
+                    await new Promise((resolve,reject)=>{
+                        timer=hostWindow.setTimeout(()=>reject(Error('SP 原事件等待附着超时，事件未执行')),91000);
+                        pendingEvents.set(key,{record,timer,reject});
+                        Promise.resolve(attached).then(resolve,reject);
+                    });
+                    const current=remoteSpIdentity(record);
+                    if(records.get(record.id)!==record||record.remoteDisposed||record.remoteAttached!==attached||current.chatId!==identity.chatId||current.lifecycleRevision!==identity.lifecycleRevision||current.sourceDigest!==identity.sourceDigest||(identity.ownerId&&current.ownerId!==identity.ownerId))throw Object.assign(Error('SP 原事件等待期间身份已变化，事件未执行'),{code:'DSH_TAVERN_RUNTIME_REPLACED'});
+                    if(!record.loaded||!record.subscriptionsReady||record.initializationFailed)throw Error('SP 原事件附着未完成，事件未执行');
+                } catch(error) {closeEventId(key);throw error;}
+                finally {hostWindow.clearTimeout(timer);pendingEvents.delete(key);}
+            }
+			async function emitToRecord(record, name, args, context, diagnostics, hostEventId, excludedScriptIds, onlyScriptIds, relay) {
 				if (Array.isArray(excludedScriptIds) && Array.from(record.scripts.keys()).every(id => excludedScriptIds.includes(id))) return Promise.resolve(args);
+                if(record.remoteOwner&&(!record.loaded||!record.subscriptionsReady)&&!record.initializationFailed){
+                    hostEventId=String(hostEventId||'')||'remote-sp-event-'+(++eventSequence);
+                    await awaitRemoteSpEventAttachment(record,hostEventId);
+                }
                 const validationEvent = /^mag_(?:variable_|command_parsed|before_message_update)/.test(String(name)) || Object.values(mvuDependencyStatus()?.owner?.mvuGlobalEvents||{}).includes(String(name)) || name==='MESSAGE_RECEIVED'&&Boolean(record.mvuCoreId)&&!excludedScriptIds?.includes(record.mvuCoreId);
                 const blockedCompanion = validationEvent ? mvuCompanionFailure() : '';
                 // A durable ordinary journal can acknowledge the other records
@@ -4425,6 +4565,20 @@ window.__ModuleLoader__.load({
 					post(record, { type: "dsh-tavern-helper-context", context: record.context });
 				}
 				if (!record.subscriptions.has(String(name))) return Promise.resolve(args);
+                if(record.remoteOwner){
+                    const eventId=String(hostEventId||'')||'remote-sp-event-'+(++eventSequence),pendingKey=record.id+'\n'+eventId;
+                    if(closedEventIds.has(pendingKey)||pendingEvents.has(pendingKey))return Promise.reject(Error('SP 远程事件标识已使用'));
+                    const delivery=new Promise((resolve,reject)=>{
+                        const timer=hostWindow.setTimeout(()=>reject(Error('SP 远程事件完成回执超时，工作状态请检查恢复记录')),Math.max(eventTimeoutMs,91000));
+                        pendingEvents.set(pendingKey,{record,timer,reject});
+                        remoteSpRequest(record,'emitTavernSpOwner',{eventId,name,args,context:record.context,excludedScriptIds,onlyScriptIds,reentrantParentId:relay?.ancestors.findLast(item=>item.record===record)?.eventId,displayedMessage:record.displayTarget?.identity}).then(resolve,reject);
+                    });
+                    return delivery.then(result=>{
+                        if(result?.completed!==true||!Array.isArray(result.args))throw Error('SP 原事件完成回执未获确认');
+                        if(Array.isArray(diagnostics)&&Array.isArray(result.diagnostics))diagnostics.push(...result.diagnostics);
+                        return result.args;
+                    }).finally(()=>{const pending=pendingEvents.get(pendingKey);if(pending)hostWindow.clearTimeout(pending.timer);pendingEvents.delete(pendingKey);closeEventId(pendingKey);});
+                }
 				const eventId = String(hostEventId || "") || "host-event-" + (++eventSequence);
                 const pendingKey = record.id + "\n" + eventId;
 				if(closedEventIds.has(pendingKey))return Promise.reject(new Error('脚本事件标识已使用，请为新的尝试使用新标识'));
@@ -4497,17 +4651,26 @@ window.__ModuleLoader__.load({
 						if(name==="MESSAGE_RECEIVED" && record.scripts.get(record.mvuCoreId)?.system==="card-mvu" && String(hostEventId||"").startsWith("journal:") && Array.isArray(diagnostics))diagnostics.push({kind:"card-mvu-deferred-v1",name:String(name),scriptId:record.mvuCoreId,message:"卡核心尚未就绪，变量结算延后"});
 						continue;
 					}
-					current = await emitToRecord(record, name, current, context, diagnostics, hostEventId, excludedScriptIds, onlyScriptIds);
+					try { current = await emitToRecord(record, name, current, context, diagnostics, hostEventId, excludedScriptIds, onlyScriptIds); }
+                    catch(error){
+                        if(record.remoteOwner&&record.remoteIdentity){
+                            const later=[...records.values()].slice([...records.values()].indexOf(record)+1);
+                            const outstanding=later.some(next=>next.loaded&&next.subscriptionsReady&&!next.initializationFailed&&next.subscriptions.has(String(name))&&(!Array.isArray(onlyScriptIds)||onlyScriptIds.some(id=>next.scripts.has(String(id))))&&(!Array.isArray(excludedScriptIds)||![...next.scripts.keys()].every(id=>excludedScriptIds.includes(id))));
+                            if(!outstanding)error.dshSpSaveRecoveryBoundary={eventId:String(hostEventId||''),ownerId:record.remoteIdentity.ownerId,allOtherRecipientsComplete:true};
+                        }
+                        throw error;
+                    }
 				}
 				return current;
 			}
 			function clear() {
+                const retiringRecords=new Set(records.values());
                 for(const item of worldbookRefreshes.values())hostWindow.clearTimeout(item.timer);worldbookRefreshes.clear();
                 if (releaseHostComposer) { releaseHostComposer(); releaseHostComposer = null; }
                 if (releaseSlashComposer) { releaseSlashComposer(); releaseSlashComposer = null; }
                 requestedUi.clear(); sourceRequests.clear();
                 mvuDependency = null; mvuReadyOwner = null; mvuStoppedScope = null;
-				Array.from(records.keys()).forEach(removeRecord);
+				for(const record of retiringRecords)if(records.get(record.id)===record)removeRecord(record.id,retiringRecords);
                 if (gameArtifacts) { gameArtifacts.scope.dispose(); gameArtifacts = null; }
 				if (scriptWindow) scriptWindow.dispose(); scriptWindow = null;
                 for(const container of uiRoots.values()) container.remove(); uiRoots.clear();
@@ -4559,12 +4722,180 @@ window.__ModuleLoader__.load({
                 if(records.get(record.id)!==record||record.subscriptionsReady||record.initializationFailed||record.initializationTimer)return;
                 armInitializationStage(record,stage,initializationAllowance(record,stage));
             }
+            function remoteSpIdentity(record){return {ownerId:record.remoteIdentity?.ownerId,capability:record.remoteIdentity?.capability,chatId:record.context.chatId,lifecycleRevision:Number(record.context.lifecycleRevision||0),sourceDigest:record.scriptSources[0].sourceDigest||record.scriptSources[0].content};}
+            async function remoteSpRequest(record,method,args={}){
+                if(records.get(record.id)!==record||record.remoteDisposed)throw Object.assign(Error('SP 界面已退出，操作未完成'),{code:'DSH_TAVERN_RUNTIME_REPLACED'});
+                const expected=remoteSpIdentity(record),controller=new hostWindow.AbortController();
+                (record.remoteControllers||=new Set()).add(controller);
+                let timer;
+                const nativeDialogBudget=method==='attachTavernSpOwner'||method==='commandTavernSpOwner'&&args.operation?.kind==='ui'&&['input','open'].includes(args.operation.command?.operation);
+                if(nativeDialogBudget){let remaining=91000,last=now();const check=()=>{const at=now();if(!record.remoteNativeDialogPending)remaining-=Math.max(0,at-last);last=at;if(remaining<=0){controller.abort();return}timer=hostWindow.setTimeout(check,Math.min(1000,remaining))};check()}else timer=hostWindow.setTimeout(()=>controller.abort(),91000);
+                let result;
+                try{result=await invoke(method,{...args,...expected},record.sessionId,{signal:controller.signal});}
+                finally{hostWindow.clearTimeout(timer);record.remoteControllers?.delete(controller);}
+                if(records.get(record.id)!==record||record.remoteDisposed||Number(record.context.lifecycleRevision||0)!==expected.lifecycleRevision)throw Object.assign(Error('SP 对话身份已变化'),{code:'DSH_TAVERN_RUNTIME_REPLACED'});
+                return result;
+            }
+            async function retryRemoteSpSave(record){
+                const reply=await remoteSpRequest(record,'commandTavernSpOwner',{operation:{kind:'retry-save'}});
+                if(reply?.completed!==true||reply.result?.saved!==true)throw Error('SP 仅保存恢复未获确认');
+                record.remoteSaveRecovered?.();return reply.result;
+            }
+            async function remoteSpCommand(record,operation){
+                await record.remoteAttached;
+                const reply=await remoteSpRequest(record,'commandTavernSpOwner',{operation});
+                if(reply?.completed!==true)throw Error('SP 原API操作完成回执未获确认');
+                if(reply.context)record.context=decorateHelperContext(reply.context,record.context);
+                reportMutation(record.sessionId,'commandTavernSpOwner',reply);
+                return reply.result;
+            }
+            function applyRemoteSpState(record,result){
+                const expected=remoteSpIdentity(record);
+                if(!result?.ownerId||result.sourceDigest!==expected.sourceDigest||Number(result.lifecycleRevision)!==expected.lifecycleRevision||result.loaded!==true||result.subscriptionsReady!==true||result.ready!==true||!Array.isArray(result.subscriptions)||typeof result.capability!=='string'||!result.capability)throw Error('SP 持久执行者初始化回执不完整');
+                if(record.remoteIdentity&&record.remoteIdentity.ownerId!==result.ownerId)throw Error('SP 持久执行者已替换，请重新打开界面');
+                record.remoteIdentity={ownerId:result.ownerId,capability:result.capability};
+                record.loaded=result.loaded;record.subscriptionsReady=result.subscriptionsReady;
+                record.subscriptions=new Set(result.subscriptions.map(String));
+                for(const script of record.scripts.values()){script.loaded=result.loaded;script.subscriptionsReady=result.subscriptionsReady;script.subscriptions=record.subscriptions;}
+                databaseProviders.receive(record,{type:'dsh-tavern-original-database-ready',ready:true,names:result.databaseTemplates||[]});
+                record.remoteSurface?.sync?.(result);
+            }
+            function refreshRemoteSp(record){
+                record.remoteRefreshRequested=true;
+                if(record.remoteRefreshing)return;
+                record.remoteRefreshing=(async()=>{
+                    await record.remoteAttached;
+                    while(record.remoteRefreshRequested&&records.get(record.id)===record&&!record.remoteDisposed){
+                        record.remoteRefreshRequested=false;
+                        // attach refreshes the authoritative owner view; it does not
+                        // initialize a second realm or re-emit CHAT_CHANGED.
+                        const result=await remoteSpRequest(record,'attachTavernSpOwner',{context:record.context,refresh:true});
+                        applyRemoteSpState(record,result);
+                    }
+                })().catch(error=>{if(records.get(record.id)===record&&!record.remoteDisposed){record.initializationWorkFailed=true;reportError('SP 执行者状态同步',error);publishInitializationState();}}).finally(()=>{record.remoteRefreshing=null;});
+            }
+            function remoteSpViewerCurrent(record){return records.get(record.id)===record&&!record.remoteDisposed&&record.sessionId===activeSessionId&&options?.background!==true&&hostDocument.visibilityState!=='hidden';}
+            function startRemoteSpSurfaceRequests(record){
+                record.remoteSurfaceRequests=new Map();
+                const receive=async()=>{
+                    if(records.get(record.id)!==record||record.remoteDisposed)return;
+                    try{
+                        if(!remoteSpViewerCurrent(record))return;
+                        const response=await remoteSpRequest(record,'getTavernSpSurfaceRequests');
+                        if(!Array.isArray(response.requests)||response.requests.length>32)throw Error('SP 前端表面请求批次无效');
+                        for(const request of response.requests){
+                            if(typeof request?.id!=='string'||!request.id)throw Error('SP 前端表面请求标识无效');
+                            let entry=record.remoteSurfaceRequests.get(request.id);
+                            if(['composer','slash'].includes(request.operation?.kind)){
+                                const acknowledge=async entry=>{
+                                    if(entry.acknowledging||entry.acknowledged)return;entry.acknowledging=true;
+                                    try{await remoteSpRequest(record,'completeTavernSpSurfaceRequest',{id:entry.id,...request.composerEpoch!==undefined?{composerEpoch:request.composerEpoch}:{},...entry.error?{error:entry.error}:{result:entry.result}});entry.acknowledged=true}
+                                    catch(error){if(!record.remoteDisposed)reportError('SP 原输入操作回执',error)}finally{entry.acknowledging=false}
+                                };
+                                if(entry){if(entry.settled)void acknowledge(entry);continue;}
+                                entry={id:request.id};record.remoteSurfaceRequests.set(request.id,entry);
+                                // A long /trigger must not block polling or the return
+                                // events/composer operations needed by that generation.
+                                void (async()=>{
+                                    try{
+                                        if(!remoteSpViewerCurrent(record)||Number(request.lifecycleRevision)!==Number(record.context.lifecycleRevision||0))throw Error('SP 前端输入归属已变化');
+                                        const operation=request.operation,input=migrationHost.composerInput(record.sessionId);
+                                        if(operation.kind==='slash'){
+                                            assertTavernFrameSlash(operation.line,record.trustedCardMode);
+                                            entry.result=await migrationHost.executeSlash(String(operation.line||''),record.sessionId);
+                                        }else{
+                                            const composerEpoch=record.remoteComposer.snapshot().composerEpoch;
+                                            if(request.composerEpoch!==composerEpoch||(operation.operation?.expectedComposerEpoch!==undefined&&operation.operation.expectedComposerEpoch!==composerEpoch))throw Error('SP 输入连接代次已变化，旧请求未执行');
+                                            if(operation.operation?.kind!=='read'&&operation.operation?.expectedRevision!==undefined&&operation.operation.expectedRevision!==record.remoteComposer.snapshot().revision)throw Error('输入框版本已变化，草稿已保留');
+                                            entry.result=await performTavernComposerOperation(input,operation.operation,{revision:()=>record.remoteComposer.snapshot().revision,running:migrationHost.composerRunning(record.sessionId),stop:()=>migrationHost.stopComposer(record.sessionId)});
+                                            entry.result={...entry.result,attached:true,composerEpoch};
+                                        }
+                                    }catch(error){entry.error=String(error?.message||error);}
+                                    entry.settled=true;await acknowledge(entry);
+                                })();
+                                continue;
+                            }
+                            if(!entry){
+                                entry={id:request.id};record.remoteSurfaceRequests.set(request.id,entry);
+                                try{
+                                    if(!remoteSpViewerCurrent(record)||Number(request.lifecycleRevision)!==Number(record.context.lifecycleRevision||0))throw Error('SP 前端表面已退出或生命周期已变化');
+                                    const operation=request.operation;
+                                    if(!operation||!['mount','bind','publish','unbind','dispose'].includes(operation.kind))throw Error('SP 前端表面操作无效');
+                                    const scope={sessionId:record.sessionId,chatId:record.context.chatId,lifecycleRevision:Number(record.context.lifecycleRevision||0)};
+                                    entry.result=tavernSpLiveSurfaces.command(scope,operation,async(method,query)=>{
+                                        const reply=await remoteSpRequest(record,'commandTavernSpOwner',{operation:{kind:'database-command',operation:{kind:'zero-read',method,query}}});
+                                        if(reply?.completed!==true)throw Error('SP 实时读取完成回执未确认');return reply.result;
+                                    },ready=>{
+                                        if(remoteSpViewerCurrent(record))void remoteSpRequest(record,'commandTavernSpOwner',{operation:{kind:'game-state',ready}}).then(reply=>{if(reply?.completed!==true)throw Error('SP 游戏表面回执未确认');}).catch(error=>reportError('SP 游戏表面回执',error));
+                                    });
+                                    record.spZeroLayerViewActive=!['dispose','unbind'].includes(operation.kind);
+                                }catch(error){entry.error=String(error?.message||error);}
+                            }
+                            await remoteSpRequest(record,'completeTavernSpSurfaceRequest',{id:entry.id,...entry.error?{error:entry.error}:{result:entry.result}});
+                            entry.acknowledged=true;
+                            while(record.remoteSurfaceRequests.size>256){const first=record.remoteSurfaceRequests.keys().next().value;if(!record.remoteSurfaceRequests.get(first)?.acknowledged)break;record.remoteSurfaceRequests.delete(first);}
+                        }
+                    }catch(error){if(records.get(record.id)===record&&!record.remoteDisposed)reportError('SP 真实游戏表面',error);}
+                    finally{if(records.get(record.id)===record&&!record.remoteDisposed)record.remoteSurfaceTimer=hostWindow.setTimeout(receive,500);}
+                };
+                record.remoteSurfaceTimer=hostWindow.setTimeout(receive,0);
+            }
+            function attachRemoteSp(record){
+                record.remoteAttached=(async()=>{
+                    // A cold logical game can mount its real surface while the
+                    // original's initialization is still awaiting that mount.
+                    // Observation capability is not a loaded/ready receipt.
+                    const prepared=await remoteSpRequest(record,'prepareTavernSpOwner');
+                    if(!prepared?.ownerId||typeof prepared.capability!=='string'||!prepared.capability||!Number.isSafeInteger(prepared.composerEpoch)||prepared.composerEpoch<1||prepared.sourceDigest!==remoteSpIdentity(record).sourceDigest||Number(prepared.lifecycleRevision)!==Number(record.context.lifecycleRevision||0))throw Error('SP 持久执行者观察连接身份无效');
+                    record.remoteIdentity={ownerId:prepared.ownerId,capability:prepared.capability};
+                    if(typeof createTavernSpRemoteSurface!=='function')throw Error('SP 原界面代理尚未载入');
+                    const recoveryCommand=async operation=>{
+                        if(operation?.kind==='ui'&&['recover','dialog','files','close'].includes(operation.command?.operation)){
+                            const reply=await remoteSpRequest(record,'commandTavernSpOwner',{operation});if(reply?.completed!==true)throw Error('SP 恢复界面回执未确认');if(operation.command?.operation==='dialog'&&reply.result?.delivered===true){record.remoteDialogAnswers=(record.remoteDialogAnswers||0)+1;record.remoteDialogRecovered?.();}return reply.result;
+                        }
+                        return remoteSpCommand(record,operation);
+                    };
+                    record.remoteSurface=createTavernSpRemoteSurface({window:hostWindow,document:hostDocument,container:record.container,frame:record.frame,sessionId:record.sessionId,identity:()=>remoteSpIdentity(record),command:recoveryCommand,retrySave:()=>retryRemoteSpSave(record),onClose:()=>closeRecordUi(record,true),onNativeDialogPending:pending=>{record.remoteNativeDialogPending=pending},report:error=>reportError('SP 原界面',error)});
+                    record.remoteSurface.sync?.(prepared);
+                    const recover=async()=>{
+                        if(records.get(record.id)!==record||record.remoteDisposed||record.remoteUiReady||record.initializationFailed)return;
+                        try{
+                            const result=await recoveryCommand({kind:'ui',command:{operation:'recover'}});
+                            if(result?.notices?.some(item=>item.kind==='dialog'||item.kind==='file'))openRecordUi(record);
+                        }catch(error){record.remoteRecoveryError=String(error?.message||error);openRecordUi(record);record.remoteSurface?.sync?.({recoveryError:record.remoteRecoveryError});}
+                        finally{if(records.get(record.id)===record&&!record.remoteDisposed&&!record.remoteUiReady&&!record.initializationFailed)record.remoteRecoveryTimer=hostWindow.setTimeout(recover,400);}
+                    };
+                    void recover();
+                    record.remoteComposer=installTavernSpRemoteComposer({window:hostWindow,input:migrationHost.composerInput(record.sessionId),composerEpoch:prepared.composerEpoch,getRoot:()=>migrationHost.composerRoot(record.sessionId),current:()=>remoteSpViewerCurrent(record),running:()=>migrationHost.composerRunning(record.sessionId),command:operation=>remoteSpRequest(record,'commandTavernSpOwner',{operation}).then(reply=>{if(reply?.completed!==true)throw Error('SP 输入桥回执未确认');return reply.result}),report:error=>reportError('SP 真实输入框',error)});
+                    startRemoteSpSurfaceRequests(record);
+                    let dialogAnswersBeforeAttach=record.remoteDialogAnswers||0;let result=await remoteSpRequest(record,'attachTavernSpOwner',{context:record.context});
+                    while(result?.recoveryRequired===true||result?.dialogRecoveryRequired===true){
+                        record.remoteSaveRecoveryRequired=result.recoveryRequired===true;record.remoteSurface.sync?.(result);openRecordUi(record);
+                        if(result.dialogRecoveryRequired===true){if((record.remoteDialogAnswers||0)===dialogAnswersBeforeAttach)await new Promise((resolve,reject)=>{record.remoteDialogRecovered=resolve;record.remoteDialogRecoveryReject=reject;});}
+                        else await new Promise((resolve,reject)=>{record.remoteSaveRecovered=resolve;record.remoteSaveRecoveryReject=reject;});
+                        if(!remoteSpViewerCurrent(record))throw Error('SP 保存恢复界面已退出');
+                        dialogAnswersBeforeAttach=record.remoteDialogAnswers||0;result=await remoteSpRequest(record,'attachTavernSpOwner',{context:record.context});
+                    }
+                    record.remoteSaveRecoveryRequired=false;delete record.remoteSaveRecovered;delete record.remoteSaveRecoveryReject;delete record.remoteDialogRecovered;delete record.remoteDialogRecoveryReject;
+                    applyRemoteSpState(record,result);
+                    record.remoteUiReady=true;if(record.remoteRecoveryTimer)hostWindow.clearTimeout(record.remoteRecoveryTimer);
+                    record.remoteSurface.sync?.(result);
+                    if(record.window&&!record.container.hidden||[...requestedUi].some(kind=>uiRequestMatchesRecord(kind,record)))openRecordUi(record);
+                    maybeAnnounceReady();return result;
+                })();
+                void record.remoteAttached.catch(error=>{
+                    if(records.get(record.id)!==record)return;
+                    record.initializationFailed=true;record.initializationWorkFailed=true;
+                    for(const script of record.scripts.values())script.initializationFailed=true;
+                    reportError('SP 持久执行者初始化',error);publishInitializationState();
+                });
+            }
             function createRecord(sessionId, scripts, context, trustedCardMode, recordId = "shared", uiKind = "", policy = {}) {
                 const name = uiKind ? scripts[0].name : "共享脚本沙箱";
 				const artifactOwner=token();
 				const container = ensureRoot(recordId, uiKind ? name : "原版脚本界面");
 				const frame = hostDocument.createElement("iframe");
-				const fingerprint = scripts.map(function (script) { return script.id + "\n" + (script.sourceDigest || script.content)+"\nstartup="+JSON.stringify(script.mvuInitialization||null); }).join("\n---\n") + "\ntrusted=" + String(trustedCardMode) + "\nlifecycle=" + Number(context.lifecycleRevision || 0) + "\npolicy=" + JSON.stringify(policy) + "\nmvu=" + JSON.stringify(mvuDependency);
+				const fingerprint = scripts.map(function (script) { return script.id + "\n" + (script.sourceDigest || script.content)+"\nstartup="+JSON.stringify(script.mvuInitialization||null)+'\nremoteSp='+String(script.remoteSp===true); }).join("\n---\n") + "\ntrusted=" + String(trustedCardMode) + "\nlifecycle=" + Number(context.lifecycleRevision || 0) + "\npolicy=" + JSON.stringify(policy) + "\nmvu=" + JSON.stringify(mvuDependency);
 				const record = {
 					id: recordId, container, uiKind, policy, mvuEpoch:++mvuDependencyEpoch,
 					officialMvu: scripts.some(script => officialMvuSources.has(script)),
@@ -4593,6 +4924,12 @@ window.__ModuleLoader__.load({
 					lastRuntimeError: "",
 					scripts: new Map(scripts.map(function (script) { return [String(script.id), { id: String(script.id), sourceDigest:script.sourceDigest || script.content, system:script.system || '', mvuInitialization:script.mvuInitialization || null, name: String(script.name || script.id), loaded: false, subscriptionsReady: false, initializationFailed: false }]; }))
 				};
+                if(options?.spOwned!==true&&options?.ownedSp!==true&&scripts.length===1&&scripts[0].id==='extension-sp-database'&&scripts[0].remoteSp===true){
+                    record.remoteOwner=true;record.initializationWorkPending=true;
+                    frame.title=name;frame.sandbox='allow-scripts';
+                    container.appendChild(frame);records.set(record.id,record);
+                    attachRemoteSp(record);return record;
+                }
 				frame.title = uiKind ? name : "人物卡共享脚本沙箱";
 				if (!trustedCardMode) frame.sandbox = "allow-scripts";
 				frame.referrerPolicy = "no-referrer";
@@ -4600,7 +4937,7 @@ window.__ModuleLoader__.load({
                 const mvuReady = dependency?.state.phase === 'ready' && !scripts.some(script => String(script.id) === mvuDependency.id) ? { events: dependency.state.events } : null;
                 const participants=scripts.map(script=>unloadAccess?.participants?.find(p=>p.scriptId===script.id&&p.sourceDigest===(script.sourceDigest||script.content)));
                 const spUnload=participants.length&&participants.every(Boolean)&&unloadAccess.lifecycleRevision===Number(context.lifecycleRevision||0)?{unloadId:unloadAccess.unloadId,participants}:null;
-                frame.srcdoc = buildTavernHelperScriptDocument({ ...(spUnload?{spUnload}:{}),token: record.token, scripts: scripts, officialMvu:Boolean(mvuDependency), mvuCoreId:mvuDependency?.id, mvuReady, background:options?.background===true, relayEvents:true, context: projectTavernScriptContext(context,scripts.map(script=>String(script.id)),policy), trustedCardMode: trustedCardMode, networkAllowed:policy.capabilities?.includes('network'),assetAccess:policy.assetAccess });
+                frame.srcdoc = buildTavernHelperScriptDocument({ ...(spUnload?{spUnload}:{}),token: record.token, scripts: scripts, officialMvu:Boolean(mvuDependency), mvuCoreId:mvuDependency?.id, mvuReady, background:options?.background===true, persistentOwner:options?.persistentOwner===true||options?.spOwned===true||options?.ownedSp===true, relayEvents:true, context: projectTavernScriptContext(context,scripts.map(script=>String(script.id)),policy), trustedCardMode: trustedCardMode, networkAllowed:policy.capabilities?.includes('network'),assetAccess:policy.assetAccess });
 				frame.addEventListener("load", function () {
 					if (records.get(record.id) !== record) return;
 					record.loaded = true;
@@ -4646,7 +4983,7 @@ window.__ModuleLoader__.load({
                     if (mvu.status === "incompatible" || index < 0) scripts.unshift({id:mvu.scriptId || "__dsh_card_mvu_blocked__",name:"人物卡 MVU",system:"card-mvu",mvuVersionSelection:mvu,content:'throw new Error(' + JSON.stringify(mvu.message || '人物卡指定 MVU 未加载；保留原资源和剧情数据。') + ');',data:{},buttons:[],info:""});
                     else { const core = scripts.splice(index,1)[0]; scripts.unshift(Object.assign({},core,{mvuVersionSelection:mvu})); }
                 }
-				return scripts;
+				return scripts.map(script=>script.id==='extension-sp-database'&&view?.tavernSpOwned===true?{...script,remoteSp:true}:script);
 			}
 			function sync(sessionId, view) {
 				const nextSessionId = String(sessionId || "");
@@ -4656,12 +4993,14 @@ window.__ModuleLoader__.load({
                 // Keep the acknowledged state until an equally recent view arrives.
                 const incoming=view?.tavernHelper;
                 if(incoming&&[...records.values()].some(record=>record.context.chatId===incoming.chatId&&Number(record.context.lifecycleRevision||0)===Number(incoming.lifecycleRevision||0)&&Number(record.context.stateRevision)>Number(incoming.stateRevision)))return;
+                spInputContext=incoming||null;
+                if(options?.background!==true&&migrationHost){try{releaseSpNativeInput.ensure(migrationHost.composerInput(nextSessionId))}catch(error){if(spLogical())reportError('零层输入',error)}}
 				const scripts = scriptsForView(view);
                 expectedScriptIds = scripts.map(script => script.id);
                 const dependencyCore = scripts.find(script => ["official-mvu", "card-mvu"].includes(script.system));
                 mvuDependency = dependencyCore ? { id:dependencyCore.id, source:dependencyCore.sourceDigest || dependencyCore.content, assetUrl:dependencyCore.assetUrl || "", selection:dependencyCore.mvuVersionSelection || null } : null;
 				const trustedCardMode = Boolean(view?.tavernRuntimePolicy?.trustedCardMode || Object.values(view?.tavernRuntimePolicy?.scriptPolicies || {}).some(policy=>policy.trustedCardMode));
-				readinessKey = scripts.length === 0 ? "" : nextSessionId + "\n" + scripts.map(function (script) { return script.id + "\n" + (script.sourceDigest || script.content)+"\nstartup="+JSON.stringify(script.mvuInitialization||null); }).join("\n---\n") + "\ntrusted=" + String(trustedCardMode);
+				readinessKey = scripts.length === 0 ? "" : nextSessionId + "\n" + scripts.map(function (script) { return script.id + "\n" + (script.sourceDigest || script.content)+"\nstartup="+JSON.stringify(script.mvuInitialization||null)+'\nremoteSp='+String(script.remoteSp===true); }).join("\n---\n") + "\ntrusted=" + String(trustedCardMode);
 				if (scripts.length === 0) { clear(); activeSessionId = nextSessionId; return; }
                 const composerRoot=options?.background===true?null:migrationHost?.composerRoot?.(nextSessionId);
                 if(composerRoot&&hostDocument.defaultView&&!releaseSlashComposer){
@@ -4705,7 +5044,7 @@ window.__ModuleLoader__.load({
                 for(const [id, group] of groups) {
                     const policy = view?.tavernRuntimePolicy?.scriptPolicies?.[group.scripts[0].id] || view?.tavernRuntimePolicy || {};
                     const groupTrusted = policy.trustedCardMode === true;
-                    const fingerprint = group.scripts.map(script => script.id + '\n' + (script.sourceDigest || script.content)+'\nstartup='+JSON.stringify(script.mvuInitialization||null)).join('\n---\n') + '\ntrusted=' + String(groupTrusted) + '\nlifecycle=' + Number(context.lifecycleRevision || 0) + '\npolicy=' + JSON.stringify(policy) + '\nmvu=' + JSON.stringify(mvuDependency);
+                    const fingerprint = group.scripts.map(script => script.id + '\n' + (script.sourceDigest || script.content)+'\nstartup='+JSON.stringify(script.mvuInitialization||null)+'\nremoteSp='+String(script.remoteSp===true)).join('\n---\n') + '\ntrusted=' + String(groupTrusted) + '\nlifecycle=' + Number(context.lifecycleRevision || 0) + '\npolicy=' + JSON.stringify(policy) + '\nmvu=' + JSON.stringify(mvuDependency);
                     let record = records.get(id);
                     if(record && record.fingerprint !== fingerprint) { removeRecord(id); record = null; }
                     
@@ -4734,7 +5073,8 @@ window.__ModuleLoader__.load({
 				const record = Array.from(records.values()).find(function (item) { return item.token === data.token && event.source === item.frame.contentWindow; });
 				if (!record) return;
                 if(data.type==='dsh-tavern-helper-context-resync'){post(record,{type:'dsh-tavern-helper-context',context:record.context,forceSnapshot:true});return;}
-                if(databaseProviders.receive(record,data)) {
+                const databaseMessage=data.type==='dsh-tavern-original-database-ready'&&(options?.ownedSp===true||options?.spOwned===true)?{...data,ready:data.ready===true}:data;
+                if(databaseProviders.receive(record,databaseMessage)) {
                     if (data.type === "dsh-tavern-original-database-ready" && data.ready === true && record.scripts.has("extension-sp-database") && (record.initializationWorkWaiting || record.initializationWorkTimedOut)) {
                         if (record.initializationWorkTimer) hostWindow.clearTimeout(record.initializationWorkTimer);
                         record.initializationWorkTimer = null;
@@ -4742,6 +5082,7 @@ window.__ModuleLoader__.load({
                         record.initializationWorkTimedOut = false;
                         publishInitializationState();
                     }
+                    if(data.type==='dsh-tavern-original-database-ready'&&(options?.ownedSp===true||options?.spOwned===true))publishInitializationState();
                     return;
                 }
                 if(data.type==='dsh-tavern-helper-slash-commands'){
@@ -4927,7 +5268,7 @@ window.__ModuleLoader__.load({
 				// options) must not fail MESSAGE_RECEIVED, stop the event journal and block
 				// the next turn. A script that awaits the call still gets the error; the skip
 				// is kept as a warning on the event. Calls that may write stay ordinary.
-				if (options?.background === true && foregroundOnlyMethods.has(data.method)) {
+                if (options?.background === true && foregroundOnlyMethods.has(data.method) && !(options?.persistentOwner===true&&['tavernSpZeroLayerView','tavernHelperComposer'].includes(data.method))) {
 					const script = record.scripts.get(String(data.scriptId || ''));
 					const message = '「' + data.method + '」只能在打开的游戏页面里使用；页面关闭时由后台运行脚本，此调用已跳过。';
 					const diagnostic = { kind: 'console', level: 'warn', scriptId: String(data.scriptId || ''), message: '后台跳过：脚本「' + String(script?.name || data.scriptId || '') + '」' + message };
@@ -4960,7 +5301,7 @@ window.__ModuleLoader__.load({
 						const relay = {rootEventId: parentEvent?.rootEventId || '', ancestors,displayTarget:parentEvent?.displayTarget,displayCurrent:parentEvent?.displayCurrent};
 						let args = clone(data.args.args);
 						for (const target of records.values()) {
-							if (target === record || !target.subscriptions.has(name)) continue;
+							if (target === record || (!target.subscriptions.has(name)&&!(target.remoteOwner&&(!target.loaded||!target.subscriptionsReady)&&!target.initializationFailed))) continue;
 							const access = tavernEventRelayAccess(record, target);
 							if (!access.deliver) continue;
 							if (records.get(record.id) !== record || (data.eventId && pendingEvents.get(record.id + '\n' + data.eventId) !== parentEvent)) throw Error('脚本事件已失效');
@@ -5007,10 +5348,18 @@ window.__ModuleLoader__.load({
                             const operation=data.method==='tavernHelperDatabaseTemplates'?mutationArgs.operation:{kind:data.method==='fillTavernScriptDatabase'?'fill':'mutate',command:mutationArgs.command,expectedRevision:mutationArgs.expectedRevision};
                             const routed=databaseProviders.request(record,{...mutationArgs,operation});if(routed)return routed;
                         }
+                        if(spOwnedTaskMethods.has(data.method)&&!(options?.persistentOwner===true&&mutationArgs.scriptId==='extension-sp-database'&&record.scripts.size===1&&record.scripts.has('extension-sp-database')))throw Error('SP 持久任务仅允许专用原包执行者调用');
                         if(data.method==='getTavernScriptResource'){
                             const key=record.sessionId+'\n'+mutationArgs.scriptId+'\n'+String(mutationArgs.digest||'')+'\n'+String(record.policy.assetAccess?.prefix || '');
                             if(!sourceRequests.has(key)){const task=invoke(data.method,mutationArgs,record.sessionId);sourceRequests.set(key,task);task.catch(()=>{if(sourceRequests.get(key)===task)sourceRequests.delete(key);});if(sourceRequests.size>24)sourceRequests.delete(sourceRequests.keys().next().value);}
                             return sourceRequests.get(key).then(result=>record.scriptSources.some(script=>script.sourceDigest===mutationArgs.digest)?Object.assign({},result,{content:scopeTavernAssetText(rewriteTavernStaticMarkup(result.content),record.policy.assetAccess)}):result);
+                        }
+                        if(data.method==='tavernSpZeroLayerView'){
+                            if(mutationArgs.scriptId!=='extension-sp-database'||!record.scripts.has('extension-sp-database')||record.sessionId!==activeSessionId||mutationArgs.expectedLifecycleRevision!==Number(record.context.lifecycleRevision||0))throw Error('零层显示调用已失效');
+                            if(options?.persistentOwner===true)return invoke(data.method,mutationArgs,record.sessionId);
+                            const operation=mutationArgs.operation,scope={sessionId:record.sessionId,chatId:record.context.chatId,lifecycleRevision:Number(record.context.lifecycleRevision||0)};
+                            const result=tavernSpLiveSurfaces.command(scope,operation,(method,query)=>databaseProviders.requestPanel(record.sessionId,{kind:'zero-read',method,query}),ready=>post(record,{type:'dsh-tavern-sp-game-state',ready}));
+                            record.spZeroLayerViewActive=operation.kind!=='dispose';return result;
                         }
                         if(data.method==='tavernHelperBrowserCache' && record.uiKind==='preset' && !mutationArgs.operation){
                             if(record.uiKind!=='preset'||!record.scripts.has(mutationArgs.scriptId)||mutationArgs.expectedLifecycleRevision!==Number(record.context.lifecycleRevision||0))throw new Error('脚本缓存调用已失效');
@@ -5019,22 +5368,29 @@ window.__ModuleLoader__.load({
                         if(data.method==='triggerTavernSlash'){
                             assertTavernFrameSlash(mutationArgs.line,record.trustedCardMode);
                             if(!record.scripts.has(mutationArgs.scriptId)||mutationArgs.expectedLifecycleRevision!==Number(record.context.lifecycleRevision||0)||record.sessionId!==activeSessionId)throw Error('脚本调用已失效');
+                            if(options?.persistentOwner===true&&mutationArgs.scriptId==='extension-sp-database'&&record.scripts.size===1)return invoke(data.method,mutationArgs,record.sessionId);
                             if(!migrationHost)throw Error('当前没有可交互的对话窗口');
                             return migrationHost.executeSlash(String(mutationArgs.line||''),record.sessionId);
                         }
                         if(data.method==='tavernHelperComposer'){
                             if(!record.scripts.has(mutationArgs.scriptId)||mutationArgs.expectedLifecycleRevision!==Number(record.context.lifecycleRevision||0)||record.sessionId!==activeSessionId)throw new Error('脚本输入调用已失效');
+                            if(options?.persistentOwner===true&&mutationArgs.scriptId==='extension-sp-database'&&record.scripts.size===1)return invoke(data.method,mutationArgs,record.sessionId);
                             if(!migrationHost)throw new Error('当前对话输入框不可用');
                             const input=migrationHost.composerInput(record.sessionId);
+                            releaseSpNativeInput.ensure(input);
                             if(!record.composerStop){record.composerRevision=0;record.composerStop=input.state.subscribe(()=>{record.composerRevision++;post(record,{type:'dsh-tavern-composer-state',value:{draft:String(input.state.getSnapshot().draft||''),revision:record.composerRevision}})})}
-                            return performTavernComposerOperation(input,mutationArgs.operation,{revision:()=>record.composerRevision,running:migrationHost.composerRunning(record.sessionId)});
+                            return performTavernComposerOperation(input,mutationArgs.operation,{revision:()=>record.composerRevision,running:migrationHost.composerRunning(record.sessionId),stop:()=>migrationHost.stopComposer(record.sessionId)});
                         }
                         return invoke(data.method, mutationArgs, record.sessionId);
 					});
 					// Independent source/file reads can run concurrently after earlier mutations.
                     // Mutations retain their ordered acknowledgement chain.
-                    const independentRead = data.method === "triggerTavernSlash" || data.method === "getTavernScriptResource" || (data.method === "tavernScriptFiles" && ["read", "verify"].includes(mutationArgs.operation?.kind));
-                    if (!independentRead) record.rpcTail = rpcTask;
+                    const independentRead = data.method === "tavernSpWebRequest" || data.method === "triggerTavernSlash" || data.method === "getTavernScriptResource" || (data.method === "tavernScriptFiles" && ["read", "verify"].includes(mutationArgs.operation?.kind));
+                    // Dispatch waits for earlier mutations but executes the original
+                    // task, whose owner checks/checkpoints/saves reenter this RPC lane.
+                    // Its completion cannot become the prerequisite for those calls.
+                    const ownedTaskDispatch = data.method === 'dispatchTavernSpOwnedTask';
+                    if (!independentRead && !ownedTaskDispatch) record.rpcTail = rpcTask;
 					if (batch) { batch.task = rpcTask; record.queuedPromptBatch = batch; }
 				}
 				record.rpcInFlight = (record.rpcInFlight || 0) + 1;
@@ -5088,6 +5444,30 @@ window.__ModuleLoader__.load({
 			return Object.freeze({
 				sync: sync,
 				emit: emit,
+                ownedState:function(){
+                    const record=[...records.values()].find(item=>!item.remoteOwner&&item.scripts.has('extension-sp-database'));
+                    if(!record)return null;
+                    const script=record.scripts.get('extension-sp-database');
+                    return {loaded:record.loaded,subscriptionsReady:record.subscriptionsReady,subscriptions:[...record.subscriptions],databaseReady:record.databaseReady===true,ready:record.databaseReady===true&&record.readyAnnounced===true&&!record.initializationWorkPending&&!record.initializationWorkWaiting&&!record.initializationWorkFailed&&!record.initializationWorkTimedOut&&!record.initializationFailed&&!script.initializationFailed,lifecycleRevision:Number(record.context.lifecycleRevision||0),chatId:record.context.chatId,sourceDigest:script.sourceDigest,databaseTemplates:record.databaseCatalog||[],initializationFailed:record.initializationFailed===true||record.initializationWorkFailed===true||script.initializationFailed===true,actualInitializationError:script.initializationFailed?String(script.initializationError||'SP 原包初始化失败'):record.initializationWorkFailed?String(record.initializationWorkError||'SP 原包初始化工作失败'):''};
+                },
+                emitOwned:async function(event){
+                    if(options?.spOwned!==true&&options?.ownedSp!==true)throw Error('当前执行器不是 SP 持久执行者');
+                    const diagnostics=[],args=await emit(event.name,event.args,event.context,diagnostics,event.eventId,event.excludedScriptIds,['extension-sp-database']);
+                    return {completed:true,args,diagnostics};
+                },
+                commandOwned:function(operation){
+                    if(options?.spOwned!==true&&options?.ownedSp!==true)return Promise.reject(Error('当前执行器不是 SP 持久执行者'));
+                    if(operation?.kind==='game-state'){
+                        const originals=[...records.values()].filter(record=>!record.remoteOwner&&record.scripts.has('extension-sp-database'));
+                        if(originals.length!==1)throw Error('SP 原包窗口缺失或不唯一');
+                        const record=originals[0];
+                        if(!record.loaded||record.initializationFailed)throw Error('SP 原包窗口尚未可接收表面回执');
+                        post(record,{type:'dsh-tavern-sp-game-state',ready:operation.ready===true});
+                        return {delivered:true};
+                    }
+                    return databaseProviders.requestPanel(activeSessionId,operation);
+                },
+                openOwnedUi:function(){const record=[...records.values()].find(item=>!item.remoteOwner&&item.scripts.has('extension-sp-database'));if(!record)throw Error('SP 原界面不存在');openRecordUi(record);return {opened:true};},
                 displayedMessageRecipients: function() {
                     const eligible=[...records.values()].filter(record=>record.trustedCardMode&&!record.uiKind&&!record.initializationFailed);
                     if(eligible.some(record=>!record.loaded||!record.subscriptionsReady||record.initializationWorkPending))return null;
@@ -5118,11 +5498,12 @@ window.__ModuleLoader__.load({
                         if(!records.size||pendingEvents.size)return false;
                         let originals=0;const actual=[];
                         for(const record of records.values()){
+                            if(record.remoteOwner)continue;
                             if(record.sessionId!==activeSessionId||record.rpcInFlight||record.storagePending||record.storageFailed||record.facadePending||record.facadeFailed||!record.loaded||!record.subscriptionsReady||record.initializationFailed||record.initializationWorkPending||record.initializationWorkWaiting||record.initializationWorkFailed||record.initializationWorkTimedOut||[...record.scripts.values()].some(script=>!script.loaded||!script.subscriptionsReady||script.initializationFailed))return false;
                             for(const script of record.scripts.values())actual.push({scriptId:script.id,sourceDigest:script.sourceDigest||script.content});
-                            if(record.scripts.has('extension-sp-database'))originals++;
+                            if(record.scripts.has('extension-sp-database')&&!record.remoteOwner)originals++;
                         }
-                        if(originals!==1)return false;
+                        if(originals!==1&&![...records.values()].some(record=>record.remoteOwner))return false;
                         const expected=unloadAccess?.participants||[];
                         if(actual.length!==expected.length||actual.some(p=>!expected.some(e=>e.scriptId===p.scriptId&&e.sourceDigest===p.sourceDigest))||new Set(actual.map(p=>p.scriptId)).size!==actual.length)return false;
                         // Each realm proves and fences its own local persistence;
@@ -5131,7 +5512,7 @@ window.__ModuleLoader__.load({
                     }catch(_){return false;}
                 },
                 drain: function(options){
-                    const original=[...records.values()].filter(record=>record.scripts.has('extension-sp-database'));
+                    const original=[...records.values()].filter(record=>!record.remoteOwner&&record.scripts.has('extension-sp-database'));
                     // An original package that is absent, never finished loading or failed
                     // to initialize has handled no event and holds nothing a save could
                     // persist; no retry could ever save from it. Releasing it is not an
@@ -5179,7 +5560,7 @@ window.__ModuleLoader__.load({
 					if (!record) return Promise.reject(new Error("人物卡脚本尚未运行"));
 					return emitToRecord(record, buttonEvent(scriptId, name), [], record.context);
 				},
-				dispose: function () { hostWindow.removeEventListener('dsh-tavern-database-panel-command',databasePanelCommand);hostWindow.removeEventListener('beforeunload', guardPendingSettings); hostWindow.removeEventListener("dsh-tavern-open-script-ui", openScriptUi);hostWindow.removeEventListener("dsh-tavern-audio-state",audioChanged); hostWindow.removeEventListener("message", receive); clear(); releaseHostStylesheetBridge(); },
+				dispose: function () { releaseSpNativeInput();hostWindow.removeEventListener('dsh-tavern-database-panel-command',databasePanelCommand);hostWindow.removeEventListener('beforeunload', guardPendingSettings); hostWindow.removeEventListener("dsh-tavern-open-script-ui", openScriptUi);hostWindow.removeEventListener("dsh-tavern-audio-state",audioChanged); hostWindow.removeEventListener("message", receive); clear(); releaseHostStylesheetBridge(); },
 				inspect: function () {
 					const record = records.get("shared");
 					const scripts = Array.from(records.values()).flatMap(r => Array.from(r.scripts.values()).map(function (script) { return { id: script.id, system:script.system, loaded: script.loaded, subscriptionsReady: script.subscriptionsReady, initializationFailed: script.initializationFailed, ...(r.mvuFirstStartWaiting === true && r.mvuGateAttempt !== true && !script.subscriptionsReady && !script.initializationFailed ? { awaitingCore: true } : {}) }; }));
@@ -5189,8 +5570,9 @@ window.__ModuleLoader__.load({
 					// initialization failure. Companions are still told the core failed, but the
 					// runtime only reports "not ready", so settlements defer and resume after the retry.
 					const downloadPaused = record?.mvuLoadState?.phase === "failed" && record.mvuLoadState.canRetry === true;
-					const initializationError = downloadPaused ? "" : mvuInitializationError(record);
-					return { sessionId: activeSessionId, lifecycleRevision:Number(record?.context?.lifecycleRevision||0), ...(mvuCompanionFailure()?{initializationBlocked:true,initializationBlockReason:mvuCompanionFailure()}:{}), frameCount: records.size, scriptIds: scripts.map(function (script) { return script.id; }), scripts: scripts, ...(record && record.mvuCoreId ? { mvuDataReady: mvuDataReady(record), mvuVersionSelection:record.mvuVersionSelection } : {}), ...(record && record.mvuLoadState ? { mvuLoadState: record.mvuLoadState } : {}), ...(mvuCoreFailed ? { mvuCoreFailed: true } : {}), ...(initializationError ? { initializationError: initializationError } : {}) };
+					const ownedInitializationError=(options?.ownedSp===true||options?.spOwned===true)?[...records.values()].filter(item=>!item.remoteOwner).map(item=>item.scripts.get('extension-sp-database')).find(script=>script?.initializationFailed):null;
+					const initializationError = ownedInitializationError?String(ownedInitializationError.initializationError||'SP 原包初始化失败'):downloadPaused ? "" : mvuInitializationError(record);
+					return { sessionId: activeSessionId, lifecycleRevision:Number(record?.context?.lifecycleRevision||0), ...((options?.ownedSp===true||options?.spOwned===true)?{spDatabaseReady:[...records.values()].some(item=>!item.remoteOwner&&item.scripts.has('extension-sp-database')&&item.databaseReady===true)}:{}), ...(mvuCompanionFailure()?{initializationBlocked:true,initializationBlockReason:mvuCompanionFailure()}:{}), frameCount: records.size, scriptIds: scripts.map(function (script) { return script.id; }), localScriptIds:[...records.values()].filter(record=>!record.remoteOwner).flatMap(record=>[...record.scripts.keys()]), scripts: scripts, ...(record && record.mvuCoreId ? { mvuDataReady: mvuDataReady(record), mvuVersionSelection:record.mvuVersionSelection } : {}), ...(record && record.mvuLoadState ? { mvuLoadState: record.mvuLoadState } : {}), ...(mvuCoreFailed ? { mvuCoreFailed: true } : {}), ...(initializationError ? { initializationError: initializationError } : {}) };
 				}
 			});
 		}
@@ -5299,7 +5681,7 @@ window.__ModuleLoader__.load({
                 const displayJobs=displayedQueue.clear();
                 for(const job of displayJobs)void Promise.resolve(invoke('cancelTavernDisplayedMessage',{eventId:job.packet.eventId,runtimeId:previousLease?.id},job.packet.sessionId)).catch(error=>console.warn('正文显示取消失败',error));
                 let drain;
-                if(previousLease&&previousRuntime?.inspect().scriptIds?.includes('extension-sp-database')){
+                if(previousLease&&(previousRuntime?.inspect().localScriptIds||previousRuntime?.inspect().scriptIds)?.includes('extension-sp-database')){
                     let unloadRequest;
                     if(idlePagehide&&!quarantineError&&options?.background!==true&&previousLease.unloadAccess&&!previousLease.workDeadline&&!previousLease.displayExecuting&&!pendingReleases.size){
                         const hostIdle=previousRuntime.prepareUnload?.()===true;
@@ -5311,8 +5693,8 @@ window.__ModuleLoader__.load({
                 }
                 else if(previousLease?.displayExecuting){
                     drainingLeases.add(previousLease);
-                    previousRuntime.dispose();
-                    drain=Promise.resolve(previousLease.idle).finally(()=>{drainingLeases.delete(previousLease);return releaseLease(previousLease);});
+                    const detached=previousRuntime.dispose();
+                    drain=Promise.all([previousLease.idle,detached]).finally(()=>{drainingLeases.delete(previousLease);return releaseLease(previousLease);});
                 }
 				lease = null;
 				if(visibilityListening){hostDocument.removeEventListener('visibilitychange',onVisibility);hostDocument.removeEventListener('resume',onVisibility);visibilityListening=false;}
@@ -5326,7 +5708,7 @@ window.__ModuleLoader__.load({
 				workStop = null;
 				if (heartbeatTimer !== null) stopHeartbeat(heartbeatTimer);
 				heartbeatTimer = null;
-				if (runtime&&!drain) runtime.dispose();
+				if (runtime&&!drain){const detached=runtime.dispose();if(previousLease&&detached)drain=Promise.resolve(detached).then(()=>releaseLease(previousLease));}
 				runtime = null;
 				if (options && options.onMvuLoadState) options.onMvuLoadState(null);
                 if(!quarantineError)options?.onInitializationState?.(null);
@@ -5345,8 +5727,8 @@ window.__ModuleLoader__.load({
 				lease = { sessionId: sessionId, id: hostWindow.crypto && typeof hostWindow.crypto.randomUUID === "function" ? hostWindow.crypto.randomUUID() : String(Date.now()) + ":" + String(Math.random()) };
 				const currentLease = lease;
 				runtime = createRuntime({
-                    window: hostWindow, background:options?.background===true, rpc: (method,args,id,requestOptions)=>{
-                        if(currentLease.quarantined&&!(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline&&args.spRecoveryToken===currentLease.recoveryToken&&args.scriptId==='extension-sp-database'&&['saveTavernChatData','saveTavernExtensionSettings','publishTavernSpAuthorityCache'].includes(method)))return Promise.reject(new Error('SP 执行已隔离，仅允许显式保存重试（RPC: '+method+'; recoveryToken: '+(args.spRecoveryToken?'present':'missing')+'; recoveryWindow: '+(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline?'valid':'expired')+'）'));
+                    window: hostWindow, spOwned:options?.spOwned===true||options?.ownedSp===true, background:options?.background===true, persistentOwner:options?.persistentOwner===true||options?.spOwned===true||options?.ownedSp===true, rpc: (method,args,id,requestOptions)=>{
+                        if(currentLease.quarantined&&!(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline&&args.spRecoveryToken===currentLease.recoveryToken&&args.scriptId==='extension-sp-database'&&['saveTavernChatData','saveTavernExtensionSettings','publishTavernSpAuthorityCache','assertTavernSpOwnedTask','prepareTavernSpOwnedSaveRetry','checkpointTavernSpOwnedTask'].includes(method)&&(!currentLease.recoveryTaskId||!args.payload?.taskId||args.payload.taskId===currentLease.recoveryTaskId)&&(method!=='checkpointTavernSpOwnedTask'||['completed','failed'].includes(args.payload?.phase))))return Promise.reject(new Error('SP 执行已隔离，仅允许显式保存重试（RPC: '+method+'; recoveryToken: '+(args.spRecoveryToken?'present':'missing')+'; recoveryWindow: '+(currentLease.recoveryToken&&monotonicNow()<currentLease.recoveryDeadline?'valid':'expired')+'）'));
                         return invoke(method,{...args,runtimeId:currentLease.id},id,requestOptions);
                     }, onMutation: invalidate,
 					onMvuLoadState: function (state) {
@@ -5402,7 +5784,7 @@ window.__ModuleLoader__.load({
 					}, delay);
 				}
 				async function claimWork() {
-				if (!lease || !runtime || !input || !input.sessionId || !hasScriptRuntime(input.view)) return;
+				if (!lease || lease.quarantined || !runtime || !input || !input.sessionId || !hasScriptRuntime(input.view)) return;
 				const currentLease = lease;
 				const currentRuntime = runtime;
 				if (claimBusy === currentLease) { claimRequested = true; return; }
@@ -5481,7 +5863,7 @@ window.__ModuleLoader__.load({
 					if (currentEvent) {
                         if(currentEvent.displayedMessage)displayedQueue.finish(currentEvent.id,error);
 						try {
-								await invoke("completeTavernHelperEvent", { eventId: currentEvent.id, leaseToken: leaseToken, args: currentEvent.args, error: String(error && error.message || error), runtimeId: currentLease.id, diagnostics: diagnostics }, currentLease.sessionId);
+								await invoke("completeTavernHelperEvent", { eventId: currentEvent.id, leaseToken: leaseToken, args: currentEvent.args, error: String(error && error.message || error), runtimeId: currentLease.id, diagnostics: diagnostics, ...(error?.dshSpSaveRecoveryBoundary?{spSaveRecoveryBoundary:error.dshSpSaveRecoveryBoundary}:{}) }, currentLease.sessionId);
 							} catch (completeError) { console.warn("Tavern Helper 失败回执同步失败", completeError); }
 						}
 						scheduleClaimRetry(currentLease);
@@ -5523,8 +5905,28 @@ window.__ModuleLoader__.load({
 			}
 			return Object.freeze({
 				sync: sync, dispose: dispose,
+                ownedState:()=>runtime?.ownedState?.()||null,
+                emitOwned:event=>{if((options?.spOwned!==true&&options?.ownedSp!==true)||!runtime||!active)return Promise.reject(Error('SP 持久执行者未取得执行权'));return runtime.emitOwned(event);},
+                commandOwned:operation=>{if((options?.spOwned!==true&&options?.ownedSp!==true)||!runtime||!active)return Promise.reject(Error('SP 持久执行者未取得执行权'));return runtime.commandOwned(operation);},
+                openOwnedUi:()=>{if((options?.spOwned!==true&&options?.ownedSp!==true)||!runtime||!active)throw Error('SP 持久执行者未取得执行权');return runtime.openOwnedUi();},
                 presentDisplayedMessage: function(target){displayedQueue.add(target);void claimWork();},
-                quarantine:error=>dispose({quarantineError:error||"SP 执行已隔离"}),
+                quarantine:error=>{
+                    if((options?.spOwned===true||options?.ownedSp===true)&&lease&&runtime){lease.quarantined=true;lease.quarantineError=String(error||"SP 执行已隔离");delete lease.recoveryToken;return {retained:true};}
+                    return dispose({quarantineError:error||"SP 执行已隔离"});
+                },
+                beginOwnedSaveRecovery:permit=>{
+                    if(!lease?.quarantined||!runtime||permit?.runtimeId!==lease.id||typeof permit.token!=='string'||!permit.token||!permit.taskId)throw Error('SP 原保存恢复租约已失效');
+                    lease.recoveryToken=permit.token;lease.recoveryTaskId=permit.taskId;lease.recoveryDeadline=monotonicNow()+Math.min(91000,permit.timeoutMs||91000);return {reserved:true};
+                },
+                finishOwnedSaveRecovery:token=>{
+                    if(!lease?.quarantined||lease.recoveryToken!==token||monotonicNow()>=lease.recoveryDeadline)throw Error('SP 原保存恢复确认已失效');
+                    lease.recoveryCommitted=true;return {committed:true};
+                },
+                resumeOwnedSaveRecovery:token=>{
+                    if(!lease?.quarantined||!lease.recoveryCommitted||lease.recoveryToken!==token||monotonicNow()>=lease.recoveryDeadline)throw Error('SP save recovery resume expired');
+                    lease.quarantined=false;delete lease.quarantineError;delete lease.recoveryCommitted;delete lease.recoveryToken;delete lease.recoveryTaskId;options?.onInitializationState?.(null);void heartbeat();void claimWork();return {resumed:true};
+                },
+                cancelOwnedSaveRecovery:token=>{if(lease?.recoveryToken===token){delete lease.recoveryToken;delete lease.recoveryTaskId;}},
                 retrySpDrain:recovery=>pendingReleases.size?Promise.all([...pendingReleases.values()].map(entry=>entry.retry(recovery))):invoke('retryTavernBackgroundScriptDrain',{},input?.sessionId).then(result=>{if(result.released){options?.onInitializationState?.(null);void claimWork();}return [result];}),
 				networkSources: function (frame) { return [...new Set([...(active&&runtime?runtime.networkSources(frame):[]),...[...pendingReleases.values()].filter(entry=>!entry.terminal&&!entry.lease.quarantined).flatMap(entry=>(entry.runtime.networkSources?.(frame)||[]).filter(id=>id==='extension-sp-database'))])]; },
                 takeOver: async function(){
@@ -5559,7 +5961,7 @@ window.__ModuleLoader__.load({
 			});
 		}
 		function tavernScriptRuntimeReady(inspection) {
-			if (inspection && (inspection.initializationError || inspection.mvuDataReady === false)) return false;
+			if (inspection && (inspection.initializationError || inspection.mvuDataReady === false || inspection.spDatabaseReady === false)) return false;
 			const scripts = inspection && Array.isArray(inspection.scripts) ? inspection.scripts : [];
 			return scripts.length > 0 && scripts.every(function (script) {
 				if (script && (script.id === "__dsh_official_mvu__" || script.system === "card-mvu") && script.initializationFailed === true) return false;
@@ -5951,6 +6353,8 @@ window.__ModuleLoader__.load({
                     if (previous) { previous.disconnect(); frameSizeObservers.delete(document.token); }
 					if (!node) {touchRelay.stop();document.dropSourceCache();documents.delete(document);}
 					channel.attach(node);
+                    document.releaseSpSurface?.();
+                    document.releaseSpSurface=node?tavernSpLiveSurfaces.register({node,token:document.token,hold:false,identity:{sessionId:props.sessionId,lifecycleRevision:Number(helperContext?.lifecycleRevision||0),messageId:Number(helperContext?.turnMessageIds?.[String(props.turn)]??-1)},current:()=>Boolean(listener&&document===visible&&channels.get(document.token)===channel)}):null;
                     document.releaseDisplayedMessage?.();
                     document.releaseDisplayedMessage = node && document.trustedCardMode ? tavernDisplayedMessages.bind(node.contentWindow,()=>({
                         trusted:true,current:Boolean(listener && document===visible && channels.get(document.token)===channel),
@@ -5984,7 +6388,7 @@ window.__ModuleLoader__.load({
 				};
 				return document;
 			}
-            function canSuspend(){return props.eager!==true&&props.persistent!==true&&props.preserveInstance!==true&&!visible?.userState&&!pending?.userState;}
+            function canSuspend(){return props.eager!==true&&props.persistent!==true&&props.preserveInstance!==true&&!tavernSpLiveSurfaces.isHeld(channels.get(visible?.token)?.element())&&!visible?.userState&&!pending?.userState;}
             function suspend(){
                 if(suspended||!canSuspend())return false;
                 suspended=true;lifetime++;cancelRuntimeReport();touchRelay.stop();
@@ -6230,7 +6634,7 @@ window.__ModuleLoader__.load({
                                 composerRevision++;
                                 for (const [token, active] of channels) active.element()?.contentWindow?.postMessage({type:'dsh-tavern-composer-state',token,value:{draft:String(input.state.getSnapshot().draft||''),revision:composerRevision}},'*');
                             });
-                            return performTavernComposerOperation(input,data.args?.operation,{revision:()=>composerRevision,running:migrationHost.composerRunning(props.sessionId)});
+                            return performTavernComposerOperation(input,data.args?.operation,{revision:()=>composerRevision,running:migrationHost.composerRunning(props.sessionId),stop:()=>migrationHost.stopComposer(props.sessionId)});
                         }).then(result => { if(current()) event.source.postMessage({type:'dsh-tavern-helper-response',token:data.token,requestId:data.requestId,ok:true,result},'*'); }, error => { if(current()) event.source.postMessage({type:'dsh-tavern-helper-response',token:data.token,requestId:data.requestId,ok:false,error:error.message},'*'); });
                         return;
                     }
@@ -6532,6 +6936,7 @@ window.__ModuleLoader__.load({
 					key: document.token,
 					ref: document.ref,
 					className: "dsh-tavern-message-frame",
+                    'data-dsh-tavern-frame-token':document.token,
 					title: hidden ? "正在准备人物卡消息界面" : "人物卡消息界面",
 					"aria-hidden": hidden || undefined,
 					"data-dsh-tavern-content-height": document.height,
@@ -6923,7 +7328,7 @@ window.__ModuleLoader__.load({
 				const time = Number.isFinite(Number(data.time)) ? new Date(Number(data.time)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
 				return React.createElement("div", { className: "dsh-tavern-user-row" },
 					React.createElement("div", { className: "dsh-tavern-user-stack" }, renderedImages, (text !== "" || extras.length > 0) ? React.createElement("div", { className: "dsh-tavern-user-bubble" }, userDisplay, extras) : null),
-					React.createElement("div", { className: "dsh-tavern-user-actions" }, React.createElement(TavernUserInputEditor,{sessionId:props.sessionId,turn:turn,useSession:props.useSession}), time ? React.createElement("span", null, time) : null, React.createElement(DshUi.Tooltip, { label: copied ? "已复制" : "复制", side: "bottom" }, React.createElement("button", { type: "button", className: "dsh-tavern-user-copy", "aria-label": copied ? "已复制" : "复制", onClick: copy }, React.createElement(copied ? DshUi.IconCheckOutline16 : DshUi.IconCopyOutline16, null))))
+					React.createElement("div", { className: "dsh-tavern-user-actions" }, React.createElement(TavernUserInputEditor,{sessionId:props.sessionId,turn:turn,useSession:props.useSession}), time ? React.createElement("span", null, time) : null, React.createElement(DshUi.Tooltip, { label: copied ? "已复制" : "复制", side: "bottom" }, React.createElement("button", { type: "button", className: "dsh-tavern-user-copy", "aria-label": copied ? "已复制" : "复制", onClick: copy }, React.createElement(copied ? DshUi.IconCheckOutlineRegular : DshUi.IconCopyOutlineRegular, null))))
 				);
 			}
 			function openSceneImagePreview(url, opener) {
@@ -7115,7 +7520,7 @@ window.__ModuleLoader__.load({
 				const mvuReceiptNode = mvuReceipt ? React.createElement(TavernMvuReceipt, { receipt: mvuReceipt, sessionId: props.sessionId, turn: storyTurn, canRetry: storyTurn === liveState.view?.latestAssistantTurn }) : null;
 				const sceneImagesEnabled = Boolean(liveState.view && liveState.view.releaseCapabilities && liveState.view.releaseCapabilities.sceneImages);
 				const illustration = sceneImagesEnabled && settled && storyTurn > 0 && isPlayMode(liveState.view && liveState.view.mode) && !sessionTransitioning ? React.createElement(SceneIllustration, { key: props.sessionId + ":" + storyTurn, sessionId: props.sessionId, turn: storyTurn }) : null;
-				return React.createElement("div", { className: "dsh-tavern-assistant", "data-streaming": data.status === "running" || undefined }, rendered, illustration, mvuReceiptNode);
+				return React.createElement(TavernSpCarrierSurface,{identity:adopted&&!sessionTransitioning&&Number.isInteger(logicalId)?{sessionId:props.sessionId,messageId:logicalId,lifecycleRevision:Number(liveState.view?.tavernHelper?.lifecycleRevision||0),bodyId,swipeId:Number(liveState.view?.tavernHelper?.messages?.[logicalId]?.swipe_id||0)}:null},React.createElement("div", { className: "dsh-tavern-assistant", "data-streaming": data.status === "running" || undefined }, rendered, illustration, mvuReceiptNode));
 			}
 			function TavernForkAssistantAction(props) {
 				const liveState = useLiveTavernView(props.sessionId, String(props.messageId || ""));
@@ -7136,7 +7541,7 @@ window.__ModuleLoader__.load({
 				}
 				return React.createElement(DshUi.Tooltip, { label: forking ? "正在分叉…" : "从这一轮分叉", side: "bottom" },
 					React.createElement("button", { type: "button", className: "dsh-tavern-message-fork", "aria-label": "从这一轮分叉", disabled: forking, onClick: fork },
-						React.createElement(DshUi.IconBranchOutline16, null)));
+						React.createElement(DshUi.IconBranchOutlineRegular, null)));
 			}
 			function register(input) {
 				const scriptOwner = createTavernScriptSessionOwner({ sessions: input.ctx.sessions });
