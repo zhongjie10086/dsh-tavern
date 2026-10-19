@@ -131,8 +131,8 @@ body.dsh-tavern-shell-active [data-turn-tail] [data-slot="conversation.chat.assi
 body.dsh-tavern-shell-active .dsh-tavern-hero-preset-row { display: none !important; }
 /* A blank session is also a hero. Only the session-less landing page loses its composer. */
 body.dsh-tavern-shell-active .dsh-tavern-landing { display: grid !important; place-items: center; }
-body.dsh-tavern-shell-active .dsh-tavern-landing > * { display: none !important; }
-body.dsh-tavern-shell-active .dsh-tavern-landing::before { content: "🍺 DSH Tavern"; color: #9a622f; font-size: clamp(24px, 4vw, 40px); font-weight: 800; padding: 24px; text-align: center; }
+body.dsh-tavern-shell-active .dsh-tavern-landing > :not(.dsh-tavern-home-mount) { display: none !important; }
+body.dsh-tavern-shell-active .dsh-tavern-landing::before { content: none; }
 body.dsh-tavern-shell-active [data-ref-chip="file"] { max-width: calc(100% - 4px); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .dsh-tavern-side-head { height: 48px; display: flex; align-items: center; gap: 8px; flex: none; }
 .dsh-tavern-side-brand { flex: 1; min-width: 0; font-size: 16px; font-weight: 800; color: #9a622f; white-space: nowrap; overflow: hidden; }
@@ -1105,3 +1105,78 @@ html.dsh-tavern-hide-process [data-chat-flow-kind="turn-process"]:has([data-turn
 .dsh-tavern-guide-editor label { display: grid; gap: 6px; }
 .dsh-tavern-guide-editor textarea { box-sizing: border-box; width: 100%; margin-bottom: 6px; }
 .dsh-tavern-guide-editor > div:not(.dsh-tavern-guide-actions) { padding: 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; }
+
+/* R34: owned landing and native modal surface. */
+.dsh-tavern-home-mount { width:100%; min-width:0; }
+.dsh-tavern-home-mount[hidden] { display:none!important; }
+.dsh-tavern-home { box-sizing:border-box; max-width:680px; margin:auto; padding:32px; color:var(--dsw-alias-label-primary); }
+.dsh-tavern-home-brand { color:#9a622f; font-weight:700; letter-spacing:.03em; }
+.dsh-tavern-home h1 { font-size:clamp(24px,3vw,34px); line-height:1.4; margin:16px 0; }
+.dsh-tavern-home p { line-height:1.7; }
+.dsh-tavern-home > button { display:block; margin:16px 0; max-width:100%; white-space:normal; }
+.dsh-tavern-home-secondary { display:flex; flex-wrap:wrap; gap:8px; margin-top:24px; }
+.dsh-tavern-home-secondary > button { margin:0!important; }
+.dsh-tavern-picker-dialog { padding:0; border:0; background:transparent; color:var(--dsw-alias-label-primary); max-width:calc(100vw - 24px); max-height:calc(100dvh - 24px); overflow:visible; }
+.dsh-tavern-picker-dialog::backdrop { background:rgba(20,18,24,.42); backdrop-filter:blur(2px); }
+.dsh-tavern-picker-dialog .dsh-tavern-card-picker { max-height:calc(100dvh - 48px); }
+
+/* R34: card selection keeps management separate from the primary action. */
+.dsh-tavern-card-pick-wrap { flex-wrap:wrap; align-items:center; padding:6px 0; }
+.dsh-tavern-card-pick-wrap .dsh-tavern-card-pick { width:auto; flex:1 1 220px; }
+.dsh-tavern-card-pick .dsh-tavern-card-thumb { display:grid; place-items:center; flex:0 0 48px; width:48px; height:64px; position:relative; overflow:hidden; border-radius:7px; background:var(--dsw-alias-interactive-bg-hover,rgba(154,98,47,.12)); color:var(--dsw-alias-label-secondary); font-size:22px; }
+.dsh-tavern-card-pick .dsh-tavern-card-thumb > span { font-size:22px; margin:0; }
+.dsh-tavern-card-thumb img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+.dsh-tavern-card-thumb img[hidden] { display:none; }
+.dsh-tavern-card-pick { display:flex; align-items:center; gap:12px; min-width:0; }
+.dsh-tavern-card-details { font-size:13px; margin-left:auto; max-width:100%; }
+.dsh-tavern-card-details[open] { flex-basis:100%; }
+.dsh-tavern-card-details summary { cursor:pointer; padding:6px 10px; }
+.dsh-tavern-card-detail-body { padding:10px; overflow-wrap:anywhere; background:var(--dsw-alias-interactive-bg-hover); border-radius:8px; }
+.dsh-tavern-card-detail-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+
+/* R34: settings panels stay mounted when their navigation changes. */
+.dsh-tavern-settings-nav { display:flex; flex-wrap:wrap; gap:6px; margin:16px 0 24px; }
+.dsh-tavern-settings-nav button { font:inherit; font-size:13px; padding:8px 12px; border:1px solid var(--dsw-alias-border-l2); border-radius:8px; color:var(--dsw-alias-label-primary); background:transparent; cursor:pointer; }
+.dsh-tavern-settings-nav button[aria-current=true] { background:#9a622f; color:#fff; border-color:#9a622f; }
+.dsh-tavern-settings-panel[hidden] { display:none!important; }
+.dsh-tavern-settings-panel h3 { margin:0 0 12px; font-size:17px; }
+.dsh-tavern-settings-scope { color:var(--dsw-alias-label-secondary); font-size:13px; line-height:1.65; }
+.dsh-tavern-settings-fields { margin:20px 0; padding:0; border:0; min-width:0; }
+.dsh-tavern-settings-fields legend { font-size:16px; font-weight:600; }
+.dsh-tavern-settings-panel .dsh-tavern-settings-row { gap:14px; }
+.dsh-tavern-settings-panel .dsh-tavern-settings-row:has(>select,>input:not([type=checkbox]),>textarea) { flex-direction:column; align-items:stretch; }
+.dsh-tavern-settings-panel .dsh-tavern-settings-select { width:100%; max-width:none; flex:none; box-sizing:border-box; }
+.dsh-tavern-settings-panel .dsh-tavern-settings-copy { min-width:0; }
+.dsh-tavern-settings-panel .dsh-tavern-settings-text { width:100%; max-width:none; box-sizing:border-box; }
+.dsh-tavern-settings-panel [role=alert] { line-height:1.6; }
+.dsh-tavern-settings-panel [role=alert] button { margin-left:8px; }
+.dsh-tavern-settings-panel [role=status] { font-size:13px; line-height:1.6; }
+
+/* R34: tokens apply only to Tavern-owned controls, not original plugin bodies. */
+.dsh-tavern-btn { background:var(--dsw-specific-input-major,#f7f7f8); color:var(--dsw-alias-label-primary,#282624); border-color:var(--dsw-alias-border-l2,#d6d3cf); font:inherit; font-size:13px; line-height:1.4; padding:7px 12px; min-height:32px; }
+.dsh-tavern-btn:hover { background:var(--dsw-alias-interactive-bg-hover,rgba(154,98,47,.1)); }
+.dsh-tavern-btn.primary,.dsh-tavern-question-primary { background:#9a622f; color:#fff; border-color:#9a622f; }
+.dsh-tavern-btn.danger { color:var(--dsw-alias-status-error,#b43838); }
+.dsh-tavern-btn:disabled { opacity:.55; cursor:default; }
+:is(.dsh-tavern-home,.dsh-tavern-picker-dialog,.dsh-tavern-settings-section,[data-tavern-owned-ui]) :is(button,input,textarea,select,summary):focus-visible { outline:2px solid var(--dsw-alias-label-primary,#75451e); outline-offset:3px; }
+.dsh-tavern-picker-dialog .dsh-tavern-card-picker { font-size:14px; }
+.dsh-tavern-card-picker-head { flex-wrap:wrap; line-height:1.5; }
+.dsh-tavern-card-picker-head > span:not(.dsh-tavern-spacer) { min-width:0; overflow-wrap:anywhere; }
+.dsh-tavern-card-list-copy { min-width:0; overflow-wrap:anywhere; }
+.dsh-tavern-card-list-copy > span { font-size:13px; line-height:1.55; }
+.dsh-tavern-card-list-copy > b { font-size:15px; }
+.dsh-tavern-settings-section { font-size:14px; }
+.dsh-tavern-settings-desc { font-size:13px; line-height:1.65; }
+:is(.dsh-plugin-panel,.dsh-play-settings)[data-tavern-owned-ui] { color-scheme:inherit; --dsw-alias-label-primary:inherit; --dsw-alias-label-secondary:inherit; --dsw-alias-label-tertiary:inherit; --dsw-alias-text-l2:inherit; --dsw-alias-background-primary:inherit; --dsw-alias-bg-base:inherit; --dsw-alias-border-l2:inherit; --dsw-alias-border-l3:inherit; --dsw-specific-input-major:inherit; --dsw-specific-input-minor:inherit; --dsw-specific-sidebar-fill:inherit; background:var(--dsw-specific-sidebar-fill,#fff); color:var(--dsw-alias-label-primary,#282624); font-size:14px; }
+.dsh-floating-content:has(>[data-tavern-owned-ui]) { background:var(--dsw-specific-sidebar-fill,#fff); color:var(--dsw-alias-label-primary,#282624); }
+.dsh-plugin-panel[data-tavern-owned-ui] :is(input,textarea,select,.dsh-tavern-preset-row,.dsh-tavern-prompt-row,.dsh-tavern-card-advanced) { color:var(--dsw-alias-label-primary); background:var(--dsw-specific-input-major); border-color:var(--dsw-alias-border-l2); }
+.dsh-plugin-panel[data-tavern-owned-ui] .dsh-sp-card { background:var(--dsw-specific-input-major); border-color:var(--dsw-alias-border-l2); }
+.dsh-plugin-panel[data-tavern-owned-ui] .dsh-plugin-tabs button[aria-pressed=true] { color:#fff; background:#9a622f; }
+.dsh-plugin-panel[data-tavern-owned-ui] .dsh-tavern-card-field :is(label,input,textarea) { font-size:14px; line-height:1.6; }
+.dsh-plugin-panel[data-tavern-owned-ui] .dsh-tavern-card-advanced summary { font-size:13px; line-height:1.6; }
+@media(max-width:760px) {
+ .dsh-tavern-home { padding:20px; }
+ .dsh-tavern-picker-dialog .dsh-tavern-card-picker { width:calc(100vw - 24px); padding:14px; max-height:calc(100dvh - 24px); }
+ .dsh-tavern-settings-panel .dsh-tavern-settings-row { padding:14px; }
+ .dsh-tavern-settings-nav { gap:6px; }
+}

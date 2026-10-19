@@ -545,7 +545,7 @@ window.__ModuleLoader__.load({
 					attempt += 1;
 					await sleep(Math.min(delay, remaining));
 				}
-				if (!ready(sessionId)) throw new Error("DSH Session 列表同步超时，请刷新页面后重试：" + sessionId);
+				if (!ready(sessionId)) throw new Error("对话列表同步超时，请刷新页面后重试：" + sessionId);
 			}
 
 			function wait(sessionId) {
@@ -633,17 +633,17 @@ window.__ModuleLoader__.load({
 						if (!sessionId) {
 							phase = request.kind === "card" ? "准备卡片工作区" : "准备游玩工作区";
 							const workspaceId = await options.resolveWorkspace(request);
-							phase = "创建 DSH Session";
+							phase = "创建对话";
 							sessionId = await options.connectWorkspace(workspaceId);
 						}
-						phase = "等待 DSH Session 就绪";
+						phase = "等待对话就绪";
 						await options.waitForSession(sessionId);
                         const run = async function () {
 						phase = "切换到酒馆模式";
 						await options.ensurePreset(sessionId, request);
 						phase = request.kind === "card" ? "创建卡片工作台对话" : "写入人物卡开场白";
 						await options.createChat(request, sessionId);
-						phase = "同步并打开 DSH Session";
+						phase = "同步并打开对话";
 						const pending = Object.assign({}, request.pending || {}, { sessionId: sessionId, targetMode: request.targetMode });
 						options.rememberPending(pending);
 						await options.finishOpen(pending);
@@ -1706,6 +1706,7 @@ window.__ModuleLoader__.load({
 // @include modules/resource-permissions.js
 // @include modules/resource-version-panel.js
 // @include modules/confirm-dialog.js
+// @include modules/picker-dialog.js
         // @include modules/confirmation-actions.js
 // @include modules/frame-assets.js
 
@@ -7782,21 +7783,25 @@ window.__ModuleLoader__.load({
 		function TavernSidebar(props) {
             const askConfirm = useTavernConfirm([props.sessionId,props.scope?.sessionId,props.cardPath,props.path,props.card?.path,props.view?.card?.path,props.record?.source?.path,props.record?.source?.cardPath].join("\n"));
 			function TavernCardListContent(props) {
-				const card = props.card;
-				const image = card && card.hasImage ? React.createElement("img", {
-					className: "dsh-tavern-card-thumb",
-					src: "/api/dsh-tavern/card-image?path=" + encodeURIComponent(card.path),
-					alt: "",
-					loading: "lazy",
-					onError: function (event) { event.currentTarget.hidden = true; }
-				}) : null;
-				return React.createElement(React.Fragment, null, image, React.createElement("span", { className: "dsh-tavern-card-list-copy" },
-					React.createElement("b", null, card.name),
-					card.path ? React.createElement("span", { title: card.path, style: { overflowWrap: "anywhere" } }, "文件：" + String(card.path).replace(/\\/g, "/").split("/").pop()) : null,
-					React.createElement("span", { className: card.readError ? "dsh-tavern-dock-error" : undefined }, card.readError || props.detail),
-					props.extra ? React.createElement("span", null, props.extra) : null
-				));
-			}
+                const card = props.card;
+                return React.createElement(React.Fragment, null,
+                    React.createElement('span', {className:'dsh-tavern-card-thumb', 'aria-hidden':true},
+                        React.createElement('span',null,Array.from(card.name || '卡')[0]),
+                        card.hasImage ? React.createElement('img',{src:'/api/dsh-tavern/card-image?path='+encodeURIComponent(card.path),alt:'',loading:'lazy',onError:event=>{event.currentTarget.hidden=true;}}) : null),
+                    React.createElement('span',{className:'dsh-tavern-card-list-copy'},
+                        React.createElement('b',null,card.name),
+                        React.createElement('span',{className:card.readError ? 'dsh-tavern-dock-error' : undefined},card.readError || props.detail),
+                        props.extra ? React.createElement('span',null,props.extra) : null));
+            }
+            function cardDetails(card, actions) {
+                return h('details',{className:'dsh-tavern-card-details'},
+                    h('summary',{'aria-label':'更多 · '+card.name},'更多'),
+                    h('div',{className:'dsh-tavern-card-detail-body'},
+                        h('span',null,'文件：'+String(card.path || '').replace(/\\/g,'/').split('/').pop()),
+                        actions ? h('div',{className:'dsh-tavern-card-detail-actions'},
+                            h('button',{className:'dsh-tavern-btn',disabled:busy,onClick:()=>exportCard(card)},'导出'),
+                            h('button',{className:'dsh-tavern-btn danger',disabled:busy,onClick:()=>cardBatch.remove([card])},'从人物卡库删除')) : null));
+            }
 
 			const collapsed = props.collapsed;
 			const current = props.useSessions(function (state) { return props.navigation.currentId(state); });
@@ -7818,6 +7823,14 @@ window.__ModuleLoader__.load({
 				try { window.localStorage.setItem("dsh-tavern-history-groups", JSON.stringify(historyGroupState)); } catch (_) {}
 			}, [historyGroupState]);
 			const [picking, setPicking] = React.useState(false);
+            const pickerOpener = React.useRef(null);
+            const homeImport = React.useRef(null);
+            const [homeTarget, setHomeTarget] = React.useState(null);
+            React.useEffect(function () {
+                const sync = () => setHomeTarget(document.querySelector('.dsh-tavern-landing > .dsh-tavern-home-mount'));
+                document.addEventListener('dsh-tavern-landing-changed', sync); sync();
+                return () => document.removeEventListener('dsh-tavern-landing-changed', sync);
+            }, []);
 			const [busy, setBusy] = React.useState(false);
 			const cardCreation = React.useRef(false), currentSession = React.useRef(current);
 			currentSession.current = current;
@@ -7930,7 +7943,7 @@ window.__ModuleLoader__.load({
 				if (!current || !summaries[current] || !props.sessions.binding(current)) return;
 				const latest = tavernErrorHub.getSnapshot()[0];
 				if (!latest || latest.source !== "左侧栏操作") return;
-				if (latest.message === "DSH Session 列表同步超时，请刷新页面后重试：" + current) setError("");
+				if (latest.message === "对话列表同步超时，请刷新页面后重试：" + current) setError("");
 			}, [current, summaries]);
 			function call(method, args) { return rpc(method, args); }
 			function isMissingUpdateApiError(error) {
@@ -8084,6 +8097,7 @@ window.__ModuleLoader__.load({
 				if (current && history.some(entry => entry.sessionId === current && entry.mode === "card") && props.cleanWorkspaceDraft) return props.cleanWorkspaceDraft(current);
 			}, [current, history]);
 			function openPicker() {
+                pickerOpener.current = document.activeElement;
 				playPrewarmRef.current.cancel();
 				setMenuSession(null);
 				setCardEntry("");
@@ -8094,7 +8108,17 @@ window.__ModuleLoader__.load({
 				void call("listCards").then(result=>{setCards(result.cards || []);tavernErrorHub.resolve("左侧栏人物卡");},error=>tavernErrorHub.report("左侧栏人物卡",error));
 				void call("preparePlayStart").catch(function (error) { console.warn("dsh-tavern: 游戏启动资源预热失败，将在开始时读取", error); });
 			}
-			function closePicker() {
+			async function allowPickerExit() {
+                if (busy) return false;
+                const changedName = openingPicker && openingPicker.initialUserName !== undefined && openingPicker.userName !== openingPicker.initialUserName;
+                return !(changedName || chatImport) || await askConfirm('放弃本次准备中的修改并返回？已保存的资源和对话不受影响。', {confirmText:'放弃修改',cancelText:'继续准备'});
+            }
+            async function backToCards() {
+                if (!(await allowPickerExit())) return;
+                playPrewarmRef.current.cancel(); setChatImport(null); setOpeningPicker(null);
+            }
+            async function closePicker() {
+                if (!(await allowPickerExit())) return;
 				cardBatch.reset();
 				setChatImport(null);
 				playPrewarmRef.current.cancel();
@@ -8350,10 +8374,10 @@ window.__ModuleLoader__.load({
 				try {
 					const userName = String(window.localStorage.getItem("dsh-tavern-player-name") || "你").trim() || "你";
 					const preparedKey = JSON.stringify([userName, compatibilityAvailable && requestMode === "sillytavern" ? "sillytavern" : "dsh"]);
-					setOpeningPicker({ card: card, openings: [], index: 0, userName: userName, preparing: true });
+					setOpeningPicker({ card: card, openings: [], index: 0, userName: userName, initialUserName: userName, preparing: true });
 					const response = await call("getCardOpenings", { path: card.path, userName: userName, requestMode: compatibilityAvailable && requestMode === "sillytavern" ? "sillytavern" : "dsh", openingDataVersion: 2 });
 					const openings = openingResponseChoices(response);
-					setOpeningPicker({ card: card, preparing: false, preparedKey: preparedKey, preparationId: response.preparationId || "", openings: openings, index: 0, userName: userName, trustedCardMode: response.trustedCardMode });
+					setOpeningPicker({ card: card, preparing: false, preparedKey: preparedKey, preparationId: response.preparationId || "", openings: openings, index: 0, userName: userName, initialUserName: userName, trustedCardMode: response.trustedCardMode });
 				} catch (err) { setOpeningPicker(null); playPrewarmRef.current.cancel(); setError(String(err && err.message || err)); }
 				finally { setBusy(false); }
 			}
@@ -8430,7 +8454,7 @@ window.__ModuleLoader__.load({
 				})[0];
 				if (first) {
 					try { await openSessionWhenReady(first.sessionId); }
-					catch (err) { setError("打开 Session 失败：" + String(err && err.message || err)); }
+					catch (err) { setError("打开对话失败：" + String(err && err.message || err)); }
 				}
 				else if (nextMode === "card") openPicker();
 				else openPicker();
@@ -8598,18 +8622,19 @@ window.__ModuleLoader__.load({
 				else openPicker("cards");
 			};
 			const h = React.createElement;
-			if (collapsed) return h(React.Fragment, null,
-				h(TavernErrorCenter),
-				h("div", { className: "dsh-tavern-sidebar collapsed" },
-					h("button", { className: "dsh-tavern-side-icon", title: "展开侧栏", onClick: props.toggleSidebar }, "🍺"),
-					h("button", { className: "dsh-tavern-side-icon", title: "新建对话（跟随当前模式）", onClick: function () { props.toggleSidebar(); window.setTimeout(function () { openPicker("cards"); }, 180); } }, "＋")
-				)
-			);
 			const visibleHistory = history.filter(function (item) {
 				if (groupOfMode(item.mode) !== uiMode) return false;
 				if (uiMode !== "play") return true;
 				return (item.requestMode === "sillytavern" ? "sillytavern" : "dsh") === requestMode;
 			});
+            async function openHistoryItem(item) {
+                const summary = summaries[item.sessionId];
+                try {
+                    if (summary && summary.blank) await call('ensureOpening', {sessionId:item.sessionId});
+                    await openSessionWhenReady(item.sessionId);
+                } catch (err) { setError(String(err && err.message || err)); }
+            }
+
 			function renderHistoryRow(item) {
 				const summary = summaries[item.sessionId];
 				const title = item.title || (summary && summary.displayTitle ? summary.displayTitle : (item.cardName + "的新对话"));
@@ -8617,10 +8642,7 @@ window.__ModuleLoader__.load({
 					managing ? h("input", { type: "checkbox", checked: selectedChats.includes(item.chatId), disabled: busy, "aria-label": "选择对话：" + title, onChange: function () { toggleChatSelection(item.chatId); } }) : null,
 					h("button", { className: "dsh-tavern-side-row-main", "data-tavern-session-id": item.sessionId, disabled: busy, onClick: async function () {
 					if (managing) { toggleChatSelection(item.chatId); return; }
-					try {
-						if (summary && summary.blank) await call("ensureOpening", { sessionId: item.sessionId });
-						await openSessionWhenReady(item.sessionId);
-					} catch (err) { setError(String(err && err.message || err)); }
+					await openHistoryItem(item);
 				} },
 					h("div", { className: "dsh-tavern-side-row-name" }, title),
 					h("div", { className: "dsh-tavern-side-row-meta" }, h("span", null, item.mode === "card" ? (item.cardPath ? ("已创建：" + item.cardName) : "尚未创建正式人物卡") : modeLabel(item.mode || "story")), h("span", null, formatTime(item.lastOpenedAt || (summary ? summary.updatedAt : item.updatedAt))))
@@ -8645,7 +8667,7 @@ window.__ModuleLoader__.load({
 			const selectedOpening = openingPicker && openingPicker.openings[openingPicker.index];
 			const pickerError = error ? h("div", { className: "dsh-tavern-picker-error", role: "alert" },
 				h("div", null, error),
-				pendingOpen ? h("button", { className: "dsh-tavern-btn", disabled: busy, style: { marginTop: "8px" }, onClick: retryPendingOpen }, "重新连接已创建的 Session") : null
+				pendingOpen ? h("button", { className: "dsh-tavern-btn", disabled: busy, style: { marginTop: "8px" }, onClick: retryPendingOpen }, "重新连接已创建的对话") : null
 			) : null;
 			const importChoice = chatImport && openingPicker && chatImport.cardPath === openingPicker.card.path ? h(React.Fragment, null,
 				h("div", { className: "dsh-tavern-card-picker-head" }, h("span", null, "导入到：" + openingPicker.card.name)),
@@ -8660,7 +8682,7 @@ window.__ModuleLoader__.load({
 					h("button", { className: "dsh-tavern-btn", disabled: busy, onClick: function () { setChatImport(null); setError(""); } }, "返回"),
 					h("button", { className: "dsh-tavern-question-primary", disabled: busy || Boolean(pendingOpen) || (chatImport.preview.incompatible && !chatImport.textOnly), onClick: importConversation }, busy ? "正在导入…" : "导入并打开"))) : null;
 			const openingChoice = importChoice || (openingPicker ? h(React.Fragment, null,
-				h("div", { className: "dsh-tavern-card-picker-head" }, h("button", { className: "dsh-tavern-btn", disabled: busy, onClick: function () { playPrewarmRef.current.cancel(); setOpeningPicker(null); } }, "← 返回"), h("span", null, openingPicker.card.name + " · 游戏准备"), h("button", { className: "dsh-tavern-btn", disabled: busy, "aria-expanded": !openingSettings.collapsed, onClick: openingSettings.toggle }, openingSettings.collapsed ? "展开设置" : "折叠设置"), h("span", { className: "dsh-tavern-spacer" }), h("button", { className: "dsh-tavern-btn", disabled: busy, onClick: closePicker }, "关闭")),
+				h("div", { className: "dsh-tavern-card-picker-head" }, h("button", { className: "dsh-tavern-btn", disabled: busy, onClick: backToCards }, "← 返回"), h("span", null, openingPicker.card.name + " · 游戏准备"), h("button", { className: "dsh-tavern-btn", disabled: busy, "aria-expanded": !openingSettings.collapsed, onClick: openingSettings.toggle }, openingSettings.collapsed ? "展开设置" : "折叠设置"), h("span", { className: "dsh-tavern-spacer" }), h("button", { className: "dsh-tavern-btn", disabled: busy, onClick: closePicker }, "关闭")),
 				busy ? h("div", { className: "dsh-tavern-session-switching", role: "status", "aria-live": "polite" }, openingPicker.preparing ? "正在准备开场与脚本资源…" : "正在完成游戏初始化…", openingPicker.preparing ? h("div", { style: { marginTop: "8px", fontSize: "13px", opacity: .75 } }, "正在处理开场预览并初始化脚本；可复用的资源会从本机缓存读取。") : null) : null,
 					selectedOpening ? h("div", { className: "dsh-tavern-opening-settings", hidden: openingSettings.collapsed },
 						h("label", { className: "dsh-tavern-player-name" }, h("span", null, "故事中的玩家称呼（可选）"), h("input", { value: openingPicker.userName ?? "", maxLength: 80, autoFocus: true, placeholder: "你", disabled: busy || Boolean(openingPicker.retrySessionId), onChange: function (event) { const userName = event.target.value; setOpeningPicker(function (current) { return current ? Object.assign({}, current, { userName: userName }) : current; }); } })),
@@ -8705,22 +8727,21 @@ window.__ModuleLoader__.load({
 				})) : null,
 				h("div", { className: "dsh-tavern-picker-foot", style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "24px", flexWrap: "wrap" } }, h("input", { ref: chatImportFile, type: "file", accept: ".jsonl", style: { display: "none" }, onChange: function (event) { previewChatImport(event.target.files && event.target.files[0]); event.target.value = ""; } }), h("div", { style: { display: "flex", flexDirection: "column", alignItems: "flex-start", gap: "6px" } }, h("button", { className: "dsh-tavern-btn", disabled: busy || Boolean(openingPicker.retrySessionId), onClick: function () { chatImportFile.current.click(); } }, "导入聊天记录"), h("small", { style: { opacity: .7 } }, "（必须和人物卡匹配）")), h("button", { className: "dsh-tavern-question-primary", disabled: busy || openingPicker.preparing || (openingPicker.openings.length > 0 && !selectedOpening), onClick: function () { newConversation(openingPicker.card, null, selectedOpening ? selectedOpening.id : "", openingPicker.userName || "你").catch(function () {}); } }, openingPicker.retrySessionId ? "重试开局" : "开始新游戏"))
 			) : null);
-			const playPicker = h("div", { ref: openingSettings.ref, className: "dsh-tavern-card-picker", role: "dialog", "aria-modal": "true", "aria-label": openingPicker ? "游戏准备" : "选择人物卡开始游玩" }, h(TavernImportFeedback,{result:importFeedback}), pickerError, openingPicker ? openingChoice : h(React.Fragment, null,
-				h("div", { className: "dsh-tavern-card-picker-head" }, h("span", null, "选择人物卡 · 开始游玩"), h("span", { className: "dsh-tavern-spacer" }), h(MobileCardImportButton, { inputRef: fileRef, disabled: busy, onImported: async function () { await refresh(); notifyDataChanged(["cards"]); } }), h("button", { className: "dsh-tavern-btn", onClick: closePicker }, "关闭")),
+			const playPicker = h("div", { ref: openingSettings.ref, className: "dsh-tavern-card-picker" }, h(TavernImportFeedback,{result:importFeedback}), pickerError, openingPicker ? openingChoice : h(React.Fragment, null,
+				h("div", { className: "dsh-tavern-card-picker-head" }, h("span", null, "选择人物卡 · 开始游玩"), h("span", { className: "dsh-tavern-spacer" }), h(MobileCardImportButton, { inputRef: fileRef, disabled: busy, onImported: async function () { await refresh(); notifyDataChanged(["cards"]); } }), h("button", { className: "dsh-tavern-btn", disabled: busy, onClick: closePicker }, "关闭")),
 				h("input", { ref: fileRef, type: "file", accept: ".png,.json", style: { display: "none" }, onChange: function (e) { const f = e.target.files && e.target.files[0]; if (f) importCard(f); e.target.value = ""; } }),
 				organization.toolbar(),
-				organization.visible.length ? h(React.Fragment, null, h("div", { className: "dsh-tavern-side-empty", style: { padding: "4px 6px" } }, "已绑定剧本的人物卡将自动按剧本推进；未绑定的按自由故事推进。剧本绑定在“卡片模式”中管理。"), organization.renderCards(function (card) { return h("div", { key: card.path, className: "dsh-tavern-card-pick-wrap" },
+				organization.visible.length ? h(React.Fragment, null, h("div", { className: "dsh-tavern-side-empty", style: { padding: "4px 6px" } }, "已绑定剧本的人物卡将自动按剧本推进；未绑定的按自由故事推进。剧本绑定在“创作工作台”中管理。"), organization.renderCards(function (card) { return h("div", { key: card.path, className: "dsh-tavern-card-pick-wrap" },
 					cardBatch.checkbox(card), !cardBatch.managing ? organization.rowTools(card) : null,
-					h("button", { className: "dsh-tavern-card-pick" + (card.hasImage ? " with-image" : "") + (cardBatch.managing && cardBatch.isSelected(card.path) ? " selected" : ""), disabled: busy || (!cardBatch.managing && Boolean(card.readError)), onClick: function () { if (cardBatch.managing) cardBatch.toggle(card.path); else preparePlayConversation(card); } }, h(TavernCardListContent, { card: card, detail: card.script ? ("剧本：" + card.script.title) : "自由故事（未绑定剧本）" })),
-					!cardBatch.managing ? h("button", { className: "dsh-tavern-script-file", disabled: busy, title: "从人物卡库删除", onClick: function () { return cardBatch.remove([card]); } }, "删除") : null,
-					!cardBatch.managing ? h("button", { className: "dsh-tavern-script-file", disabled: busy, title: "导出为 SillyTavern 兼容 JSON", onClick: function () { exportCard(card); } }, "导出") : null
+					h("button", { className: "dsh-tavern-card-pick" + (card.hasImage ? " with-image" : "") + (cardBatch.managing && cardBatch.isSelected(card.path) ? " selected" : ""), disabled: busy || (!cardBatch.managing && Boolean(card.readError)), onClick: function () { if (cardBatch.managing) cardBatch.toggle(card.path); else preparePlayConversation(card); } }, h(TavernCardListContent, { card: card, detail: card.script ? ("剧本：" + card.script.title) : "自由故事（未绑定剧本）", extra: !card.readError && !cardBatch.managing ? "选择人物卡 →" : "" })),
+					!cardBatch.managing ? cardDetails(card, true) : null
 				); })) : h("div", { className: "dsh-tavern-empty" }, "还没有人物卡。\n点“导入人物卡”添加 PNG/JSON 卡片。")
 			));
 			const cardEditRows = cards.length ? cards.map(function (card) { return h("div", { key: card.path, className: "dsh-tavern-card-pick-wrap" },
-				h("button", { className: "dsh-tavern-card-pick" + (card.hasImage ? " with-image" : ""), disabled: busy, onClick: function () { newCardConversation(card, cardEntry === "gentle" ? "gentle" : "edit", cardEntry === "gentle" ? "人物卡温和改写" : "修改人物卡"); } }, h(TavernCardListContent, { card: card, detail: cardEntry === "gentle" ? "另存温和副本，再配置试玩案例" : "选择这张人物卡开始修改" }))
+				h("button", { className: "dsh-tavern-card-pick" + (card.hasImage ? " with-image" : ""), disabled: busy, onClick: function () { newCardConversation(card, cardEntry === "gentle" ? "gentle" : "edit", cardEntry === "gentle" ? "人物卡温和改写" : "修改人物卡"); } }, h(TavernCardListContent, { card: card, detail: cardEntry === "gentle" ? "另存温和副本，再配置试玩案例" : "选择这张人物卡开始修改" })), cardDetails(card, false)
 			); }) : h("div", { className: "dsh-tavern-empty" }, "还没有人物卡，可先在空白工作台中创建。");
 			const cardMvuRows = cards.length ? cards.map(function (card) { return h("div", { key: card.path, className: "dsh-tavern-card-pick-wrap" },
-				h("button", { className: "dsh-tavern-card-pick" + (card.hasImage ? " with-image" : ""), disabled: busy, onClick: function () { newCardConversation(card, "mvu", "把人物卡转成 MVU 版"); } }, h(TavernCardListContent, { card: card, detail: "转换为 MVU 后，状态栏绝对不会掉格式" }))
+				h("button", { className: "dsh-tavern-card-pick" + (card.hasImage ? " with-image" : ""), disabled: busy, onClick: function () { newCardConversation(card, "mvu", "把人物卡转成 MVU 版"); } }, h(TavernCardListContent, { card: card, detail: "转换为 MVU 变量驱动；效果取决于人物卡与脚本，转换后需要试玩核对" })), cardDetails(card, false)
 			); }) : h("div", { className: "dsh-tavern-empty" }, "还没有人物卡，可先导入一张需要转换的卡。");
 			const chosenInitialResources = Object.keys(selectedInitialResources).map(function (key) { return selectedInitialResources[key]; });
 			function initialResourceGroup(title, items) {
@@ -8745,19 +8766,20 @@ window.__ModuleLoader__.load({
 			) : h("div", { className: "dsh-tavern-empty" }, "暂无可选" + initialResourceTitle + "，可点击右上角导入。");
 			const initialImportLabel = cardEntry === "worldbook" ? "导入世界书" : cardEntry === "preset" ? "导入预设" : cardEntry === "extract" || cardEntry === "script" ? "导入剧本" : "";
 			const initialImportAccept = cardEntry === "worldbook" || cardEntry === "preset" ? ".json,application/json" : ".txt,.md,.json,.epub,text/plain,text/markdown,application/json,application/epub+zip";
-			const cardPicker = h("div", { className: "dsh-tavern-card-picker", role: "dialog", "aria-modal": "true", "aria-label": "选择卡片工作台起始任务" }, h(TavernImportFeedback,{result:importFeedback}), pickerError,
-				h("div", { className: "dsh-tavern-card-picker-head" }, cardEntry ? h("button", { className: "dsh-tavern-btn", onClick: function () { setCardEntry(""); } }, "← 返回") : h("span", null, "选择起始任务"), cardEntry === "extract" ? h("span", null, "选择初始剧本（至少 1 份）") : cardEntry === "mvu" ? h("span", null, "选择要转换的人物卡") : cardEntry === "script" || cardEntry === "worldbook" || cardEntry === "preset" ? h("span", null, "选择一个编辑目标") : null, h("span", { className: "dsh-tavern-spacer" }), cardEntry === "edit" || cardEntry === "gentle" || cardEntry === "mvu" ? h(MobileCardImportButton, { inputRef: fileRef, disabled: busy, onImported: async function () { await refresh(); notifyDataChanged(["cards"]); } }) : null, initialImportLabel ? h("button", { className: "dsh-tavern-btn", disabled: busy, onClick: function () { initialImportRef.current && initialImportRef.current.click(); } }, initialImportLabel) : null, h("button", { className: "dsh-tavern-btn", onClick: closePicker }, "关闭")),
+			const cardPicker = h("div", { className: "dsh-tavern-card-picker" }, h(TavernImportFeedback,{result:importFeedback}), pickerError,
+				busy ? h("p", { role: "status" }, "正在准备创作对话，请稍候…") : null,
+				h("div", { className: "dsh-tavern-card-picker-head" }, cardEntry ? h("button", { className: "dsh-tavern-btn", disabled: busy, onClick: function () { if (!busy) setCardEntry(""); } }, "← 返回") : h("span", null, "选择起始任务"), cardEntry === "extract" ? h("span", null, "选择初始剧本（至少 1 份）") : cardEntry === "mvu" ? h("span", null, "选择要转换的人物卡") : cardEntry === "script" || cardEntry === "worldbook" || cardEntry === "preset" ? h("span", null, "选择一个编辑目标") : null, h("span", { className: "dsh-tavern-spacer" }), cardEntry === "edit" || cardEntry === "gentle" || cardEntry === "mvu" ? h(MobileCardImportButton, { inputRef: fileRef, disabled: busy, onImported: async function () { await refresh(); notifyDataChanged(["cards"]); } }) : null, initialImportLabel ? h("button", { className: "dsh-tavern-btn", disabled: busy, onClick: function () { initialImportRef.current && initialImportRef.current.click(); } }, initialImportLabel) : null, h("button", { className: "dsh-tavern-btn", disabled: busy, onClick: closePicker }, "关闭")),
 				h("input", { ref: fileRef, type: "file", accept: ".png,.json", style: { display: "none" }, onChange: function (e) { const f = e.target.files && e.target.files[0]; if (f) importCard(f); e.target.value = ""; } }),
 				h("input", { ref: initialImportRef, type: "file", accept: initialImportAccept, style: { display: "none" }, onChange: function (e) { const f = e.target.files && e.target.files[0]; if (f) importInitialResource(f, cardEntry); e.target.value = ""; } }),
 					(cardEntry === "edit" || cardEntry === "gentle") ? cardEditRows : cardEntry === "mvu" ? cardMvuRows : cardEntry === "extract" || cardEntry === "script" || cardEntry === "worldbook" || cardEntry === "preset" ? initialResourcePicker : h(React.Fragment, null,
-						h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { setCardEntry("edit"); } }, h("b", null, "修改人物卡"), h("span", null, "先选择人物卡，再追加修改任务提示词")),
-						h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { setCardEntry("gentle"); } }, h("b", null, "人物卡温和改写"), h("span", null, "人物卡被模型拒绝输出时，适当改写为温和版本，减少拒绝并实测效果")),
-						h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { setCardEntry("mvu"); } }, h("b", null, "把人物卡转成 MVU 版"), h("span", null, "转换为 MVU 后，状态栏绝对不会掉格式")),
-						h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { openResourcePicker("extract"); } }, h("b", null, "从剧本新建人物卡"), h("span", null, "先选择至少一份剧本，再进入工作台")),
-						h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { openResourcePicker("script"); } }, h("b", null, "修改剧本"), h("span", null, "先选择一份剧本，再进入工作台修改工作版")),
-					h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { openResourcePicker("worldbook"); } }, h("b", null, "修改世界书"), h("span", null, "先选择一本世界书，再进入工作台按条目修改")),
-					h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { openResourcePicker("preset"); } }, h("b", null, "修改预设"), h("span", null, "先选择一个预设，交给卡片 Agent 阅读和修改")),
-					h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { newCardConversation(null); } }, h("b", null, "空白开始"), h("span", null, "不追加任务提示词，自由使用完整卡片 Agent"))
+						h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { setCardEntry("edit"); } }, h("b", null, "让 AI 修改人物卡"), h("span", null, "先选择人物卡，再追加修改任务提示词")),
+						h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { setCardEntry("gentle"); } }, h("b", null, "让 AI 温和改写人物卡"), h("span", null, "人物卡被模型拒绝输出时，适当改写为温和版本，减少拒绝并实测效果")),
+						h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { setCardEntry("mvu"); } }, h("b", null, "让 AI 把人物卡转成 MVU 版"), h("span", null, "转换为 MVU 变量驱动；效果取决于人物卡与脚本，转换后需要试玩核对")),
+						h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { openResourcePicker("extract"); } }, h("b", null, "让 AI 从剧本新建人物卡"), h("span", null, "先选择至少一份剧本，再进入工作台")),
+						h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { openResourcePicker("script"); } }, h("b", null, "让 AI 修改剧本"), h("span", null, "先选择一份剧本，再进入工作台修改工作版")),
+					h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { openResourcePicker("worldbook"); } }, h("b", null, "让 AI 修改世界书"), h("span", null, "先选择一本世界书，再进入工作台按条目修改")),
+					h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { openResourcePicker("preset"); } }, h("b", null, "让 AI 修改预设"), h("span", null, "先选择一个预设，交给卡片 Agent 阅读和修改")),
+					h("button", { className: "dsh-tavern-card-pick", disabled: busy, onClick: function () { newCardConversation(null); } }, h("b", null, "空白 AI 创作"), h("span", null, "不追加任务提示词，自由使用完整卡片 Agent"))
 				)
 			);
 			const updateMessage = updateStatus.phase === "local-build"
@@ -8794,25 +8816,47 @@ window.__ModuleLoader__.load({
 					h("button", { className: "dsh-tavern-update-button primary", onClick: performUpdate }, "进行更新"))
 				: h("div", { className: "dsh-tavern-update-actions" },
 					h("button", { className: "dsh-tavern-update-button", disabled: checkingOrRunning || updateStatus.phase === "restart-required" || updateStatus.phase === "installed-restart-required", onClick: checkUpdate }, updateStatus.phase === "checking" ? "正在检查…" : (updateStatus.phase === "running" ? "正在更新…" : (updateStatus.phase === "installed-restart-required" ? "请手动重启" : (updateStatus.phase === "restart-required" ? "重启 Desktop 后可用" : "检查更新")))));
-			return h(React.Fragment, null, h(TavernErrorCenter), h("div", { className: "dsh-tavern-sidebar", style: { position: "relative", width: props.embedded ? "100%" : props.width + "px" } },
+			const recentPlay = history.find(item => isPlayMode(item.mode || 'story') && (item.requestMode === 'sillytavern' ? 'sillytavern' : 'dsh') === requestMode);
+            const home = homeTarget ? ReactDom.createPortal(h('section', {className:'dsh-tavern-home','aria-label':'酒馆首页'},
+                h('p',{className:'dsh-tavern-home-brand'},'DSH Tavern'),
+                h('h1',null,uiMode === 'play' ? '下一段故事，从这里开始' : '创作你的故事世界'),
+                h('p',null,uiMode === 'play' ? '选择人物卡，开始游玩；也可以继续已有故事。' : '选择创作任务，让 AI 帮你修改人物卡、预设或世界书。'),
+                uiMode === 'play' && recentPlay ? h('button',{className:'dsh-tavern-btn primary',disabled:busy,onClick:()=>openHistoryItem(recentPlay)},'继续最近游玩 · '+(recentPlay.title || summaries[recentPlay.sessionId]?.displayTitle || recentPlay.cardName || '未命名对话')) : null,
+                h('button',{className:'dsh-tavern-btn'+(uiMode === 'play' && recentPlay ? '' : ' primary'),disabled:busy,onClick:openPicker},uiMode === 'play' ? '选择人物卡开始游玩' : '选择 AI 创作任务'),
+                uiMode === 'play' ? h('div',{className:'dsh-tavern-home-secondary'},
+                    h(MobileCardImportButton,{inputRef:homeImport,disabled:busy,onImported:async()=>{await refresh();notifyDataChanged(['cards']);}}),
+                    h('input',{ref:homeImport,type:'file',accept:'.png,.json',hidden:true,onChange:event=>{const file=event.target.files?.[0];if(file)importCard(file);event.target.value='';}}),
+                    h(TavernGamePackageImport,{disabled:busy,onError:setError,onImported:finishPendingOpen})) : null,
+                !picking && error ? h('p',{role:'alert',className:'dsh-card-error'},error) : null,
+                !picking ? h(TavernImportFeedback,{result:importFeedback}) : null
+            ),homeTarget) : null;
+            const picker = picking ? h(TavernPickerDialog, {opener:pickerOpener.current,busy,onClose:closePicker,label:uiMode === 'play' ? (openingPicker ? '游戏准备' : '选择人物卡开始游玩') : '选择创作工作台起始任务'},uiMode === 'play' ? playPicker : cardPicker) : null;
+			if (collapsed) return h(React.Fragment, null, home, picker,
+				h(TavernErrorCenter),
+				h("div", { className: "dsh-tavern-sidebar collapsed" },
+					h("button", { className: "dsh-tavern-side-icon", title: "展开侧栏", onClick: props.toggleSidebar }, "🍺"),
+					h("button", { className: "dsh-tavern-side-icon", title: "新建对话（跟随当前模式）", onClick: function () { props.toggleSidebar(); window.setTimeout(function () { openPicker("cards"); }, 180); } }, "＋")
+				)
+			);
+            return h(React.Fragment, null, home, h(TavernErrorCenter), h("div", { className: "dsh-tavern-sidebar", style: { position: "relative", width: props.embedded ? "100%" : props.width + "px" } },
 				h("div", { className: "dsh-tavern-side-head" }, h("div", { className: "dsh-tavern-side-brand" }, "🍺 DSH Tavern"), props.embedded ? null : h("button", { className: "dsh-tavern-side-icon", title: "收起侧栏", onClick: props.toggleSidebar }, "◧")),
 				h("div", { className: "dsh-tavern-mode-switch" },
 					h("button", { className: uiMode === "play" && requestMode === "dsh" ? "active" : "", disabled: busy, onClick: function () { switchPlayRequestMode("dsh"); } }, "游玩"),
-					h("button", { className: uiMode === "card" ? "active" : "", disabled: busy, onClick: function () { switchMode("card"); } }, "卡片")
+					h("button", { className: uiMode === "card" ? "active" : "", disabled: busy, onClick: function () { switchMode("card"); } }, "创作工作台")
 				),
-				h("button", { className: "dsh-tavern-side-new", disabled: busy, onClick: function () { openPicker(); } }, uiMode === "play" ? (requestMode === "sillytavern" ? "＋ 选择人物卡 · 新开兼容对话" : "＋ 选择人物卡 · 新开游玩") : "＋ 新建卡片工作台对话"),
+				h("button", { className: "dsh-tavern-side-new", disabled: busy, onClick: function () { openPicker(); } }, uiMode === "play" ? (requestMode === "sillytavern" ? "＋ 选择人物卡 · 新开兼容对话" : "＋ 选择人物卡 · 新开游玩") : "＋ 新建 AI 创作对话"),
 				uiMode === "play" ? h(TavernGamePackageImport, {disabled:busy,onError:setError,onImported:finishPendingOpen}) : null,
 				uiMode === "play" && requestMode === "sillytavern" ? h("div", { className: "dsh-tavern-compatibility-notice" },
 					h("strong", null, "兼容模式实验"),
 					h("div", null, "按 SillyTavern 语义构造正文请求。未选择外部预设时自动使用内置纯净预设；选择后使用整份外部预设。请与普通游玩分别新建对话做对照。")
 				) : null,
 				h("div", { className: "dsh-tavern-side-title dsh-tavern-history-heading" },
-					h("span", null, uiMode === "play" ? (requestMode === "sillytavern" ? "兼容对话" : "游玩历史") : "卡片历史"),
+					h("span", null, uiMode === "play" ? (requestMode === "sillytavern" ? "兼容对话" : "游玩历史") : "创作历史"),
 					h("button", { className: "dsh-tavern-history-action", disabled: busy, onClick: function () { setManaging(!managing); setSelectedChats([]); setMenuSession(null); setDeleteNotice(""); } }, managing ? "取消" : "管理")),
 				managing ? h("div", { className: "dsh-tavern-history-selection" },
 					h("button", { className: "dsh-tavern-history-action", disabled: busy || !visibleHistory.length, onClick: function () { setSelectedChats(visibleHistory.map(function (item) { return item.chatId; })); } }, "全选"),
 					h("span", null, "已选 " + visibleHistory.filter(function (item) { return selectedChats.includes(item.chatId); }).length)) : null,
-				h("div", { className: "dsh-tavern-side-list" }, rows.length ? rows : h("div", { className: "dsh-tavern-side-empty" }, uiMode === "play" ? (requestMode === "sillytavern" ? "还没有兼容对话。\n选择人物卡开始；未选择外部预设时自动使用内置纯净预设。" : "还没有游玩对话。\n选择人物卡开始；绑定剧本的卡会按剧本推进。") : "还没有卡片工作台对话。\n可以空白开始，再按需添加人物卡和剧本。")),
+				h("div", { className: "dsh-tavern-side-list" }, rows.length ? rows : h("div", { className: "dsh-tavern-side-empty" }, uiMode === "play" ? (requestMode === "sillytavern" ? "还没有兼容对话。\n选择人物卡开始；未选择外部预设时自动使用内置纯净预设。" : "还没有游玩对话。\n选择人物卡开始；绑定剧本的卡会按剧本推进。") : "还没有创作工作台对话。\n选择任务或空白开始，再向 AI 描述你的要求。")),
 				managing ? h("button", { className: "dsh-tavern-btn", style: { flexShrink: 0, margin: "8px 12px", color: "#e57373" }, disabled: busy || !visibleHistory.some(function (item) { return selectedChats.includes(item.chatId); }), onClick: deleteSelectedConversations }, busy ? "正在删除…" : "删除所选（" + visibleHistory.filter(function (item) { return selectedChats.includes(item.chatId); }).length + "）") : null,
 				deleteNotice ? h("div", { role: "status", style: { padding: "4px 12px" } }, deleteNotice) : null,
 				!picking && error ? h("div", { className: "dsh-tavern-dock-error", role: "alert" }, error) : null,
@@ -8822,7 +8866,7 @@ window.__ModuleLoader__.load({
 					updateActions,
 					h("div", { className: "dsh-tavern-update-status" + (updateStatus.phase === "failed" || updateStatus.phase === "check-failed" ? " error" : "") }, updateMessage)
 				),
-				picking ? h("div", { className: "dsh-tavern-picker-overlay", onMouseDown: function (event) { if (event.target === event.currentTarget) closePicker(); } }, uiMode === "play" ? playPicker : cardPicker) : null
+				picker
 			));
 		}
 
@@ -9129,7 +9173,7 @@ window.__ModuleLoader__.load({
             }
             return React.createElement("div", { className: "dsh-tavern-settings-group dsh-tavern-compaction-settings" },
                 React.createElement("h3", { className: "dsh-tavern-settings-title" }, "上下文压缩"),
-                React.createElement("p", { className: "dsh-tavern-settings-desc" }, "默认手动。自动模式在剧情后台结算后联合压缩前后台，再继续下一轮；不会删除原始剧情记录。"),
+                React.createElement("p", { className: "dsh-tavern-settings-desc" }, "所有游戏 · 点击“保存压缩设置”后，在下一个安全边界生效。默认手动；自动模式在剧情后台结算后联合压缩前后台，再继续下一轮，不删除原始剧情记录。"),
                 policy ? React.createElement("label", { className: "dsh-tavern-compaction-field" }, "压缩模式", React.createElement("select", { className: "dsh-tavern-settings-select", value: policy.mode, disabled: busy, onChange: function (e) { setPolicy(Object.assign({}, policy, { mode: e.target.value })); } }, [["manual", "手动压缩（默认）"], ["rounds", "每 N 轮自动压缩"], ["percent", "上下文达到 X% 自动压缩"]].map(function (item) { return React.createElement("option", { key: item[0], value: item[0] }, item[1]); }))) : null,
                 policy && policy.mode !== "manual" ? React.createElement("label", { className: "dsh-tavern-compaction-field" }, policy.mode === "rounds" ? "剧情轮数（1–1000）" : "上下文占用百分比（10–95，估算）", React.createElement("input", { className: "dsh-tavern-settings-select", type: "number", min: policy.mode === "rounds" ? 1 : 10, max: policy.mode === "rounds" ? 1000 : 95, step: 1, value: policy[policy.mode], disabled: busy, onChange: function (e) { setPolicy(Object.assign({}, policy, { [policy.mode]: e.target.value })); } })) : null,
                 policy ? React.createElement("label", { className: "dsh-tavern-compaction-field" }, "压缩后保留最近剧情原文轮数（0–100）", React.createElement("input", { className: "dsh-tavern-settings-select", type: "number", min: 0, max: 100, step: 1, value: policy.retainRounds === undefined ? 10 : policy.retainRounds, disabled: busy, onChange: function (e) { setPolicy(Object.assign({}, policy, { retainRounds: Number(e.target.value) })); } })) : null,
@@ -9278,7 +9322,7 @@ window.__ModuleLoader__.load({
             return h("section", { className: "dsh-tavern-settings-group" },
                 h("label", { className: "dsh-tavern-settings-row" },
                     h("span", { className: "dsh-tavern-settings-copy" }, h("span", { className: "dsh-tavern-settings-title" }, "隐藏上下文注入和思考过程"),
-                        h("span", { className: "dsh-tavern-settings-desc" }, "默认隐藏对话中的上下文注入、已思考和思考过程。仅影响显示，正文、模型请求和存档内容不变。")),
+                        h("span", { className: "dsh-tavern-settings-desc" }, "所有对话 · 自动保存。默认隐藏上下文注入、已思考和思考过程。仅影响显示，正文、模型请求和存档内容不变。")),
                     h("input", { type: "checkbox", role: "switch", "aria-label": "隐藏上下文注入和思考过程", checked: hidden === true, disabled: hidden === null || busy, onChange: event => save(event.target.checked) })),
                 notice ? h("p", { className: "dsh-tavern-settings-desc", role: "status" }, notice) : null);
         }
@@ -9302,7 +9346,7 @@ window.__ModuleLoader__.load({
                 h("label", { className: "dsh-tavern-settings-row" },
                     h("span", { className: "dsh-tavern-settings-copy" },
                         h("strong", null, "候选项"),
-                        h("p", { className: "dsh-tavern-settings-desc" }, "设置候选项的隐藏时机。")),
+                        h("p", { className: "dsh-tavern-settings-desc" }, "所有游戏 · 自动保存。设置候选项的隐藏时机。")),
                     h("select", { className: "dsh-tavern-settings-select", "aria-label": "候选项收起时机", value: mode, disabled: busy, onChange: event => save(event.target.value) },
                         h("option", { value: "after-fill" }, "选择一项后即隐藏"),
                         h("option", { value: "after-send" }, "可选择多项发送后才隐藏"))),
@@ -9319,7 +9363,7 @@ window.__ModuleLoader__.load({
                 rpc("getTavernSettings").then(result => {
                     const value = Number(result && result.settings && result.settings.worldBookRecallLimit) || 3;
                     if (active) setState(current => ({ ...current, value, saved: value }));
-                }, () => {});
+                }, error => { if(active)setState(current=>({...current,notice:"读取失败："+String(error.message||error)})); });
                 return () => { active = false; };
             }, []);
             async function save(value) {
@@ -9330,17 +9374,17 @@ window.__ModuleLoader__.load({
                     const result = await rpc("updateTavernSettings", { patch: { worldBookRecallLimit: limit } });
                     const saved = Number(result.settings.worldBookRecallLimit) || limit;
                     setState({ value: saved, saved, busy: false, notice: "已保存，下一轮起对所有游戏生效" });
-                } catch (error) { setState(current => ({ ...current, value: current.saved, busy: false, notice: "保存失败：" + String(error.message || error) })); }
+                } catch (error) { setState(current => ({ ...current, busy: false, notice: "保存失败：" + String(error.message || error) })); }
             }
             const h = React.createElement;
             return h("section", { className: "dsh-tavern-settings-group" },
                 h("label", { className: "dsh-tavern-settings-row" },
                     h("span", { className: "dsh-tavern-settings-copy" },
                         h("strong", null, "世界书自动召回"),
-                        h("p", { className: "dsh-tavern-settings-desc" }, "游玩模式每轮按关键词最多召回的世界书条目数（1–10，默认 3）。常驻条目不计入；兼容模式仍按 SillyTavern 自己的预算。")),
+                        h("p", { className: "dsh-tavern-settings-desc" }, "所有游戏下一轮 · 离开输入框或按 Enter 保存。游玩模式每轮按关键词最多召回的世界书条目数（1–10，默认 3）。常驻条目不计入；兼容模式仍按 SillyTavern 自己的预算。")),
                     h("input", { type: "number", min: 1, max: 10, step: 1, className: "dsh-tavern-settings-select", "aria-label": "每轮自动召回的世界书条目上限", value: state.value, disabled: state.busy,
-                        onChange: event => setState(current => ({ ...current, value: event.target.value })), onBlur: event => save(event.target.value),
-                        onKeyDown: event => { if (event.key === "Enter") event.currentTarget.blur(); } })),
+                        onChange: event => setState(current => ({ ...current, value: event.target.value })), onBlur: event => { if(!event.relatedTarget?.closest("[data-settings-nav]"))save(event.target.value); },
+                        onKeyDown: event => { if (event.key === "Enter" && !event.nativeEvent?.isComposing) event.currentTarget.blur(); } })),
                 state.notice ? h("div", { className: "dsh-tavern-settings-row", role: "status" },
                     h("span", { className: "dsh-tavern-settings-desc" }, state.notice)) : null);
         }
@@ -9368,129 +9412,86 @@ window.__ModuleLoader__.load({
         }
         // @include modules/background-generation-settings.js
 		function TavernSettingsSection() {
-			const [defaultPlayerName, setDefaultPlayerName] = React.useState("");
-			React.useEffect(function () { setDefaultPlayerName(String(window.localStorage.getItem("dsh-tavern-player-name") || "").trim()); }, []);
-			// localStorage is the single source of truth for the default player name: the
-			// prepare screen already reads and writes this key. Keeping it in one place
-			// avoids a second copy in tavern-settings.json that could disagree with it.
-			function saveDefaultPlayerName(value) {
-				const name = String(value || "").trim();
-				if (name === defaultPlayerName) return;
-				if (name === "") window.localStorage.removeItem("dsh-tavern-player-name");
-				else window.localStorage.setItem("dsh-tavern-player-name", name);
-				setDefaultPlayerName(name);
-				window.dispatchEvent(new CustomEvent("dsh-tavern-settings-changed"));
-				notifyTavernDataChanged(["settings"], "settings");
-			}
-			const [state, setState] = React.useState({ loading: true, busy: false, webSearchEnabled: false, backgroundModel: null, backgroundTasks: { posture: true, characterDesign: false, variables: true, ledger: false }, modelCatalog: [], sceneImages: false, error: "" });
-			React.useEffect(function () {
-				let active = true;
-				rpc("getTavernSettings").then(function (result) {
-					if (active) setState({ loading: false, busy: false, webSearchEnabled: Boolean(result.settings && result.settings.defaultWebSearchEnabled), backgroundModel: result.settings && result.settings.defaultBackgroundModel || null, backgroundTasks: result.settings && result.settings.defaultBackgroundTasks || { posture: true, characterDesign: false, variables: true, ledger: false }, modelCatalog: Array.isArray(result.modelCatalog) ? result.modelCatalog : [], sceneImages: Boolean(result.releaseCapabilities && result.releaseCapabilities.sceneImages), error: "" });
-				}, function (error) {
-					if (active) setState(function (current) { return Object.assign({}, current, { loading: false, busy: false, error: String(error && error.message || error) }); });
-				});
-				return function () { active = false; };
-			}, []);
-			async function setWebSearchEnabled(enabled) {
-				setState(function (current) { return Object.assign({}, current, { busy: true, error: "" }); });
-				try {
-					const result = await rpc("updateTavernSettings", { patch: { defaultWebSearchEnabled: enabled } });
-					setState(function (current) { return Object.assign({}, current, { loading: false, busy: false, webSearchEnabled: Boolean(result.settings && result.settings.defaultWebSearchEnabled), error: "" }); });
-					window.dispatchEvent(new CustomEvent("dsh-tavern-settings-changed"));
-					notifyTavernDataChanged(["settings"], "settings");
-				} catch (error) {
-					setState(function (current) { return Object.assign({}, current, { busy: false, error: String(error && error.message || error) }); });
-				}
-			}
-			async function setBackgroundTask(name, enabled) {
-				setState(function (current) { return Object.assign({}, current, { busy: true, error: "" }); });
-				try {
-					const result = await rpc("updateTavernSettings", { patch: { defaultBackgroundTasks: { [name]: enabled } } });
-					setState(function (current) { return Object.assign({}, current, { busy: false, backgroundTasks: result.settings.defaultBackgroundTasks }); });
-					notifyTavernDataChanged(["settings"], "settings");
-				} catch (error) {
-					setState(function (current) { return Object.assign({}, current, { busy: false, error: String(error && error.message || error) }); });
-				}
-			}
-
-			async function setBackgroundModel(value) {
-				setState(function (current) { return Object.assign({}, current, { busy: true, error: "" }); });
-				try {
-					const backgroundModel = value === "" ? null : JSON.parse(value);
-					const result = await rpc("updateTavernSettings", { patch: { defaultBackgroundModel: backgroundModel } });
-					setState(function (current) { return Object.assign({}, current, { loading: false, busy: false, backgroundModel: result.settings && result.settings.defaultBackgroundModel || null, error: "" }); });
-					window.dispatchEvent(new CustomEvent("dsh-tavern-settings-changed"));
-					notifyTavernDataChanged(["settings"], "settings");
-				} catch (error) {
-					setState(function (current) { return Object.assign({}, current, { busy: false, error: String(error && error.message || error) }); });
-				}
-			}
-			return React.createElement("div", { className: "dsh-tavern-settings-section" },
-				React.createElement("p", { className: "dsh-tavern-settings-intro" }, "这里设置新局默认值；旧局未保存过写作技能开关时也会继承该项默认。已有本局选择保留，网络连接说明适用于所有对话。"),
-                React.createElement("div", { className: "dsh-tavern-settings-row", "aria-label": "Fake-IP 连接模式" },
-                    React.createElement("span", { className: "dsh-tavern-settings-copy" },
-                        React.createElement("span", { className: "dsh-tavern-settings-title" }, "网络连接：信任本机代理"),
-                        React.createElement("span", { className: "dsh-tavern-settings-desc" }, "使用系统解析结果，包括代理分配的 Fake-IP；不另查公共 DNS，不更改系统 IP 或代理配置。最终出口由现有代理规则决定，HTTPS 证书仍须有效。"))),
-                React.createElement(DisplayPreferencesSettings),
-                React.createElement(CandidatePreferencesSettings),
-                React.createElement(WorldBookRecallSettings),
-                React.createElement(TavernDefaultForegroundModel),
-                React.createElement(TavernTextColorSettings),
-                React.createElement(ContextCompactionSettings),
-                React.createElement(TavernCapacitySettings),
-                React.createElement(TavernBackgroundGenerationSettings),
-				React.createElement("div", { className: "dsh-tavern-settings-group" },
-					React.createElement("label", { className: "dsh-tavern-settings-row" },
-						React.createElement("span", { className: "dsh-tavern-settings-copy" },
-							React.createElement("span", { className: "dsh-tavern-settings-title" }, "默认玩家称呼"),
-							React.createElement("span", { className: "dsh-tavern-settings-desc" }, "只影响新开游戏和进入准备界面时的默认值；已有游戏请在对话顶栏单独修改。留空表示使用“你”。")
-						),
-						React.createElement("input", { key: defaultPlayerName, className: "dsh-tavern-settings-text", type: "text", defaultValue: defaultPlayerName, maxLength: 80, placeholder: "你", disabled: state.loading, "aria-label": "默认玩家称呼", onBlur: function (event) { saveDefaultPlayerName(event.target.value); }, onKeyDown: function (event) { if (event.key === "Enter" && !(event.nativeEvent && event.nativeEvent.isComposing)) { event.preventDefault(); event.currentTarget.blur(); } } })
-					)
-				),
-				React.createElement("div", { className: "dsh-tavern-settings-group" },
-					React.createElement("label", { className: "dsh-tavern-settings-row" },
-						React.createElement("span", { className: "dsh-tavern-settings-copy" },
-							React.createElement("span", { className: "dsh-tavern-settings-title" }, "联网搜索"),
-							React.createElement("span", { className: "dsh-tavern-settings-desc" }, "只影响新开游戏；已有游戏可在“本局设置”单独修改。", React.createElement("span", { style: { color: "#dc4545", display: "block" } }, "改变配置，会导致缓存失效，请注意。"))
-						),
-						React.createElement("span", { className: "dsh-tavern-settings-switch" },
-							React.createElement("input", { type: "checkbox", checked: state.webSearchEnabled, disabled: state.loading || state.busy, onChange: function (event) { void setWebSearchEnabled(event.target.checked); }, "aria-label": "开启联网搜索" }),
-							React.createElement("span", { className: "dsh-tavern-settings-track", "aria-hidden": "true" })
-						)
-					),
-					React.createElement("label", { className: "dsh-tavern-settings-row dsh-tavern-settings-model-row" },
+            const h=React.createElement;
+            const [group,setGroup]=React.useState('play'), id=React.useId();
+            const [defaultPlayerName,setDefaultPlayerName]=React.useState('');
+            const [nameNotice,setNameNotice]=React.useState(''),[nameError,setNameError]=React.useState('');
+            const [state,setState]=React.useState({loading:true,loaded:false,busy:false,webSearchEnabled:false,backgroundModel:null,backgroundTasks:{posture:true,characterDesign:false,variables:true,ledger:false},modelCatalog:[],sceneImages:false,error:'',errorPhase:'',notice:''});
+            const alive=React.useRef(false),retry=React.useRef(null);
+            async function readSettings() {
+                setState(c=>({...c,loading:true,error:'',notice:''}));
+                try {
+                    const result=await rpc('getTavernSettings');
+                    if(alive.current)setState(c=>({...c,loading:false,loaded:true,webSearchEnabled:Boolean(result.settings?.defaultWebSearchEnabled),backgroundModel:result.settings?.defaultBackgroundModel||null,backgroundTasks:result.settings?.defaultBackgroundTasks||c.backgroundTasks,modelCatalog:result.modelCatalog||[],sceneImages:Boolean(result.releaseCapabilities?.sceneImages),error:''}));
+                } catch(error) { if(alive.current)setState(c=>({...c,loading:false,errorPhase:'读取',error:String(error.message||error)})); }
+            }
+            React.useEffect(()=>{alive.current=true;try{setDefaultPlayerName(String(localStorage.getItem('dsh-tavern-player-name')||'').trim())}catch(error){setNameError('读取失败：'+error.message)}readSettings();return()=>{alive.current=false}},[]);
+            function saveDefaultPlayerName(value) {
+                const name=String(value||'').trim(); if(name===defaultPlayerName)return;
+                setNameError('');setNameNotice('');
+                try {
+                    if(name==='')localStorage.removeItem('dsh-tavern-player-name');else localStorage.setItem('dsh-tavern-player-name',name);
+                    setDefaultPlayerName(name);setNameNotice('玩家称呼已保存到当前浏览器，仅作为新局默认。');
+                    window.dispatchEvent(new CustomEvent('dsh-tavern-settings-changed'));notifyTavernDataChanged(['settings'],'settings');
+                } catch(error) {setNameError('保存失败：'+error.message);}
+            }
+            async function save(patch,draft,label) {
+                retry.current=()=>save(patch,draft,label);
+                setState(c=>({...c,...draft,busy:true,error:'',notice:''}));
+                try {
+                    const result=await rpc('updateTavernSettings',{patch});
+                    if(alive.current)setState(c=>({...c,busy:false,webSearchEnabled:Boolean(result.settings.defaultWebSearchEnabled),backgroundModel:result.settings.defaultBackgroundModel||null,backgroundTasks:result.settings.defaultBackgroundTasks,notice:label+'已保存。生效范围见对应说明。'}));
+                    retry.current=null;
+                    window.dispatchEvent(new CustomEvent('dsh-tavern-settings-changed'));notifyTavernDataChanged(['settings'],'settings');
+                } catch(error) {if(alive.current)setState(c=>({...c,busy:false,errorPhase:'保存',error:String(error.message||error)}));}
+            }
+            function setWebSearchEnabled(enabled){return save({defaultWebSearchEnabled:enabled},{webSearchEnabled:enabled},'联网搜索');}
+            function setBackgroundTask(name,enabled){return save({defaultBackgroundTasks:{[name]:enabled}},{backgroundTasks:{...state.backgroundTasks,[name]:enabled}},'后台结算默认值');}
+            function setBackgroundModel(value){const backgroundModel=value===''?null:JSON.parse(value);return save({defaultBackgroundModel:backgroundModel},{backgroundModel},'后台模型');}
+            const groups=[['play','游玩与模型'],['writing','写作技能'],['display','显示与候选'],['context','世界书与上下文'],['storage','存储与恢复'],['advanced','高级与诊断']];
+            function panel(key,...children){return h('section',{key,id:id+'-'+key,hidden:group!==key,'aria-labelledby':id+'-'+key+'-nav',className:'dsh-tavern-settings-panel'},...children);}
+            const backgroundModel=React.createElement("label", { className: "dsh-tavern-settings-row dsh-tavern-settings-model-row" },
 						React.createElement("span", { className: "dsh-tavern-settings-copy" },
 							React.createElement("span", { className: "dsh-tavern-settings-title" }, "后台模型"),
 							React.createElement("span", { className: "dsh-tavern-settings-desc" }, "修改后对新局和已有游戏的下一次后台任务生效，正在运行的任务不变。清空则随正文模型及推理强度切换；本局可单独选择，直到下一次全局修改。")
 						),
-						React.createElement("select", { className: "dsh-tavern-settings-select", value: state.backgroundModel ? JSON.stringify({ provider: state.backgroundModel.provider, model: state.backgroundModel.model }) : "", disabled: state.loading || state.busy, onChange: function (event) { void setBackgroundModel(event.target.value); }, "aria-label": "后台模型" },
+						React.createElement("select", { className: "dsh-tavern-settings-select", value: state.backgroundModel ? JSON.stringify({ provider: state.backgroundModel.provider, model: state.backgroundModel.model }) : "", disabled: state.loading || !state.loaded || state.busy, onChange: function (event) { void setBackgroundModel(event.target.value); }, "aria-label": "后台模型", "aria-describedby": state.error?id+"-settings-error":undefined },
 							React.createElement("option", { value: "" }, "跟随正文（随切换生效）"),
 							state.modelCatalog.flatMap(function (group) { return (group.models || []).map(function (model) {
 								const value = JSON.stringify({ provider: group.provider, model: model.id });
 								return React.createElement("option", { key: group.provider + ":" + model.id, value: value }, (group.providerName || group.provider) + " · " + (model.name || model.id));
 							}); })
 						)
-					)
-				),
-				React.createElement("h3", null, "新局后台结算默认值"),
-				React.createElement("p", { className: "dsh-tavern-settings-intro" }, "以下开关只影响新局；已有游戏继续使用原配置，在“本局设置”可单独调整。", React.createElement("span", { style: { color: "#dc4545", display: "block" } }, "改变配置，会导致缓存失效，请注意。")),
-				React.createElement("div", { className: "dsh-tavern-settings-group" },
-					[["ledger", "自动台账", "在当前后台结算内整理已发生的物品、人物和地点变化，会增加上下文与工具调用。未设置时默认关闭。"], ["variables", "变量结算", "MVU 卡强烈建议不要关闭。关闭后剧情仍会推进，但变量和状态栏可能不再同步。普通卡不执行此任务。"], ["posture", "人物姿势结算", "总结本轮结束时人物的位置、动作和姿势。"], ["characterDesign", "人物设计档案", "按需建立、补充人物档案。人物较多时会增加等待时间和 Token 用量；关闭后候选任务也不再自动设计人物。"]].map(function (item) {
+					);
+            return h('div',{className:'dsh-tavern-settings-section'},
+                h('p',{className:'dsh-tavern-settings-intro'},'每项设置都标明生效范围。切换分类会保留尚未保存的输入。'),
+                h('nav',{'aria-label':'酒馆设置分类',className:'dsh-tavern-settings-nav'},groups.map(([key,title])=>h('button',{key,id:id+'-'+key+'-nav',type:'button','data-settings-nav':true,'aria-controls':id+'-'+key,'aria-current':group===key?'true':undefined,onClick:()=>setGroup(key)},title))),
+                panel('play',
+                    h('h3',null,'模型与生成'),h('p',{className:'dsh-tavern-settings-scope'},'模型选择自动保存 · 正文和后台模型用于所有游戏的下一次对应任务；创作模型仅作新对话默认。'),
+                    h(TavernDefaultForegroundModel,{background:backgroundModel}),
+                    h('label',{className:'dsh-tavern-settings-row'},h('span',{className:'dsh-tavern-settings-copy'},h('span',{className:'dsh-tavern-settings-title'},'默认玩家称呼'),h('span',{className:'dsh-tavern-settings-desc'},'当前浏览器 · 仅新局默认。留空使用“你”；离开输入框或按 Enter 保存。已有游戏在对话顶栏修改。')),h('input',{key:defaultPlayerName,className:'dsh-tavern-settings-text',defaultValue:defaultPlayerName,maxLength:80,placeholder:'你','aria-label':'默认玩家称呼','aria-describedby':nameError?id+'-name-error':undefined,onBlur:e=>{if(!e.relatedTarget?.closest('[data-settings-nav]'))saveDefaultPlayerName(e.target.value)},onKeyDown:e=>{if(e.key==='Enter'&&!e.nativeEvent?.isComposing){e.preventDefault();e.currentTarget.blur()}}})),
+                    nameError?h('p',{id:id+'-name-error',role:'alert',className:'dsh-tavern-settings-error'},nameError):null,nameNotice?h('p',{role:'status'},nameNotice):null,
+                    h('fieldset',{disabled:state.loading||!state.loaded||state.busy,className:'dsh-tavern-settings-fields'},
+                        h('legend',null,'新局默认功能'),h('p',{className:'dsh-tavern-settings-scope'},'仅新局默认 · 开关自动保存；已有游戏在“本局设置”单独调整。变更可能使相关提示词缓存失效。'),
+                        h('label',{className:'dsh-tavern-settings-row'},h('span',{className:'dsh-tavern-settings-copy'},h('span',{className:'dsh-tavern-settings-title'},'联网搜索'),h('span',{className:'dsh-tavern-settings-desc'},'允许新局在需要时联网查找资料。')),h('input',{type:'checkbox','aria-label':'开启联网搜索','aria-describedby':state.error?id+'-settings-error':undefined,checked:state.webSearchEnabled,onChange:e=>setWebSearchEnabled(e.target.checked)})),
+                        [["ledger", "自动台账", "在当前后台结算内整理已发生的物品、人物和地点变化，会增加上下文与工具调用。未设置时默认关闭。"], ["variables", "变量结算", "MVU 卡强烈建议不要关闭。关闭后剧情仍会推进，但变量和状态栏可能不再同步。普通卡不执行此任务。"], ["posture", "人物姿势结算", "总结本轮结束时人物的位置、动作和姿势。"], ["characterDesign", "人物设计档案", "按需建立、补充人物档案。人物较多时会增加等待时间和 Token 用量；关闭后候选任务也不再自动设计人物。"]].map(function (item) {
 						return React.createElement("label", { key: item[0], className: "dsh-tavern-settings-row" },
 							React.createElement("span", { className: "dsh-tavern-settings-copy" }, React.createElement("span", { className: "dsh-tavern-settings-title" }, item[1]), React.createElement("span", { className: "dsh-tavern-settings-desc" }, item[2])),
-							React.createElement("span", { className: "dsh-tavern-settings-switch" }, React.createElement("input", { type: "checkbox", checked: state.backgroundTasks[item[0]], disabled: state.loading || state.busy, "aria-label": item[1], onChange: function (event) { void setBackgroundTask(item[0], event.target.checked); } }), React.createElement("span", { className: "dsh-tavern-settings-track", "aria-hidden": "true" })));
-					})
-				),
-				state.sceneImages ? React.createElement(SceneImageSettings, null) : null,
-				React.createElement(TavernRecoverySettings, null),
-				React.createElement(TavernToolWorkbench, null),
-				state.error ? React.createElement("div", { className: "dsh-tavern-settings-error", role: "alert" }, "保存失败：" + state.error) : null
-			);
-		}
+							React.createElement("span", { className: "dsh-tavern-settings-switch" }, React.createElement("input", { type: "checkbox", checked: state.backgroundTasks[item[0]], disabled: state.loading || state.busy, "aria-label": item[1], "aria-describedby": state.error?id+"-settings-error":undefined, onChange: function (event) { void setBackgroundTask(item[0], event.target.checked); } }), React.createElement("span", { className: "dsh-tavern-settings-track", "aria-hidden": "true" })));
+					})),
+                    state.error?h('div',{id:id+'-settings-error',role:'alert',className:'dsh-tavern-settings-error'},state.errorPhase+'失败：'+state.error,h('button',{className:'dsh-tavern-btn',disabled:state.busy||state.loading,onClick:()=>state.errorPhase==='读取'?readSettings():retry.current?.()},state.errorPhase==='读取'?'重新读取':'重试保存')):null,
+                    state.notice?h('p',{role:'status'},state.notice):null,
+                    state.sceneImages?h(SceneImageSettings):null),
+                panel('writing',h(TavernWritingSkills)),
+                panel('display',h('h3',null,'显示与候选'),h(DisplayPreferencesSettings),h(CandidatePreferencesSettings),h(TavernTextColorSettings)),
+                panel('context',h('h3',null,'世界书与上下文'),h(WorldBookRecallSettings),h(ContextCompactionSettings)),
+                panel('storage',h('h3',null,'存储与恢复'),h(TavernCapacitySettings),h(TavernRecoverySettings)),
+                panel('advanced',h('h3',null,'高级与诊断'),
+                    h('details',{'aria-label':'Fake-IP 连接模式'},h('summary',null,'网络连接：信任本机代理'),h('p',null,'使用系统解析结果，包括代理分配的 Fake-IP；不另查公共 DNS，不更改系统 IP 或代理配置。最终出口由现有代理规则决定，HTTPS 证书仍须有效。')),
+                    h(TavernBackgroundGenerationSettings),h(TavernToolWorkbench)));
+        }
 
-		function UserPreferenceProfileTab(props) {
+        function UserPreferenceProfileTab(props) {
             const askConfirm = useTavernConfirm([props.sessionId,props.scope?.sessionId,props.cardPath,props.path,props.card?.path,props.view?.card?.path,props.record?.source?.path,props.record?.source?.cardPath].join("\n"));
 			const h = React.createElement;
 			const sessionId = props.scope && props.scope.sessionId || "";
@@ -10716,6 +10717,7 @@ window.__ModuleLoader__.load({
 		}
 
 		function CardFieldsPanel(props) {
+            const fieldId = React.useId();
             const askConfirm = useTavernConfirm([props.sessionId,props.scope?.sessionId,props.cardPath,props.path,props.card?.path,props.view?.card?.path,props.record?.source?.path,props.record?.source?.cardPath].join("\n"));
 			const [draft, setDraft] = React.useState({});
             const [savedDraft,setSavedDraft]=React.useState('{}');
@@ -10924,7 +10926,7 @@ window.__ModuleLoader__.load({
 				} catch (err) { setWorldBookError(String(err && err.message || err)); }
 				finally { setWorldBookBusy(false); }
 			}
-			function F(name, label, large) { return React.createElement("div", { className: "dsh-tavern-card-field" }, React.createElement("label", null, label), name === "name" || name === "tags" ? React.createElement("input", { value: draft[name] || "", onChange: function (e) { field(name, e.target.value); } }) : React.createElement("textarea", { className: large ? "large" : "", value: draft[name] || "", onChange: function (e) { field(name, e.target.value); } })); }
+			function F(name, label, large) { return React.createElement("div", { className: "dsh-tavern-card-field" }, React.createElement("label", { htmlFor: fieldId + "-" + name }, label), name === "name" || name === "tags" ? React.createElement("input", { id: fieldId + "-" + name, "aria-describedby": error?fieldId+"-error":undefined, value: draft[name] || "", onChange: function (e) { field(name, e.target.value); } }) : React.createElement("textarea", { id: fieldId + "-" + name, "aria-describedby": error?fieldId+"-error":undefined, className: large ? "large" : "", value: draft[name] || "", onChange: function (e) { field(name, e.target.value); } })); }
 			const h = React.createElement;
 			const cardExtensions = props.view.card.extensions || {};
 			const cardRegexScripts = cardExtensions.regexScripts || [];
@@ -11049,7 +11051,7 @@ window.__ModuleLoader__.load({
 					h("details", { className: "dsh-tavern-card-advanced", open: true }, h("summary", null, "基本信息"), F("name", "角色名称"), F("tags", "标签"), F("description", "角色描述", true), F("personality", "性格"), F("scenario", "场景设定"), F("first_mes", "开场白", true), F("alternate_greetings", "备选开场白（--- 分隔）"), F("system_prompt", "系统提示"), F("post_history_instructions", "历史后指令"), F("mes_example", "对话示例", true), F("creator_notes", "创作者备注")),
 					h("details", { ref: worldBookDetailsRef, className: "dsh-tavern-card-advanced", onToggle: function (event) { if (event.currentTarget.open) loadWorldBookCatalog(); } }, h("summary", null, "世界书 · " + boundWorldBooks.length + " 本"), worldBookPanel),
 					h("details", { className: "dsh-tavern-card-advanced" }, h("summary", null, "扩展内容 · " + extensionCount + " 项"), extensionPanel),
-					error ? h("div", { className: "dsh-card-error" }, error) : null,
+					error ? h("div", { id:fieldId+"-error", role:"alert", className: "dsh-card-error" }, error) : null,
 					h("div", { className: "dsh-tavern-card-save" }, h("button", { className: "dsh-card-primary", disabled: busy, onClick: save }, busy ? "保存中…" : "保存字段"), h("button", {className:"dsh-tavern-btn",disabled:busy || cardDirty || !cardPath,onClick:restoreOriginal},"从原版恢复…"))
 				)
 			);

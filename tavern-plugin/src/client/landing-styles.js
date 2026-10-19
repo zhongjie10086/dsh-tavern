@@ -5,8 +5,13 @@ function installTavernLandingStyles(doc) {
   const Observer = doc.defaultView && doc.defaultView.MutationObserver;
   if (!Observer || !doc.body) return function () {};
   const roots = new Map();
-  const slotSelector = '[data-slot="conversation"]';
+  const slotSelector = '[data-slot="main.conversation"], [data-slot="conversation"]';
   function watch(root) {
+    const mount = doc.createElement('div');
+    mount.className = 'dsh-tavern-home-mount';
+    mount.hidden = true;
+    root.append(mount);
+    let previousLanding;
     let presetRow = null;
     function sync() {
       const hero = root.getAttribute('data-phase') === 'hero';
@@ -19,6 +24,11 @@ function installTavernLandingStyles(doc) {
       const hasHeader = Array.from(root.children).some(child => child.getAttribute('data-slot') === 'conversation.session.header');
       const landing = hero && !hasHeader && Boolean(root.querySelector('[data-composer-seat]'));
       root.classList.toggle('dsh-tavern-landing', landing);
+      mount.hidden = !landing;
+      if (previousLanding !== landing) {
+        previousLanding = landing;
+        doc.dispatchEvent(new doc.defaultView.CustomEvent('dsh-tavern-landing-changed'));
+      }
     }
     const observer = new Observer(records => {
       // Active-message streaming and input edits never rescan the history.
@@ -30,6 +40,8 @@ function installTavernLandingStyles(doc) {
       observer.disconnect();
       root.classList.remove('dsh-tavern-landing');
       if (presetRow) presetRow.classList.remove('dsh-tavern-hero-preset-row');
+      mount.remove();
+      doc.dispatchEvent(new doc.defaultView.CustomEvent('dsh-tavern-landing-changed'));
     };
   }
   function discover() {
