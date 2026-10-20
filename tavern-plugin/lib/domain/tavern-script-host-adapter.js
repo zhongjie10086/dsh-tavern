@@ -13,6 +13,7 @@ import {
   lastTavernHelperVariables,
   readTavernHelperVariables,
   projectTavernHelperContext,
+  projectTavernHelperMessageVariables,
   replaceTavernHelperMessages,
   replaceTavernHelperVariables
 } from './tavern-helper-context.js'
@@ -575,7 +576,7 @@ export function createTavernScriptHostAdapter(options = {}) {
     if (userText !== '' && !inputView.input) {
       const previousVariables = lastTavernHelperVariables(draft.messages)
       const message = { role: 'user', text: userText, swipeId: 0, swipes: [userText], variables: [] }
-      if (previousVariables !== undefined) message.variables = [structuredClone(previousVariables)]
+      if (previousVariables !== undefined) message.variables = [previousVariables]
       draft.messages.push(message)
     }
     const projected = {...projectTavernHelperContext(draft),...options.scriptDispatch.mvuActivity?.(chat)}
@@ -728,10 +729,11 @@ export function createTavernScriptHostAdapter(options = {}) {
       settled.text = originalText
       settled.sessionText = originalText
       settled.displayText = originalText
-      const beforeVariables = projectTavernHelperContext(current).messages[messageId].variables
-      const proposedContext = projectTavernHelperContext(transaction.draft)
       const validation = typeof input.validate === 'function'
-        ? await input.validate({ before: beforeVariables, after: proposedContext.messages[messageId].variables })
+        ? await input.validate({
+          before: projectTavernHelperMessageVariables(current, messageId),
+          after: projectTavernHelperMessageVariables(transaction.draft, messageId)
+        })
         : null
       if (validation && validation.failures.length > 0) {
         await record('validation-rejected', { failures: validation.failures, externalEffects: transaction.externalEffects === true })

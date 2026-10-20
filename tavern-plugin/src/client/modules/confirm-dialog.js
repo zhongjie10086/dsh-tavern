@@ -34,6 +34,34 @@ function askTavernConfirm(message, options) {
         }
         panel.append(actions); dialog.append(panel);
         let settled = false;
+        function restoreOpenerFocus() {
+            if (!opener?.isConnected || opts.signal?.aborted) return;
+            const enabled = () => !opener.disabled && !opener.matches?.(':disabled');
+            if (enabled()) { opener.focus({ preventScroll: true }); return; }
+            const previousFocus = document.activeElement;
+            const previousModals = [...document.querySelectorAll('dialog[open],[role="dialog"][aria-modal="true"]')];
+            let interrupted = false;
+            const interrupt = () => { interrupted = true; };
+            const focusChanged = () => { if (document.activeElement !== opener) interrupt(); };
+            document.addEventListener('focusin', focusChanged, true);
+            document.addEventListener('pointerdown', interrupt, true);
+            document.addEventListener('keydown', interrupt, true);
+            for (const event of ['pagehide','popstate','hashchange']) window.addEventListener(event, interrupt);
+            opts.signal?.addEventListener('abort', interrupt, { once: true });
+            // Promise continuations release their busy state before the next paint.
+            window.requestAnimationFrame(() => {
+                document.removeEventListener('focusin', focusChanged, true);
+                document.removeEventListener('pointerdown', interrupt, true);
+                document.removeEventListener('keydown', interrupt, true);
+                for (const event of ['pagehide','popstate','hashchange']) window.removeEventListener(event, interrupt);
+                opts.signal?.removeEventListener('abort', interrupt);
+                const currentModals = [...document.querySelectorAll('dialog[open],[role="dialog"][aria-modal="true"]')];
+                if (interrupted || opts.signal?.aborted || activeTavernConfirmation || !opener.isConnected || !enabled()
+                    || currentModals.length !== previousModals.length || currentModals.some((element,index) => element !== previousModals[index])
+                    || ![previousFocus,document.body,opener].includes(document.activeElement)) return;
+                opener.focus({ preventScroll: true });
+            });
+        }
         function finish(value, restoreFocus = true) {
             if (settled) return;
             settled = true;
@@ -44,7 +72,7 @@ function askTavernConfirm(message, options) {
             if (dialog.open) dialog.close();
             dialog.remove();
             if (activeTavernConfirmation === dialog) activeTavernConfirmation = null;
-            if (restoreFocus && opener?.isConnected) opener.focus({ preventScroll: true });
+            if (restoreFocus) restoreOpenerFocus();
             const accepted=value === true && !opts.signal?.aborted;
             resolve(accepted && opts.resourceImport ? {trustResource:trust.checked} : accepted);
         }

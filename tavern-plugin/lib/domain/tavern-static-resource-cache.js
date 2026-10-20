@@ -174,10 +174,6 @@ export function projectCachedResourceBody(asset, {scriptId=''}={}) {
   return body
 }
 
-async function quietlyDelete(file) {
-  try { await unlink(file) } catch {}
-}
-
 export function createTavernStaticResourceCache(options = {}) {
   const rootDir = path.resolve(str(options.rootDir) || '.dsh-tavern-static-assets')
   const request = (url, init, policy) => safeOutboundFetch(url, init, { ...policy,fetcher: options.fetch, lookup: options.lookup,maxDecodedBytes:maxEntryBytes })

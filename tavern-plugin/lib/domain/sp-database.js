@@ -139,12 +139,6 @@ function cellIndex(sheet, value) {
   return index
 }
 
-function lockedCell(locks, key, sheet, row, column) {
-  const lock = locks[key] || {}
-  const id = text(sheet.content[row]?.[0] ?? row)
-  return lock.table === true || (lock.rows || []).map(String).includes(id) || (lock.columns || []).includes(column) || (lock.cells || []).includes(id + ':' + column)
-}
-
 export function assertTableLocks(before, after, locks = {}) {
   for (const key of sheetKeys(before)) {
     const lock=locks[key];if(!lock||(!lock.table&&!(lock.rows?.length)&&!(lock.columns?.length)&&!(lock.cells?.length)))continue

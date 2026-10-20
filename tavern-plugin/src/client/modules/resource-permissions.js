@@ -8,7 +8,7 @@ function TavernResourcePermissions(props) {
   try{await props.api('changeTavernResourcePermissions',{targets:selected,capabilities:revoke?[]:caps});setCatalog(await props.api('getTavernCardPermissions',{currentOnly:true}));liveTavernView.invalidate(props.sessionId);setNotice(revoke?'所选资源的授信已撤销。':'所选资源已永久授信，新局、刷新、重启及同来源更新继续有效。');}
   catch(e){setError(e.message)}finally{setBusy(false)}
  }
- return h('section',{'aria-label':'本局资源授信',className:'dsh-script-permissions'},h('h2',null,'本局资源授信'),h('p',null,tavernResourceTrustExplanation),
+ return h('section',{'data-tavern-owned-ui':true,'aria-label':'本局资源授信',className:'dsh-script-permissions'},props.embedded?null:h('h2',null,'本局资源授信'),h('p',null,tavernResourceTrustExplanation),
   error?h('p',{role:'alert'},error):null,notice?h('p',{role:'status'},notice):null,
   !catalog?h('p',null,'正在读取本局资源…'):h('fieldset',{disabled:busy},h('legend',null,(catalog.restrictions?.count||0)+' 项能力受限'),
    h('p',null,'下面只列本局使用的资源。重复请求按资源和能力合并计数；此处记录保留到服务重启。'),

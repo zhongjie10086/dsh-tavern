@@ -51,6 +51,14 @@ export function lastTavernHelperVariables(messages) {
   return undefined
 }
 
+/** Read one projected floor without projecting unrelated message payloads. */
+export function projectTavernHelperMessageVariables(chat, messageId) {
+  const messages = (Array.isArray(chat?.messages) ? chat.messages : [])
+    .filter(source => source && typeof source === 'object')
+  const message = messages[normalizeMessageId(messages, messageId)]
+  return clone(Array.isArray(message.variables) ? message.variables[selectedSwipe(message)] || {} : {})
+}
+
 /** Project authoritative Chat state into the synchronous Tavern Helper read API. */
 export function projectTavernHelperContext(chat,{readonly=false}={}) {
   const copy=readonly?immutableJsonSnapshot:clone

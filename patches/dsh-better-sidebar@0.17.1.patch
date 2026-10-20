@@ -436,3 +436,927 @@ diff --git a/src/client/intercept.tsx b/src/client/intercept.tsx
  }
  
  /**
+diff --git a/lib/client.js b/lib/client.js
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -10433,6 +10433,65 @@
+ 		* disposes the entry and a later declaration re-registers it. This mirrors
+ 		* @deepseek-ai/dsh-client-ui-deliverables' registration of the same slot.
+ 		*/
++// Compatibility with legacy selection and the explicit-reference Session controller.
++function sidebarCurrentSession(list) {
++  if (Object.prototype.hasOwnProperty.call(list, "current")) return list.current;
++  return Object.values(list.byId).find(row => (row.retainedBy?.mainView ?? 0) > 0)?.id;
++}
++function sidebarCatalogs(list) {
++  if (list.subagentsByParent !== undefined) return list.subagentsByParent;
++  const projections = list.projectionsBySession ?? {};
++  return Object.fromEntries(Object.entries(projections).map(([parentId, projection]) => [parentId, {
++    state: projection.state === "idle" ? projection.values?.subagentCatalog === undefined ? "loading" : "ready" : projection.state,
++    error: projection.error ?? null,
++    parentAvailable: list.byId[parentId] !== undefined,
++    entries: (projection.values?.subagentCatalog ?? []).map(entry => {
++      if (entry.mode === "unknown") return { kind: "diagnostic", id: entry.id, reason: "unsupported" };
++      const children = projections[entry.id]?.values?.subagentCatalog;
++      return { ...entry, mode: entry.mode, kind: "child", activity: list.byId[entry.id]?.running ? "running" : "inactive",
++        hasChildren: children === undefined || children.length > 0 };
++    })
++  }]));
++}
++function sidebarObserveCatalog(sessions, parentId, open) {
++  if (typeof sessions.refreshProjections === "function") {
++    // Projection pushes are owned by the controller, not by this panel's lifetime.
++    if (open) return sessions.refreshProjections(parentId);
++  } else sessions.setSubagentCatalogOpen?.(parentId, open);
++}
++function sidebarRefreshCatalog(sessions, parentId) {
++  return typeof sessions.refreshProjections === "function" ? sessions.refreshProjections(parentId) : sessions.refreshSubagents?.(parentId);
++}
++function sidebarOpenSession(ctx, target) {
++  if (typeof ctx.sessions.retain === "function") {
++    const workspace = ctx.get("uiWorkspace");
++    if (typeof workspace?.openSession !== "function") throw new Error("main-view navigation service is unavailable");
++    workspace.openSession(target);
++  } else if (typeof target === "string") {
++    if (typeof ctx.sessions.open !== "function") throw new Error("session navigation is unavailable");
++    ctx.sessions.open(target);
++  } else {
++    if (typeof ctx.sessions.openSubagent !== "function") throw new Error("subagent navigation is unavailable");
++    ctx.sessions.openSubagent(target);
++  }
++}
++async function sidebarSaveFork(ctx, threadId, title) {
++  const newId = await ctx.sessions.fork({ sessionId: threadId, increaseTitle: true });
++  if (typeof ctx.sessions.retain === "function") {
++    const reference = ctx.sessions.retain(newId, { source: "controllerOperation" });
++    try {
++      await reference.ready;
++      if (title !== "") await reference.binding.session.rename(title);
++      sidebarOpenSession(ctx, newId);
++    } finally { reference.release(); }
++  } else {
++    const binding = ctx.sessions.binding?.(newId);
++    if (binding !== undefined && title !== "") await binding.session.rename(title);
++    sidebarOpenSession(ctx, newId);
++  }
++  return newId;
++}
++
+ 		function registerTurnTailInterception(ctx, store) {
+ 			return ctx.slots.inject("conversation.chat.turnTail", () => ctx.slots.register({
+ 				name: "conversation.chat.turnTail",
+@@ -10476,7 +10535,7 @@
+ 		function registerOpenPathInterception(ctx, store) {
+ 			return wrapOpenPath(ctx.workspaces, {
+ 				takeoverEnabled: () => !store.getSuspended() && store.getPrefs().interceptOpenPath !== false && store.getPrefs().tabsEnabled["editor"] !== false,
+-				currentSessionId: () => ctx.sessions.list.getSnapshot().current,
++				currentSessionId: () => sidebarCurrentSession(ctx.sessions.list.getSnapshot()),
+ 				openInSidebar: (path, sessionId) => {
+ 					openSidebarFile(ctx, store, sessionId, path);
+ 				},
+@@ -15848,7 +15907,7 @@
+ 			const sessions = ctx.sessions;
+ 			const list = (0, react.useSyncExternalStore)((0, react.useMemo)(() => (callback) => sessions.list.subscribe(callback), [sessions]), (0, react.useCallback)(() => sessions.list.getSnapshot(), [sessions]));
+ 			const byId = list.byId;
+-			const catalogs = list.subagentsByParent ?? {};
++			const catalogs = (0, react.useMemo)(() => sidebarCatalogs(list), [list]);
+ 			const rootId = (0, react.useMemo)(() => rootAncestor(byId, sessionId), [byId, sessionId]);
+ 			const rootCatalog = rootId === void 0 ? void 0 : catalogs[rootId];
+ 			const rootSummary = rootId === void 0 ? void 0 : byId[rootId];
+@@ -15856,7 +15915,7 @@
+ 			/** Catalog owners currently consuming live membership updates. */
+ 			const observedRef = (0, react.useRef)(/* @__PURE__ */ new Set());
+ 			const observe = (0, react.useCallback)((parentSessionId, open) => {
+-				sessions.setSubagentCatalogOpen?.(parentSessionId, open);
++				Promise.resolve(sidebarObserveCatalog(sessions, parentSessionId, open)).catch(error => console.warn("[dsh-better-sidebar] catalog refresh failed:", error));
+ 				if (open) observedRef.current.add(parentSessionId);
+ 				else observedRef.current.delete(parentSessionId);
+ 			}, [sessions]);
+@@ -15864,7 +15923,7 @@
+ 				if (rootId === void 0 || !active) return;
+ 				observe(rootId, true);
+ 				return () => {
+-					for (const parentSessionId of observedRef.current) sessions.setSubagentCatalogOpen?.(parentSessionId, false);
++					for (const parentSessionId of observedRef.current) sidebarObserveCatalog(sessions, parentSessionId, false);
+ 					observedRef.current.clear();
+ 				};
+ 			}, [
+@@ -15883,13 +15942,13 @@
+ 				observe
+ 			]);
+ 			(0, react.useEffect)(() => () => {
+-				for (const parentSessionId of observedRef.current) sessions.setSubagentCatalogOpen?.(parentSessionId, false);
++				for (const parentSessionId of observedRef.current) sidebarObserveCatalog(sessions, parentSessionId, false);
+ 				observedRef.current.clear();
+ 			}, [sessions]);
+ 			const openChild = (0, react.useCallback)((address) => {
+ 				onOpenChild?.(address);
+ 				try {
+-					sessions.openSubagent?.(address);
++					sidebarOpenSession(ctx, address);
+ 				} catch (error) {
+ 					console.warn("[dsh-better-sidebar] openSubagent failed:", error);
+ 				}
+@@ -15898,13 +15957,13 @@
+ 			const openMain = (0, react.useCallback)(() => {
+ 				if (rootId === void 0) return;
+ 				try {
+-					sessions.open?.(rootId);
++					sidebarOpenSession(ctx, rootId);
+ 				} catch (error) {
+ 					console.warn("[dsh-better-sidebar] open session failed:", error);
+ 				}
+ 			}, [sessions, rootId]);
+ 			const refresh = (0, react.useCallback)((parentSessionId) => {
+-				sessions.refreshSubagents?.(parentSessionId);
++				Promise.resolve(sidebarRefreshCatalog(sessions, parentSessionId)).catch(error => console.warn("[dsh-better-sidebar] catalog refresh failed:", error));
+ 			}, [sessions]);
+ 			const totals = (0, react.useMemo)(() => rootId === void 0 ? {
+ 				count: 0,
+@@ -16776,14 +16835,8 @@
+ 				setSaved(false);
+ 				try {
+ 					if (ctx.sessions.fork === void 0) throw new Error("session fork is unavailable");
+-					const newId = await ctx.sessions.fork({
+-						sessionId: threadId,
+-						increaseTitle: true
+-					});
+ 					const title = summary === void 0 ? "" : threadDisplayTitle(summary.displayTitle).trim();
+-					const binding = ctx.sessions.binding?.(newId);
+-					if (binding !== void 0 && title !== "") await binding.session.rename(title);
+-					ctx.sessions.open?.(newId);
++					await sidebarSaveFork(ctx, threadId, title);
+ 					setSaved(true);
+ 				} catch (cause) {
+ 					setError(cause instanceof Error ? cause.message : String(cause));
+@@ -19322,7 +19375,7 @@
+ 			}, []);
+ 			const layoutViewportHeight = visualViewportHeight ?? viewport.height;
+ 			const sessionList = (0, react.useSyncExternalStore)((0, react.useMemo)(() => (callback) => ctx.sessions.list.subscribe(callback), [ctx]), (0, react.useCallback)(() => ctx.sessions.list.getSnapshot(), [ctx]));
+-			const current = sessionList.current;
++			const current = sidebarCurrentSession(sessionList);
+ 			const snapshot = (0, react.useSyncExternalStore)((0, react.useCallback)((callback) => store.subscribe(callback), [store]), (0, react.useCallback)(() => store.getSnapshot(), [store]));
+ 			(0, react.useEffect)(() => {
+ 				store.setSession(current);
+diff --git a/lib/client-registry.js b/lib/client-registry.js
+--- a/lib/client-registry.js
++++ b/lib/client-registry.js
+@@ -10433,6 +10433,65 @@
+ 		* disposes the entry and a later declaration re-registers it. This mirrors
+ 		* @deepseek-ai/dsh-client-ui-deliverables' registration of the same slot.
+ 		*/
++// Compatibility with legacy selection and the explicit-reference Session controller.
++function sidebarCurrentSession(list) {
++  if (Object.prototype.hasOwnProperty.call(list, "current")) return list.current;
++  return Object.values(list.byId).find(row => (row.retainedBy?.mainView ?? 0) > 0)?.id;
++}
++function sidebarCatalogs(list) {
++  if (list.subagentsByParent !== undefined) return list.subagentsByParent;
++  const projections = list.projectionsBySession ?? {};
++  return Object.fromEntries(Object.entries(projections).map(([parentId, projection]) => [parentId, {
++    state: projection.state === "idle" ? projection.values?.subagentCatalog === undefined ? "loading" : "ready" : projection.state,
++    error: projection.error ?? null,
++    parentAvailable: list.byId[parentId] !== undefined,
++    entries: (projection.values?.subagentCatalog ?? []).map(entry => {
++      if (entry.mode === "unknown") return { kind: "diagnostic", id: entry.id, reason: "unsupported" };
++      const children = projections[entry.id]?.values?.subagentCatalog;
++      return { ...entry, mode: entry.mode, kind: "child", activity: list.byId[entry.id]?.running ? "running" : "inactive",
++        hasChildren: children === undefined || children.length > 0 };
++    })
++  }]));
++}
++function sidebarObserveCatalog(sessions, parentId, open) {
++  if (typeof sessions.refreshProjections === "function") {
++    // Projection pushes are owned by the controller, not by this panel's lifetime.
++    if (open) return sessions.refreshProjections(parentId);
++  } else sessions.setSubagentCatalogOpen?.(parentId, open);
++}
++function sidebarRefreshCatalog(sessions, parentId) {
++  return typeof sessions.refreshProjections === "function" ? sessions.refreshProjections(parentId) : sessions.refreshSubagents?.(parentId);
++}
++function sidebarOpenSession(ctx, target) {
++  if (typeof ctx.sessions.retain === "function") {
++    const workspace = ctx.get("uiWorkspace");
++    if (typeof workspace?.openSession !== "function") throw new Error("main-view navigation service is unavailable");
++    workspace.openSession(target);
++  } else if (typeof target === "string") {
++    if (typeof ctx.sessions.open !== "function") throw new Error("session navigation is unavailable");
++    ctx.sessions.open(target);
++  } else {
++    if (typeof ctx.sessions.openSubagent !== "function") throw new Error("subagent navigation is unavailable");
++    ctx.sessions.openSubagent(target);
++  }
++}
++async function sidebarSaveFork(ctx, threadId, title) {
++  const newId = await ctx.sessions.fork({ sessionId: threadId, increaseTitle: true });
++  if (typeof ctx.sessions.retain === "function") {
++    const reference = ctx.sessions.retain(newId, { source: "controllerOperation" });
++    try {
++      await reference.ready;
++      if (title !== "") await reference.binding.session.rename(title);
++      sidebarOpenSession(ctx, newId);
++    } finally { reference.release(); }
++  } else {
++    const binding = ctx.sessions.binding?.(newId);
++    if (binding !== undefined && title !== "") await binding.session.rename(title);
++    sidebarOpenSession(ctx, newId);
++  }
++  return newId;
++}
++
+ 		function registerTurnTailInterception(ctx, store) {
+ 			return ctx.slots.inject("conversation.chat.turnTail", () => ctx.slots.register({
+ 				name: "conversation.chat.turnTail",
+@@ -10476,7 +10535,7 @@
+ 		function registerOpenPathInterception(ctx, store) {
+ 			return wrapOpenPath(ctx.workspaces, {
+ 				takeoverEnabled: () => !store.getSuspended() && store.getPrefs().interceptOpenPath !== false && store.getPrefs().tabsEnabled["editor"] !== false,
+-				currentSessionId: () => ctx.sessions.list.getSnapshot().current,
++				currentSessionId: () => sidebarCurrentSession(ctx.sessions.list.getSnapshot()),
+ 				openInSidebar: (path, sessionId) => {
+ 					openSidebarFile(ctx, store, sessionId, path);
+ 				},
+@@ -15843,7 +15902,7 @@
+ 			const sessions = ctx.sessions;
+ 			const list = (0, react.useSyncExternalStore)((0, react.useMemo)(() => (callback) => sessions.list.subscribe(callback), [sessions]), (0, react.useCallback)(() => sessions.list.getSnapshot(), [sessions]));
+ 			const byId = list.byId;
+-			const catalogs = list.subagentsByParent ?? {};
++			const catalogs = (0, react.useMemo)(() => sidebarCatalogs(list), [list]);
+ 			const rootId = (0, react.useMemo)(() => rootAncestor(byId, sessionId), [byId, sessionId]);
+ 			const rootCatalog = rootId === void 0 ? void 0 : catalogs[rootId];
+ 			const rootSummary = rootId === void 0 ? void 0 : byId[rootId];
+@@ -15851,7 +15910,7 @@
+ 			/** Catalog owners currently consuming live membership updates. */
+ 			const observedRef = (0, react.useRef)(/* @__PURE__ */ new Set());
+ 			const observe = (0, react.useCallback)((parentSessionId, open) => {
+-				sessions.setSubagentCatalogOpen?.(parentSessionId, open);
++				Promise.resolve(sidebarObserveCatalog(sessions, parentSessionId, open)).catch(error => console.warn("[dsh-better-sidebar] catalog refresh failed:", error));
+ 				if (open) observedRef.current.add(parentSessionId);
+ 				else observedRef.current.delete(parentSessionId);
+ 			}, [sessions]);
+@@ -15859,7 +15918,7 @@
+ 				if (rootId === void 0 || !active) return;
+ 				observe(rootId, true);
+ 				return () => {
+-					for (const parentSessionId of observedRef.current) sessions.setSubagentCatalogOpen?.(parentSessionId, false);
++					for (const parentSessionId of observedRef.current) sidebarObserveCatalog(sessions, parentSessionId, false);
+ 					observedRef.current.clear();
+ 				};
+ 			}, [
+@@ -15878,13 +15937,13 @@
+ 				observe
+ 			]);
+ 			(0, react.useEffect)(() => () => {
+-				for (const parentSessionId of observedRef.current) sessions.setSubagentCatalogOpen?.(parentSessionId, false);
++				for (const parentSessionId of observedRef.current) sidebarObserveCatalog(sessions, parentSessionId, false);
+ 				observedRef.current.clear();
+ 			}, [sessions]);
+ 			const openChild = (0, react.useCallback)((address) => {
+ 				onOpenChild?.(address);
+ 				try {
+-					sessions.openSubagent?.(address);
++					sidebarOpenSession(ctx, address);
+ 				} catch (error) {
+ 					console.warn("[dsh-better-sidebar] openSubagent failed:", error);
+ 				}
+@@ -15893,13 +15952,13 @@
+ 			const openMain = (0, react.useCallback)(() => {
+ 				if (rootId === void 0) return;
+ 				try {
+-					sessions.open?.(rootId);
++					sidebarOpenSession(ctx, rootId);
+ 				} catch (error) {
+ 					console.warn("[dsh-better-sidebar] open session failed:", error);
+ 				}
+ 			}, [sessions, rootId]);
+ 			const refresh = (0, react.useCallback)((parentSessionId) => {
+-				sessions.refreshSubagents?.(parentSessionId);
++				Promise.resolve(sidebarRefreshCatalog(sessions, parentSessionId)).catch(error => console.warn("[dsh-better-sidebar] catalog refresh failed:", error));
+ 			}, [sessions]);
+ 			const totals = (0, react.useMemo)(() => rootId === void 0 ? {
+ 				count: 0,
+@@ -16772,14 +16831,8 @@
+ 				setSaved(false);
+ 				try {
+ 					if (ctx.sessions.fork === void 0) throw new Error("session fork is unavailable");
+-					const newId = await ctx.sessions.fork({
+-						sessionId: threadId,
+-						increaseTitle: true
+-					});
+ 					const title = summary === void 0 ? "" : threadDisplayTitle(summary.displayTitle).trim();
+-					const binding = ctx.sessions.binding?.(newId);
+-					if (binding !== void 0 && title !== "") await binding.session.rename(title);
+-					ctx.sessions.open?.(newId);
++					await sidebarSaveFork(ctx, threadId, title);
+ 					setSaved(true);
+ 				} catch (cause) {
+ 					setError(cause instanceof Error ? cause.message : String(cause));
+@@ -19318,7 +19371,7 @@
+ 			}, []);
+ 			const layoutViewportHeight = visualViewportHeight ?? viewport.height;
+ 			const sessionList = (0, react.useSyncExternalStore)((0, react.useMemo)(() => (callback) => ctx.sessions.list.subscribe(callback), [ctx]), (0, react.useCallback)(() => ctx.sessions.list.getSnapshot(), [ctx]));
+-			const current = sessionList.current;
++			const current = sidebarCurrentSession(sessionList);
+ 			const snapshot = (0, react.useSyncExternalStore)((0, react.useCallback)((callback) => store.subscribe(callback), [store]), (0, react.useCallback)(() => store.getSnapshot(), [store]));
+ 			(0, react.useEffect)(() => {
+ 				store.setSession(current);
+diff --git a/src/context-types.ts b/src/context-types.ts
+--- a/src/context-types.ts
++++ b/src/context-types.ts
+@@ -135,6 +135,7 @@
+ 
+ /** The client session list row the sidebar reads (cwd for the explorer). */
+ export interface SidebarSessionSummary {
++  retainedBy?: { mainView?: number }
+   id: string
+   cwd?: string
+   displayTitle: string
+@@ -339,10 +340,15 @@
+ 
+ /** The client session list snapshot the sidebar subscribes to. */
+ export interface SidebarSessionList {
+-  current: string | undefined
++  current?: string | undefined
+   byId: Record<string, SidebarSessionSummary>
+   /** Direct durable catalogs keyed by their selected parent address. */
+   subagentsByParent?: Readonly<Record<string, SidebarSubagentCatalog>>
++  projectionsBySession?: Record<string, {
++    state: 'idle' | 'loading' | 'ready' | 'error'
++    error: SidebarSubagentCatalog['error']
++    values?: { subagentCatalog?: Array<{ id: string; mode: 'one-shot' | 'continuable' | 'unknown'; label?: string }> }
++  }>
+   /**
+    * Background jobs per session, last-wins from the harness's `session/jobs`
+    * push (a missing key is an empty set). Absent on runtime snapshots older
+@@ -353,6 +359,12 @@
+ 
+ /** The client sessions service face (only the list feed is needed). */
+ export interface SidebarSessionsService {
++  refreshProjections?(id: string): Promise<void>
++  retain?(id: string, options: { source: 'controllerOperation' }): {
++    ready: Promise<unknown>
++    binding: { session: { rename(title: string): Promise<unknown> } }
++    release(): void
++  }
+   list: {
+     getSnapshot(): SidebarSessionList
+     subscribe(fn: () => void): () => void
+diff --git a/src/client/host-sessions.ts b/src/client/host-sessions.ts
+new file mode 100644
+--- /dev/null
++++ b/src/client/host-sessions.ts
+@@ -0,0 +1,60 @@
++import type { Context, SidebarSessionList, SidebarSessionsService, SidebarSubagentAddress, SidebarSubagentCatalog } from '../context-types.ts'
++// Compatibility with legacy selection and the explicit-reference Session controller.
++export function sidebarCurrentSession(list: SidebarSessionList): string | undefined {
++  if (Object.prototype.hasOwnProperty.call(list, "current")) return list.current;
++  return Object.values(list.byId).find(row => (row.retainedBy?.mainView ?? 0) > 0)?.id;
++}
++export function sidebarCatalogs(list: SidebarSessionList): Record<string, SidebarSubagentCatalog> {
++  if (list.subagentsByParent !== undefined) return list.subagentsByParent;
++  const projections = list.projectionsBySession ?? {};
++  return Object.fromEntries(Object.entries(projections).map(([parentId, projection]) => [parentId, {
++    state: projection.state === "idle" ? projection.values?.subagentCatalog === undefined ? "loading" : "ready" : projection.state,
++    error: projection.error ?? null,
++    parentAvailable: list.byId[parentId] !== undefined,
++    entries: (projection.values?.subagentCatalog ?? []).map(entry => {
++      if (entry.mode === "unknown") return { kind: "diagnostic", id: entry.id, reason: "unsupported" };
++      const children = projections[entry.id]?.values?.subagentCatalog;
++      return { ...entry, mode: entry.mode, kind: "child", activity: list.byId[entry.id]?.running ? "running" : "inactive",
++        hasChildren: children === undefined || children.length > 0 };
++    })
++  }]));
++}
++export function sidebarObserveCatalog(sessions: SidebarSessionsService, parentId: string, open: boolean) {
++  if (typeof sessions.refreshProjections === "function") {
++    // Projection pushes are owned by the controller, not by this panel's lifetime.
++    if (open) return sessions.refreshProjections(parentId);
++  } else sessions.setSubagentCatalogOpen?.(parentId, open);
++}
++export function sidebarRefreshCatalog(sessions: SidebarSessionsService, parentId: string) {
++  return typeof sessions.refreshProjections === "function" ? sessions.refreshProjections(parentId) : sessions.refreshSubagents?.(parentId);
++}
++export function sidebarOpenSession(ctx: Context, target: string | SidebarSubagentAddress) {
++  if (typeof ctx.sessions.retain === "function") {
++    const workspace = ctx.get("uiWorkspace") as { openSession?(target: string | SidebarSubagentAddress): void } | undefined;
++    if (typeof workspace?.openSession !== "function") throw new Error("main-view navigation service is unavailable");
++    workspace.openSession(target);
++  } else if (typeof target === "string") {
++    if (typeof ctx.sessions.open !== "function") throw new Error("session navigation is unavailable");
++    ctx.sessions.open(target);
++  } else {
++    if (typeof ctx.sessions.openSubagent !== "function") throw new Error("subagent navigation is unavailable");
++    ctx.sessions.openSubagent(target);
++  }
++}
++export async function sidebarSaveFork(ctx: Context, threadId: string, title: string) {
++  if (!ctx.sessions.fork) throw new Error("session fork is unavailable");
++  const newId = await ctx.sessions.fork({ sessionId: threadId, increaseTitle: true });
++  if (typeof ctx.sessions.retain === "function") {
++    const reference = ctx.sessions.retain(newId, { source: "controllerOperation" });
++    try {
++      await reference.ready;
++      if (title !== "") await reference.binding.session.rename(title);
++      sidebarOpenSession(ctx, newId);
++    } finally { reference.release(); }
++  } else {
++    const binding = ctx.sessions.binding?.(newId);
++    if (binding !== undefined && title !== "") await binding.session.rename(title);
++    sidebarOpenSession(ctx, newId);
++  }
++  return newId;
++}
+diff --git a/src/client/intercept.tsx b/src/client/intercept.tsx
+--- a/src/client/intercept.tsx
++++ b/src/client/intercept.tsx
+@@ -1,3 +1,4 @@
++import { sidebarCurrentSession } from './host-sessions.ts'
+ /**
+  * Interception of the chat's produced-files row: the turn-tail chain entry
+  * that replaces ui-deliverables' row when the closing turn produced files.
+@@ -173,7 +174,7 @@
+     takeoverEnabled: () => !store.getSuspended()
+       && store.getPrefs().interceptOpenPath !== false
+       && store.getPrefs().tabsEnabled['editor'] !== false,
+-    currentSessionId: () => ctx.sessions.list.getSnapshot().current,
++    currentSessionId: () => sidebarCurrentSession(ctx.sessions.list.getSnapshot()),
+     openInSidebar: (path, sessionId) => { openSidebarFile(ctx, store, sessionId, path) },
+     revealInExplorer: (_path, sessionId) => { revealInExplorer(ctx, store, sessionId, lastProduced) },
+   })
+diff --git a/src/client/Sidebar.tsx b/src/client/Sidebar.tsx
+--- a/src/client/Sidebar.tsx
++++ b/src/client/Sidebar.tsx
+@@ -1,3 +1,4 @@
++import { sidebarCurrentSession } from './host-sessions.ts'
+ /**
+  * The sidebar shell: panels mounted inside the unified panel host — a
+  * fixed, viewport-sized containing block ([data-dsh-panel-host]) appended
+@@ -289,7 +290,7 @@
+     useMemo(() => (callback: () => void) => ctx.sessions.list.subscribe(callback), [ctx]),
+     useCallback(() => ctx.sessions.list.getSnapshot(), [ctx]),
+   )
+-  const current = sessionList.current
++  const current = sidebarCurrentSession(sessionList)
+ 
+   // Per-session sidebar state.
+   const snapshot = useSyncExternalStore(
+diff --git a/src/client/SubagentView.tsx b/src/client/SubagentView.tsx
+--- a/src/client/SubagentView.tsx
++++ b/src/client/SubagentView.tsx
+@@ -1,3 +1,4 @@
++import { sidebarCatalogs, sidebarObserveCatalog, sidebarRefreshCatalog, sidebarOpenSession } from './host-sessions.ts'
+ /**
+  * Subagent page: the FULL agent topology of the current tree's main session.
+  *
+@@ -656,7 +657,7 @@
+     useCallback(() => sessions.list.getSnapshot(), [sessions]),
+   )
+   const byId = list.byId
+-  const catalogs = list.subagentsByParent ?? {}
++  const catalogs = useMemo(() => sidebarCatalogs(list), [list])
+ 
+   // The topology root: the main agent of the current session's tree.
+   const rootId = useMemo(() => rootAncestor(byId, sessionId), [byId, sessionId])
+@@ -668,7 +669,7 @@
+   const observedRef = useRef(new Set<string>())
+ 
+   const observe = useCallback((parentSessionId: string, open: boolean): void => {
+-    sessions.setSubagentCatalogOpen?.(parentSessionId, open)
++    Promise.resolve(sidebarObserveCatalog(sessions, parentSessionId, open)).catch(error => console.warn("[dsh-better-sidebar] catalog refresh failed:", error))
+     if (open) observedRef.current.add(parentSessionId)
+     else observedRef.current.delete(parentSessionId)
+   }, [sessions])
+@@ -681,7 +682,7 @@
+     observe(rootId, true)
+     return () => {
+       for (const parentSessionId of observedRef.current) {
+-        sessions.setSubagentCatalogOpen?.(parentSessionId, false)
++        sidebarObserveCatalog(sessions, parentSessionId, false)
+       }
+       observedRef.current.clear()
+     }
+@@ -701,7 +702,7 @@
+   // Unobserve everything on unmount (the host stops refreshing unused catalogs).
+   useEffect(() => () => {
+     for (const parentSessionId of observedRef.current) {
+-      sessions.setSubagentCatalogOpen?.(parentSessionId, false)
++      sidebarObserveCatalog(sessions, parentSessionId, false)
+     }
+     observedRef.current.clear()
+   }, [sessions])
+@@ -713,7 +714,7 @@
+     // highlighted) — the README "page stays open" contract.
+     onOpenChild?.(address)
+     try {
+-      sessions.openSubagent?.(address)
++      sidebarOpenSession(ctx, address)
+     } catch (error) {
+       console.warn('[dsh-better-sidebar] openSubagent failed:', error)
+     }
+@@ -723,14 +724,14 @@
+   const openMain = useCallback((): void => {
+     if (rootId === undefined) return
+     try {
+-      sessions.open?.(rootId)
++      sidebarOpenSession(ctx, rootId)
+     } catch (error) {
+       console.warn('[dsh-better-sidebar] open session failed:', error)
+     }
+   }, [sessions, rootId])
+ 
+   const refresh = useCallback((parentSessionId: string): void => {
+-    void sessions.refreshSubagents?.(parentSessionId)
++    void Promise.resolve(sidebarRefreshCatalog(sessions, parentSessionId)).catch(error => console.warn("[dsh-better-sidebar] catalog refresh failed:", error))
+   }, [sessions])
+ 
+   const totals = useMemo(
+diff --git a/src/client/SideChatView.tsx b/src/client/SideChatView.tsx
+--- a/src/client/SideChatView.tsx
++++ b/src/client/SideChatView.tsx
+@@ -1,3 +1,4 @@
++import { sidebarSaveFork } from './host-sessions.ts'
+ /**
+  * Side Chat page: Codex-style side conversations for the current session.
+  *
+@@ -498,13 +499,8 @@
+       // client-runtime sessions service, and an unbound reference loses
+       // `this` (its fork reads this.list for the title bump).
+       if (ctx.sessions.fork === undefined) throw new Error('session fork is unavailable')
+-      const newId = await ctx.sessions.fork({ sessionId: threadId, increaseTitle: true })
+       const title = summary === undefined ? '' : threadDisplayTitle(summary.displayTitle).trim()
+-      const binding = ctx.sessions.binding?.(newId)
+-      if (binding !== undefined && title !== '') {
+-        await binding.session.rename(title)
+-      }
+-      ctx.sessions.open?.(newId)
++      await sidebarSaveFork(ctx, threadId, title)
+       setSaved(true)
+     } catch (cause) {
+       setError(cause instanceof Error ? cause.message : String(cause))
+diff --git a/lib/client-editor.js b/lib/client-editor.js
+--- a/lib/client-editor.js
++++ b/lib/client-editor.js
+@@ -6,6 +6,11 @@
+ 	let react = require("react");
+ 	let react_dom = require("react-dom");
+ 	let _deepseek_ai_dsh_client_ui_primitives = require("@deepseek-ai/dsh-client-ui-primitives");
++		// Host icon exports moved from size suffixes to stroke vocabulary in 0.2.
++		_deepseek_ai_dsh_client_ui_primitives = { ..._deepseek_ai_dsh_client_ui_primitives,
++			IconCheckOutline16: _deepseek_ai_dsh_client_ui_primitives.IconCheckOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconCheckOutlineRegular,
++			IconListPenOutline16: _deepseek_ai_dsh_client_ui_primitives.IconListPenOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconListPenOutlineRegular,
++		};
+ 	let react_jsx_runtime = require("react/jsx-runtime");
+ 	//#region node_modules/.pnpm/clsx@2.1.1/node_modules/clsx/dist/clsx.mjs
+ 	function r$1(e) {
+diff --git a/lib/client-mermaid.js b/lib/client-mermaid.js
+--- a/lib/client-mermaid.js
++++ b/lib/client-mermaid.js
+@@ -47,6 +47,10 @@
+ 	let react_dom = require("react-dom");
+ 	let react_dom_client = require("react-dom/client");
+ 	let _deepseek_ai_dsh_client_ui_primitives = require("@deepseek-ai/dsh-client-ui-primitives");
++		// Host icon exports moved from size suffixes to stroke vocabulary in 0.2.
++		_deepseek_ai_dsh_client_ui_primitives = { ..._deepseek_ai_dsh_client_ui_primitives,
++			IconCopyOutline16: _deepseek_ai_dsh_client_ui_primitives.IconCopyOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconCopyOutlineRegular,
++		};
+ 	let react_jsx_runtime = require("react/jsx-runtime");
+ 	//#region node_modules/.pnpm/mermaid@11.17.0/node_modules/mermaid/dist/chunks/mermaid.core/chunk-Y2CYZVJY.mjs
+ 	var __defProp$1, __name$1, __export$1;
+diff --git a/lib/client-registry.js b/lib/client-registry.js
+--- a/lib/client-registry.js
++++ b/lib/client-registry.js
+@@ -30,6 +30,33 @@
+ 		react = __toESM(react, 1);
+ 		let react_dom_client = require("react-dom/client");
+ 		let _deepseek_ai_dsh_client_ui_primitives = require("@deepseek-ai/dsh-client-ui-primitives");
++		// Host icon exports moved from size suffixes to stroke vocabulary in 0.2.
++		_deepseek_ai_dsh_client_ui_primitives = { ..._deepseek_ai_dsh_client_ui_primitives,
++			IconBranchOutline16: _deepseek_ai_dsh_client_ui_primitives.IconBranchOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconBranchOutlineRegular,
++			IconCheckOutline16: _deepseek_ai_dsh_client_ui_primitives.IconCheckOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconCheckOutlineRegular,
++			IconChevronDownOutline14: _deepseek_ai_dsh_client_ui_primitives.IconChevronDownOutline14 ?? _deepseek_ai_dsh_client_ui_primitives.IconChevronDownOutlineRegular,
++			IconChevronLeftOutline14: _deepseek_ai_dsh_client_ui_primitives.IconChevronLeftOutline14 ?? _deepseek_ai_dsh_client_ui_primitives.IconChevronLeftOutlineRegular,
++			IconChevronRightOutline14: _deepseek_ai_dsh_client_ui_primitives.IconChevronRightOutline14 ?? _deepseek_ai_dsh_client_ui_primitives.IconChevronRightOutlineRegular,
++			IconCloseFill14: _deepseek_ai_dsh_client_ui_primitives.IconCloseFill14 ?? _deepseek_ai_dsh_client_ui_primitives.IconCloseFillRegular,
++			IconCloseOutline16: _deepseek_ai_dsh_client_ui_primitives.IconCloseOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconCloseOutlineRegular,
++			IconCodeOutline16: _deepseek_ai_dsh_client_ui_primitives.IconCodeOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconCodeOutlineRegular,
++			IconCopyOutline16: _deepseek_ai_dsh_client_ui_primitives.IconCopyOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconCopyOutlineRegular,
++			IconDownloadOutline16: _deepseek_ai_dsh_client_ui_primitives.IconDownloadOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconDownloadOutlineRegular,
++			IconFolderOpen16: _deepseek_ai_dsh_client_ui_primitives.IconFolderOpen16 ?? _deepseek_ai_dsh_client_ui_primitives.IconFolderOpenRegular,
++			IconLinkOutline14: _deepseek_ai_dsh_client_ui_primitives.IconLinkOutline14 ?? _deepseek_ai_dsh_client_ui_primitives.IconLinkOutlineRegular,
++			IconLinkOutline16: _deepseek_ai_dsh_client_ui_primitives.IconLinkOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconLinkOutlineRegular,
++			IconNewChatOutline16: _deepseek_ai_dsh_client_ui_primitives.IconNewChatOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconNewChatOutlineRegular,
++			IconPanelLeftOutline16: _deepseek_ai_dsh_client_ui_primitives.IconPanelLeftOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconPanelLeftOutlineRegular,
++			IconPlusOutline16: _deepseek_ai_dsh_client_ui_primitives.IconPlusOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconPlusOutlineRegular,
++			IconRefreshOutline14: _deepseek_ai_dsh_client_ui_primitives.IconRefreshOutline14 ?? _deepseek_ai_dsh_client_ui_primitives.IconRefreshOutlineRegular,
++			IconRefreshOutline16: _deepseek_ai_dsh_client_ui_primitives.IconRefreshOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconRefreshOutlineRegular,
++			IconSendOutline16: _deepseek_ai_dsh_client_ui_primitives.IconSendOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconSendOutlineRegular,
++			IconSettingsOutline16: _deepseek_ai_dsh_client_ui_primitives.IconSettingsOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconSettingsOutlineRegular,
++			IconStopFill16: _deepseek_ai_dsh_client_ui_primitives.IconStopFill16 ?? _deepseek_ai_dsh_client_ui_primitives.IconStopFillRegular,
++			IconThinkOutline16: _deepseek_ai_dsh_client_ui_primitives.IconThinkOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconThinkOutlineRegular,
++			IconTrashOutline16: _deepseek_ai_dsh_client_ui_primitives.IconTrashOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconTrashOutlineRegular,
++			IconWarningOutline16: _deepseek_ai_dsh_client_ui_primitives.IconWarningOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconWarningOutlineRegular,
++		};
+ 		let react_jsx_runtime = require("react/jsx-runtime");
+ 		let react_dom = require("react-dom");
+ 		/** The title-bar / shell compatibility schemes (see {@link SidebarPrefs.titleBarScheme}). */
+diff --git a/lib/client.js b/lib/client.js
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -30,6 +30,33 @@
+ 		react = __toESM(react, 1);
+ 		let react_dom_client = require("react-dom/client");
+ 		let _deepseek_ai_dsh_client_ui_primitives = require("@deepseek-ai/dsh-client-ui-primitives");
++		// Host icon exports moved from size suffixes to stroke vocabulary in 0.2.
++		_deepseek_ai_dsh_client_ui_primitives = { ..._deepseek_ai_dsh_client_ui_primitives,
++			IconBranchOutline16: _deepseek_ai_dsh_client_ui_primitives.IconBranchOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconBranchOutlineRegular,
++			IconCheckOutline16: _deepseek_ai_dsh_client_ui_primitives.IconCheckOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconCheckOutlineRegular,
++			IconChevronDownOutline14: _deepseek_ai_dsh_client_ui_primitives.IconChevronDownOutline14 ?? _deepseek_ai_dsh_client_ui_primitives.IconChevronDownOutlineRegular,
++			IconChevronLeftOutline14: _deepseek_ai_dsh_client_ui_primitives.IconChevronLeftOutline14 ?? _deepseek_ai_dsh_client_ui_primitives.IconChevronLeftOutlineRegular,
++			IconChevronRightOutline14: _deepseek_ai_dsh_client_ui_primitives.IconChevronRightOutline14 ?? _deepseek_ai_dsh_client_ui_primitives.IconChevronRightOutlineRegular,
++			IconCloseFill14: _deepseek_ai_dsh_client_ui_primitives.IconCloseFill14 ?? _deepseek_ai_dsh_client_ui_primitives.IconCloseFillRegular,
++			IconCloseOutline16: _deepseek_ai_dsh_client_ui_primitives.IconCloseOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconCloseOutlineRegular,
++			IconCodeOutline16: _deepseek_ai_dsh_client_ui_primitives.IconCodeOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconCodeOutlineRegular,
++			IconCopyOutline16: _deepseek_ai_dsh_client_ui_primitives.IconCopyOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconCopyOutlineRegular,
++			IconDownloadOutline16: _deepseek_ai_dsh_client_ui_primitives.IconDownloadOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconDownloadOutlineRegular,
++			IconFolderOpen16: _deepseek_ai_dsh_client_ui_primitives.IconFolderOpen16 ?? _deepseek_ai_dsh_client_ui_primitives.IconFolderOpenRegular,
++			IconLinkOutline14: _deepseek_ai_dsh_client_ui_primitives.IconLinkOutline14 ?? _deepseek_ai_dsh_client_ui_primitives.IconLinkOutlineRegular,
++			IconLinkOutline16: _deepseek_ai_dsh_client_ui_primitives.IconLinkOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconLinkOutlineRegular,
++			IconNewChatOutline16: _deepseek_ai_dsh_client_ui_primitives.IconNewChatOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconNewChatOutlineRegular,
++			IconPanelLeftOutline16: _deepseek_ai_dsh_client_ui_primitives.IconPanelLeftOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconPanelLeftOutlineRegular,
++			IconPlusOutline16: _deepseek_ai_dsh_client_ui_primitives.IconPlusOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconPlusOutlineRegular,
++			IconRefreshOutline14: _deepseek_ai_dsh_client_ui_primitives.IconRefreshOutline14 ?? _deepseek_ai_dsh_client_ui_primitives.IconRefreshOutlineRegular,
++			IconRefreshOutline16: _deepseek_ai_dsh_client_ui_primitives.IconRefreshOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconRefreshOutlineRegular,
++			IconSendOutline16: _deepseek_ai_dsh_client_ui_primitives.IconSendOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconSendOutlineRegular,
++			IconSettingsOutline16: _deepseek_ai_dsh_client_ui_primitives.IconSettingsOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconSettingsOutlineRegular,
++			IconStopFill16: _deepseek_ai_dsh_client_ui_primitives.IconStopFill16 ?? _deepseek_ai_dsh_client_ui_primitives.IconStopFillRegular,
++			IconThinkOutline16: _deepseek_ai_dsh_client_ui_primitives.IconThinkOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconThinkOutlineRegular,
++			IconTrashOutline16: _deepseek_ai_dsh_client_ui_primitives.IconTrashOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconTrashOutlineRegular,
++			IconWarningOutline16: _deepseek_ai_dsh_client_ui_primitives.IconWarningOutline16 ?? _deepseek_ai_dsh_client_ui_primitives.IconWarningOutlineRegular,
++		};
+ 		let react_jsx_runtime = require("react/jsx-runtime");
+ 		let react_dom = require("react-dom");
+ 		/** The title-bar / shell compatibility schemes (see {@link SidebarPrefs.titleBarScheme}). */
+diff --git a/src/client/host-ui.ts b/src/client/host-ui.ts
+new file mode 100644
+--- /dev/null
++++ b/src/client/host-ui.ts
+@@ -0,0 +1,31 @@
++import * as HostUi from '@deepseek-ai/dsh-client-ui-primitives'
++import type { ComponentType } from 'react'
++import type { IconProps } from '@deepseek-ai/dsh-client-ui-primitives'
++export * from '@deepseek-ai/dsh-client-ui-primitives'
++// Preserve the original host components and map only the renamed icon face.
++const hostIcons = HostUi as unknown as Record<string, ComponentType<IconProps>>
++export const IconBranchOutline16 = hostIcons.IconBranchOutline16 ?? hostIcons.IconBranchOutlineRegular
++export const IconCheckOutline16 = hostIcons.IconCheckOutline16 ?? hostIcons.IconCheckOutlineRegular
++export const IconChevronDownOutline14 = hostIcons.IconChevronDownOutline14 ?? hostIcons.IconChevronDownOutlineRegular
++export const IconChevronLeftOutline14 = hostIcons.IconChevronLeftOutline14 ?? hostIcons.IconChevronLeftOutlineRegular
++export const IconChevronRightOutline14 = hostIcons.IconChevronRightOutline14 ?? hostIcons.IconChevronRightOutlineRegular
++export const IconCloseFill14 = hostIcons.IconCloseFill14 ?? hostIcons.IconCloseFillRegular
++export const IconCloseOutline16 = hostIcons.IconCloseOutline16 ?? hostIcons.IconCloseOutlineRegular
++export const IconCodeOutline16 = hostIcons.IconCodeOutline16 ?? hostIcons.IconCodeOutlineRegular
++export const IconCopyOutline16 = hostIcons.IconCopyOutline16 ?? hostIcons.IconCopyOutlineRegular
++export const IconDownloadOutline16 = hostIcons.IconDownloadOutline16 ?? hostIcons.IconDownloadOutlineRegular
++export const IconFolderOpen16 = hostIcons.IconFolderOpen16 ?? hostIcons.IconFolderOpenRegular
++export const IconLinkOutline14 = hostIcons.IconLinkOutline14 ?? hostIcons.IconLinkOutlineRegular
++export const IconLinkOutline16 = hostIcons.IconLinkOutline16 ?? hostIcons.IconLinkOutlineRegular
++export const IconListPenOutline16 = hostIcons.IconListPenOutline16 ?? hostIcons.IconListPenOutlineRegular
++export const IconNewChatOutline16 = hostIcons.IconNewChatOutline16 ?? hostIcons.IconNewChatOutlineRegular
++export const IconPanelLeftOutline16 = hostIcons.IconPanelLeftOutline16 ?? hostIcons.IconPanelLeftOutlineRegular
++export const IconPlusOutline16 = hostIcons.IconPlusOutline16 ?? hostIcons.IconPlusOutlineRegular
++export const IconRefreshOutline14 = hostIcons.IconRefreshOutline14 ?? hostIcons.IconRefreshOutlineRegular
++export const IconRefreshOutline16 = hostIcons.IconRefreshOutline16 ?? hostIcons.IconRefreshOutlineRegular
++export const IconSendOutline16 = hostIcons.IconSendOutline16 ?? hostIcons.IconSendOutlineRegular
++export const IconSettingsOutline16 = hostIcons.IconSettingsOutline16 ?? hostIcons.IconSettingsOutlineRegular
++export const IconStopFill16 = hostIcons.IconStopFill16 ?? hostIcons.IconStopFillRegular
++export const IconThinkOutline16 = hostIcons.IconThinkOutline16 ?? hostIcons.IconThinkOutlineRegular
++export const IconTrashOutline16 = hostIcons.IconTrashOutline16 ?? hostIcons.IconTrashOutlineRegular
++export const IconWarningOutline16 = hostIcons.IconWarningOutline16 ?? hostIcons.IconWarningOutlineRegular
+diff --git a/src/client/BrowserView.tsx b/src/client/BrowserView.tsx
+--- a/src/client/BrowserView.tsx
++++ b/src/client/BrowserView.tsx
+@@ -23,7 +23,7 @@
+   IconLinkOutline14,
+   IconRefreshOutline14,
+   IconWarningOutline16,
+-} from '@deepseek-ai/dsh-client-ui-primitives'
++} from './host-ui.ts'
+ import { VscLinkExternal } from 'react-icons/vsc'
+ import { api } from './api.ts'
+ import { embeddabilityOf, isAllowedLoopbackUrl, normalizeBrowserUrl } from './browser.ts'
+diff --git a/src/client/DiffTab.tsx b/src/client/DiffTab.tsx
+--- a/src/client/DiffTab.tsx
++++ b/src/client/DiffTab.tsx
+@@ -8,7 +8,7 @@
+  * very content it shows.
+  */
+ import { useCallback, useEffect, useState } from 'react'
+-import { IconRefreshOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconRefreshOutline16 } from './host-ui.ts'
+ import type { SessionScope } from './api.ts'
+ import { api } from './api.ts'
+ import type { SidebarDiffRef } from './state.ts'
+diff --git a/src/client/EditorHost.tsx b/src/client/EditorHost.tsx
+--- a/src/client/EditorHost.tsx
++++ b/src/client/EditorHost.tsx
+@@ -25,7 +25,7 @@
+ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+ import { createElement } from 'react'
+ import clsx from 'clsx'
+-import { IconCheckOutline16, IconFolderOpen16, IconRefreshOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconCheckOutline16, IconFolderOpen16, IconRefreshOutline14 } from './host-ui.ts'
+ import type { Context } from '../context-types.ts'
+ import { api, mediaUrl, type SessionScope } from './api.ts'
+ import { BinaryDownload } from './binary-download.tsx'
+diff --git a/src/client/FileTree.tsx b/src/client/FileTree.tsx
+--- a/src/client/FileTree.tsx
++++ b/src/client/FileTree.tsx
+@@ -26,7 +26,7 @@
+ import {
+   IconChevronRightOutline14, IconCodeOutline16, IconCopyOutline16, IconDownloadOutline16,
+   IconLinkOutline16, Menu, type MenuEntry, type MenuItem, writeClipboard,
+-} from '@deepseek-ai/dsh-client-ui-primitives'
++} from './host-ui.ts'
+ import { SiCursor, SiZedindustries } from 'react-icons/si'
+ import { VscFile, VscFolder, VscFolderOpened, VscLinkExternal, VscPin, VscPinned } from 'react-icons/vsc'
+ import { api, downloadUrl, type FsEntry } from './api.ts'
+diff --git a/src/client/FreeWindow.tsx b/src/client/FreeWindow.tsx
+--- a/src/client/FreeWindow.tsx
++++ b/src/client/FreeWindow.tsx
+@@ -16,7 +16,7 @@
+  */
+ import { useEffect, useRef, useState, type ReactNode } from 'react'
+ import clsx from 'clsx'
+-import { IconCloseFill14, Menu } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconCloseFill14, Menu } from './host-ui.ts'
+ import type { FloatWindow, SidebarTab } from './state.ts'
+ import { FLOAT_MIN_H, FLOAT_MIN_W } from './state.ts'
+ import { t } from './locales.ts'
+diff --git a/src/client/GitView.tsx b/src/client/GitView.tsx
+--- a/src/client/GitView.tsx
++++ b/src/client/GitView.tsx
+@@ -13,7 +13,7 @@
+ import {
+   Button, IconBranchOutline16, IconCodeOutline16, IconCopyOutline16, IconRefreshOutline16,
+   IconTrashOutline16, Input, Menu, Modal, writeClipboard,
+-} from '@deepseek-ai/dsh-client-ui-primitives'
++} from './host-ui.ts'
+ import type { GitLogEntry, GitStatusEntry, GitStatusResult, GitWorktree, SessionScope } from './api.ts'
+ import { api } from './api.ts'
+ import { isWithinWorkspace, relativeTo } from './paths.ts'
+diff --git a/src/client/intercept.tsx b/src/client/intercept.tsx
+--- a/src/client/intercept.tsx
++++ b/src/client/intercept.tsx
+@@ -7,7 +7,7 @@
+  * deliverables entry; when nothing was produced the selector returns null
+  * and the original row renders unchanged.
+  */
+-import { IconCodeOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconCodeOutline16 } from './host-ui.ts'
+ import type { Context } from '../context-types.ts'
+ import { firstLeaf, revealPaths, togglePanel, type SidebarStore } from './state.ts'
+ import { t } from './locales.ts'
+diff --git a/src/client/md-toc.tsx b/src/client/md-toc.tsx
+--- a/src/client/md-toc.tsx
++++ b/src/client/md-toc.tsx
+@@ -18,7 +18,7 @@
+  */
+ import { useLayoutEffect, useRef, useState } from 'react'
+ import type { ReactNode } from 'react'
+-import { IconListPenOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconListPenOutline16 } from './host-ui.ts'
+ import { t } from './locales.ts'
+ import css from './sidebar.module.css'
+ 
+diff --git a/src/client/mermaid.tsx b/src/client/mermaid.tsx
+--- a/src/client/mermaid.tsx
++++ b/src/client/mermaid.tsx
+@@ -28,7 +28,7 @@
+ import { createPortal } from 'react-dom'
+ import { createRoot, type Root } from 'react-dom/client'
+ import mermaid from 'mermaid'
+-import { IconCopyOutline16, MarkdownText, writeClipboard } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconCopyOutline16, MarkdownText, writeClipboard } from './host-ui.ts'
+ import { isDarkScheme, subscribeColorScheme } from './theme.ts'
+ import { markdownTextProps } from './markdown-labels.tsx'
+ import { t } from './locales.ts'
+diff --git a/src/client/open-with-settings.tsx b/src/client/open-with-settings.tsx
+--- a/src/client/open-with-settings.tsx
++++ b/src/client/open-with-settings.tsx
+@@ -10,7 +10,7 @@
+  * this component owns only its own section.
+  */
+ import { useState } from 'react'
+-import { IconCloseOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconCloseOutline16 } from './host-ui.ts'
+ import {
+   isValidCustomEditor,
+   newCustomEditorId,
+diff --git a/src/client/Sidebar.tsx b/src/client/Sidebar.tsx
+--- a/src/client/Sidebar.tsx
++++ b/src/client/Sidebar.tsx
+@@ -32,7 +32,7 @@
+ import { createElement, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode } from 'react'
+ import { useSyncExternalStore } from 'react'
+ import clsx from 'clsx'
+-import { IconCloseFill14, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconCloseFill14, Tooltip } from './host-ui.ts'
+ import type { Context, SidebarSessionList } from '../context-types.ts'
+ import { appendToDraft } from './conversation-draft.ts'
+ import {
+diff --git a/src/client/SideCardSection.tsx b/src/client/SideCardSection.tsx
+--- a/src/client/SideCardSection.tsx
++++ b/src/client/SideCardSection.tsx
+@@ -48,7 +48,7 @@
+   Input,
+   Menu,
+   Modal,
+-} from '@deepseek-ai/dsh-client-ui-primitives'
++} from './host-ui.ts'
+ import clsx from 'clsx'
+ // Type-only: pulls the settings shell's SlotMap merges ('settings.section').
+ import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+diff --git a/src/client/SideChatView.tsx b/src/client/SideChatView.tsx
+--- a/src/client/SideChatView.tsx
++++ b/src/client/SideChatView.tsx
+@@ -34,7 +34,7 @@
+   Menu,
+   StateDot,
+   type MenuEntry,
+-} from '@deepseek-ai/dsh-client-ui-primitives'
++} from './host-ui.ts'
+ import { markdownTextProps } from './markdown-labels.tsx'
+ import { IconHistoryOutline16, IconSaveOutline16 } from './icons.tsx'
+ import type { Context, SidebarHistoryEntry } from '../context-types.ts'
+diff --git a/src/client/SubagentView.tsx b/src/client/SubagentView.tsx
+--- a/src/client/SubagentView.tsx
++++ b/src/client/SubagentView.tsx
+@@ -25,7 +25,7 @@
+ import clsx from 'clsx'
+ import {
+   IconRefreshOutline14, StateDot,
+-} from '@deepseek-ai/dsh-client-ui-primitives'
++} from './host-ui.ts'
+ import type {
+   Context,
+   SidebarSessionList,
+diff --git a/src/client/TabBar.tsx b/src/client/TabBar.tsx
+--- a/src/client/TabBar.tsx
++++ b/src/client/TabBar.tsx
+@@ -12,7 +12,7 @@
+ import clsx from 'clsx'
+ import {
+   IconCloseFill14, IconPlusOutline16, Menu,
+-} from '@deepseek-ai/dsh-client-ui-primitives'
++} from './host-ui.ts'
+ import type { SidebarTab } from './state.ts'
+ import { isAgentTabId } from './state.ts'
+ import { isPinnedVirtualTab } from './pinned.ts'
+diff --git a/src/client/TextEditor.tsx b/src/client/TextEditor.tsx
+--- a/src/client/TextEditor.tsx
++++ b/src/client/TextEditor.tsx
+@@ -19,7 +19,7 @@
+ import { EditorState } from '@codemirror/state'
+ import { EditorView as CodeMirrorView, keymap, lineNumbers } from '@codemirror/view'
+ import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
+-import { IconCheckOutline16, MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconCheckOutline16, MarkdownText } from './host-ui.ts'
+ import { markdownTextProps } from './markdown-labels.tsx'
+ import { api, htmlUrl } from './api.ts'
+ import { rewriteLocalImageUrls } from './markdown-images.ts'
+diff --git a/src/client/TreePanel.tsx b/src/client/TreePanel.tsx
+--- a/src/client/TreePanel.tsx
++++ b/src/client/TreePanel.tsx
+@@ -17,7 +17,7 @@
+  */
+ import { useEffect, useRef, useState, type InputHTMLAttributes } from 'react'
+ import clsx from 'clsx'
+-import { IconFolderOpen16, IconRefreshOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconFolderOpen16, IconRefreshOutline16 } from './host-ui.ts'
+ import { api } from './api.ts'
+ import { FileTree } from './FileTree.tsx'
+ import { IconUploadOutline16 } from './icons.tsx'
+diff --git a/src/client/builtins/tabs.tsx b/src/client/builtins/tabs.tsx
+--- a/src/client/builtins/tabs.tsx
++++ b/src/client/builtins/tabs.tsx
+@@ -7,7 +7,7 @@
+  * `browser:<n>` the same way (no quota). The editor IS the files window
+  * (the old standalone explorer merged into it).
+  */
+-import { IconBranchOutline16, IconCodeOutline16, IconFolderOpen16, IconNewChatOutline16, IconPanelLeftOutline16, IconThinkOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconBranchOutline16, IconCodeOutline16, IconFolderOpen16, IconNewChatOutline16, IconPanelLeftOutline16, IconThinkOutline16 } from '../host-ui.ts'
+ import type { Context } from '../../context-types.ts'
+ import { allLeaves, isAgentTabId, type SidebarState } from '../state.ts'
+ import { t } from '../locales.ts'
+diff --git a/src/client/builtins/viewers.tsx b/src/client/builtins/viewers.tsx
+--- a/src/client/builtins/viewers.tsx
++++ b/src/client/builtins/viewers.tsx
+@@ -22,7 +22,7 @@
+  * and `icon` — so the Side card settings page can render the enable/disable
+  * inventory without hardcoding (eating our own dogfood).
+  */
+-import { IconCodeOutline16, IconDownloadOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
++import { IconCodeOutline16, IconDownloadOutline16 } from '../host-ui.ts'
+ import { lazyChunkComponent } from '../lazy-chunk.tsx'
+ import { PdfView } from '../PdfView.tsx'
+ import { BinaryDownload } from '../binary-download.tsx'

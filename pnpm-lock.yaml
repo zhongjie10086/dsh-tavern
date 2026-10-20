@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   dsh-web-mobile@2.3.0: 8988461b23999ee4b0d392bf2049a57dc7d8e6d5d2f02e93b2ae77e5018415d9
-  dsh-better-sidebar@0.17.1: 07b855bb78be7416c0c2c3151857697655133c9d2ec8938a9813d88c13dff2d1
+  dsh-better-sidebar@0.17.1: 2f7eb3b8b51f54533dfb6800af1f5d1c384515060b3b3b057d4dc8a7e76b15d0
 
 importers:
 
@@ -26,7 +26,7 @@ importers:
         version: 11.2.0
       dsh-better-sidebar:
         specifier: 0.17.1
-        version: 0.17.1(patch_hash=07b855bb78be7416c0c2c3151857697655133c9d2ec8938a9813d88c13dff2d1)
+        version: 0.17.1(patch_hash=2f7eb3b8b51f54533dfb6800af1f5d1c384515060b3b3b057d4dc8a7e76b15d0)
       dsh-tavern-plugin:
         specifier: link:./tavern-plugin
         version: link:tavern-plugin
@@ -1498,7 +1498,7 @@ snapshots:
     optionalDependencies:
       '@types/trusted-types': 2.0.7
 
-  dsh-better-sidebar@0.17.1(patch_hash=07b855bb78be7416c0c2c3151857697655133c9d2ec8938a9813d88c13dff2d1):
+  dsh-better-sidebar@0.17.1(patch_hash=2f7eb3b8b51f54533dfb6800af1f5d1c384515060b3b3b057d4dc8a7e76b15d0):
     dependencies:
       '@codemirror/commands': 6.11.0
       '@codemirror/lang-cpp': 6.0.3

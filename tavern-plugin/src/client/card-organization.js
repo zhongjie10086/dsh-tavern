@@ -95,10 +95,10 @@ function useCardOrganization(cards, busy, refresh, onError, batch) {
         } }, h('option', { value: '', disabled: true }, '移动所选到…'), options())) : null,
       managing ? h('dialog', { className: 'dsh-tavern-group-manager', 'aria-label': '管理分组',
         ref: element => { manager.current = element; if (element && !element.open) element.showModal(); },
-        onCancel: () => setManaging(false), onClick: event => { if (event.target === event.currentTarget && !disabled) setManaging(false); }
+        onCancel: event => { event.preventDefault(); if (!disabled && !running.current) setManaging(false); }, onClick: event => { if (event.target === event.currentTarget && !disabled && !running.current) setManaging(false); }
       }, h('div', { className: 'dsh-tavern-group-manager-content' },
         h('div', { className: 'dsh-tavern-group-manager-head' }, h('h3', null, '管理分组'),
-          h('button', { className: 'dsh-tavern-btn', onClick: () => setManaging(false) }, '关闭')),
+          h('button', { className: 'dsh-tavern-btn', disabled, onClick: () => { if (!disabled && !running.current) setManaging(false); } }, '关闭')),
         groups.length ? groups.map(group => h('div', { key: group, className: 'dsh-tavern-group-manager-row' },
           h('span', null, group),
           h('button', { className: 'dsh-tavern-btn', disabled, 'aria-label': '重命名分组：' + group, onClick: () => nameGroup(group) }, '重命名'),
@@ -118,10 +118,10 @@ function useCardOrganization(cards, busy, refresh, onError, batch) {
       }, '＋ 添加人物卡'),
       addingGroup !== null ? h('dialog', { className: 'dsh-tavern-group-manager', 'aria-label': '添加人物卡到分组',
         ref: element => { if (element && !element.open) element.showModal(); },
-        onCancel: event => { if (saving) event.preventDefault(); else setAddingGroup(null); }
+        onCancel: event => { event.preventDefault(); if (!disabled && !running.current) setAddingGroup(null); }
       }, h('div', { className: 'dsh-tavern-group-manager-content' },
         h('div', { className: 'dsh-tavern-group-manager-head' }, h('h3', null, '添加到「' + addingGroup + '」'),
-          h('button', { className: 'dsh-tavern-btn', disabled: saving, onClick: () => setAddingGroup(null) }, '取消')),
+          h('button', { className: 'dsh-tavern-btn', disabled, onClick: () => { if (!disabled && !running.current) setAddingGroup(null); } }, '取消')),
         h('input', { className: 'dsh-tavern-library-search', value: addQuery, placeholder: '搜索人物卡', 'aria-label': '搜索可添加的人物卡', onChange: event => setAddQuery(event.target.value) }),
         h('div', { className: 'dsh-tavern-group-add-list' }, candidates.length ? candidates.map(card => h('label', { key: card.path },
           h('input', { type: 'checkbox', disabled, checked: addPaths.includes(card.path), onChange: event => {
@@ -181,6 +181,9 @@ function useCardOrganization(cards, busy, refresh, onError, batch) {
         onChange: event => submit({ action: 'cards', paths: [card.path], group: event.target.value.slice(6) }) }, options())),
       h('button', { className: 'dsh-tavern-btn', disabled, onClick: () => nameGroup() }, '创建分组'));
   }
-  function rowTools(card) { return h(React.Fragment,null,h("button",{type:"button",className:"dsh-tavern-btn",disabled,"aria-label":(card.starred?"取消收藏：":"收藏：")+card.name,"aria-pressed":Boolean(card.starred),onClick:()=>submit({action:"cards",paths:[card.path],starred:!card.starred})},card.starred?"★":"☆"),rowMenu(card)); }
-  return { visible, toolbar, rowTools, rowMenu, detailSettings, addCardsFooter, renderCards: render => visible.map(render) };
+  function groupControls(card) {
+    return h('label',{className:'dsh-tavern-card-group-control'},'所属分组',h('select',{'aria-label':'所属分组：'+card.name,value:'group:'+(card.group||''),disabled,onChange:event=>submit({action:'cards',paths:[card.path],group:event.target.value.slice(6)})},options()));
+  }
+  function rowTools(card,config={}) { return h(React.Fragment,null,h("button",{type:"button",className:"dsh-tavern-btn",disabled,"aria-label":(card.starred?"取消收藏：":"收藏：")+card.name,"aria-pressed":Boolean(card.starred),onClick:()=>submit({action:"cards",paths:[card.path],starred:!card.starred})},card.starred?"★":"☆"),config.favoritesOnly||config.omitMenu?null:rowMenu(card)); }
+  return { visible, toolbar, rowTools, rowMenu, groupControls, detailSettings, addCardsFooter, renderCards: render => visible.map(render) };
 }

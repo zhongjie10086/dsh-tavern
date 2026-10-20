@@ -54,7 +54,8 @@ function createTavernHostNavigation({ sessions, uiWorkspace, workspaces }) {
     async function open(target, { signal, isCurrent } = {}) {
         opening?.abort();
         const attempt = new AbortController(); opening = attempt;
-        signal = signalFor(signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal);
+        // acquire owns lifetime cancellation; dispose also aborts the active attempt.
+        signal = signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal;
         try {
             return await using(target, () => {
                 signal.throwIfAborted();

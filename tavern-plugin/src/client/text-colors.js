@@ -154,8 +154,10 @@ function TavernTextColorSettings() {
         React.createElement('label', { className: 'dsh-tavern-settings-row' },
             React.createElement('span', { className: 'dsh-tavern-settings-copy' },
                 React.createElement('span', { className: 'dsh-tavern-settings-title' }, '正文分色'),
-                React.createElement('span', { className: 'dsh-tavern-settings-desc' }, '为引号内对白和斜体文字分别选色，普通文字保持原色。保留人物卡已有配色；仅影响当前浏览器显示。')),
-            React.createElement('input', { type: 'checkbox', checked: enabled, onChange: event => { setEnabled(event.target.checked); setTavernTextColorsEnabled(event.target.checked); } })),
+                React.createElement('span', { className: 'dsh-tavern-settings-desc' }, '当前浏览器 · 开关与颜色自动保存。为引号内对白和斜体文字分别选色，普通文字保持原色。保留人物卡已有配色；仅影响当前浏览器显示。')),
+            React.createElement('span', { className: 'dsh-tavern-settings-switch' },
+                React.createElement('input', { type: 'checkbox', role: 'switch', 'aria-label': '正文分色', checked: enabled, onChange: event => { setEnabled(event.target.checked); setTavernTextColorsEnabled(event.target.checked); } }),
+                React.createElement('span', { className: 'dsh-tavern-settings-track', 'aria-hidden': 'true' }))),
         ...[['quote', '对白颜色', '#edb75f'], ['em', '斜体颜色', '#bba4e3']].map(([key, label, fallback]) =>
             React.createElement('label', { key, className: 'dsh-tavern-settings-row' },
                 React.createElement('span', { className: 'dsh-tavern-settings-copy' },

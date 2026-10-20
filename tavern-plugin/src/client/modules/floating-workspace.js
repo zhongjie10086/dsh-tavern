@@ -1,5 +1,42 @@
 function requestTavernScriptUi(detail){const pending=window.__dshTavernPendingScriptUi||[];window.__dshTavernPendingScriptUi=pending.filter(p=>p.sessionId!==detail.sessionId||p.kind!==(detail.kind||'companion')).concat({...detail,kind:detail.kind||'companion'}).slice(-40);window.dispatchEvent(new CustomEvent('dsh-tavern-open-script-ui',{detail}));}
-function nextTavernFloatingLayer() { return window.__dshTavernFloatingLayer = Math.max(1000000, Number(window.__dshTavernFloatingLayer) || 0) + 1; }
+function nextTavernFloatingLayer() {
+  const layer=window.__dshTavernFloatingLayer=Math.max(1000000,Number(window.__dshTavernFloatingLayer)||0)+1;
+  queueMicrotask(()=>window.dispatchEvent(new Event('dsh-tavern-floating-layer')));
+  return layer;
+}
+// One observation source for launcher visibility and error placement. Ordinary floating
+// dialogs are deliberately excluded; minimizing one must not suppress its launcher.
+const tavernModalState=(function(){
+  let snapshot=Object.freeze({blocked:false,modal:null,layer:1000000}),dispose=null;
+  const listeners=new Set();
+  function start(){
+    let frame=0,nativeOrder=[];
+    function update(){
+      frame=0;
+      const visible=element=>!element.closest('[hidden],[aria-hidden="true"]')&&element.getClientRects().length>0&&getComputedStyle(element).visibility!=='hidden';
+      const natives=[...document.querySelectorAll('dialog:modal')].filter(visible);
+      nativeOrder=nativeOrder.filter(element=>natives.includes(element));
+      for(const element of natives)if(!nativeOrder.includes(element))nativeOrder.push(element);
+      const focused=document.activeElement?.closest('dialog:modal');
+      if(focused&&natives.includes(focused))nativeOrder=nativeOrder.filter(element=>element!==focused).concat(focused);
+      const other=[...document.querySelectorAll('[role="dialog"][aria-modal="true"]')].filter(visible);
+      const focusedOther=other.find(element=>element.contains(document.activeElement));
+      const settings=[...document.querySelectorAll('.dsh-tavern-settings-section')].find(visible);
+      const modal=nativeOrder.at(-1)||focusedOther||other.at(-1)||settings||null;
+      const next={blocked:!!modal,modal,layer:Math.max(1000000,Number(window.__dshTavernFloatingLayer)||0)};
+      if(next.modal!==snapshot.modal||next.layer!==snapshot.layer){snapshot=Object.freeze(next);listeners.forEach(listener=>listener());}
+    }
+    function schedule(){if(!frame)frame=requestAnimationFrame(update);}
+    const observer=new MutationObserver(schedule);
+    observer.observe(document.body,{subtree:true,childList:true,attributes:true,attributeFilter:['open','hidden','aria-hidden','aria-modal','class','style','data-state']});
+    for(const event of ['toggle','focusin','close'])document.addEventListener(event,schedule,true);
+    for(const event of ['resize','dsh-tavern-floating-layer'])window.addEventListener(event,schedule);
+    update();
+    return()=>{observer.disconnect();for(const event of ['toggle','focusin','close'])document.removeEventListener(event,schedule,true);for(const event of ['resize','dsh-tavern-floating-layer'])window.removeEventListener(event,schedule);if(frame)cancelAnimationFrame(frame);};
+  }
+  return {getSnapshot:()=>snapshot,subscribe(listener){listeners.add(listener);if(!dispose)dispose=start();return()=>{listeners.delete(listener);if(!listeners.size&&dispose){dispose();dispose=null;}};}};
+})();
+function useTavernModalState(){return React.useSyncExternalStore(tavernModalState.subscribe,tavernModalState.getSnapshot,tavernModalState.getSnapshot);}
 const tavernFloatingWindows = (function () {
   let snapshot = Object.freeze([]), serial = 0;
   const listeners = new Set();
@@ -7,6 +44,10 @@ const tavernFloatingWindows = (function () {
   return {
     subscribe: function (fn) { listeners.add(fn); return function () { listeners.delete(fn); }; },
     getSnapshot: function () { return snapshot; },
+    openResourceLibrary: function (kind, title, meta) {
+      const id = 'resource-library:' + kind, previous = snapshot.find(item => item.id === id);
+      publish(snapshot.filter(item => item.id !== id).concat([Object.assign({}, previous, { id, kind: 'resource-library-' + kind, resourceLibrary: kind, title, meta, minimized: false, order: ++serial })]));
+    },
     open: function (sessionId, kind, title, page) {
       if (!sessionId) return;
       const id = sessionId + ':' + kind, previous = snapshot.find(function (item) { return item.id === id; });
@@ -102,14 +143,20 @@ function TavernFloatingWindow(props) {
     finally {popPending.current=false;}
   }
   function maximize(){if(maximized){saveRect(restoreRect.current||tavernWindowRect(item.kind));setMaximized(false)}else{restoreRect.current={...rectRef.current};saveRect({x:8,y:8,width:innerWidth-16,height:innerHeight-16});setMaximized(true)}}
+  const dirtyCloseMessage='此窗口有未保存的编辑，请先保存或放弃编辑；也可以最小化。';
+  function reportDirty(value) {
+    dirty.current=value;
+    if(!value)setError(current=>current===dirtyCloseMessage?'':current);
+  }
   function close() {
-    if (dirty.current) { setError('此窗口有未保存的编辑，请先保存或放弃编辑；也可以最小化。'); return; }
+    if (dirty.current) { setError(dirtyCloseMessage); return; }
     tavernFloatingWindows.close(item.id);
   }
   function button(label, work, title) { return h('button', { type: 'button', className: 'dsh-floating-control', 'aria-label': label, title: title || label, onClick: work }, label); }
   const style = pip ? { position: 'relative', width: '100vw', height: '100vh', left: 0, top: 0, resize: 'none' } : { left: rect.x, top: rect.y, width: rect.width, height: rect.height, zIndex: layer };
   style.display = item.minimized && !pip ? 'none' : 'flex';
-  return ReactDom.createPortal(h('section', { ref: dialog, className: 'dsh-floating-window', role: 'dialog', 'aria-label': item.title, 'data-window-kind': item.kind, style: style,
+  const embeddedTitles={'play-settings':'本局设置',characters:'角色卡管理',extensions:'扩展程序',personas:'玩家身份',presets:'预设管理','resource-permissions':'本局资源授信','resource-versions':'本局资源版本'};
+  return ReactDom.createPortal(h('section', { ref: dialog, className: 'dsh-floating-window', role: 'dialog', 'aria-label': item.title, 'data-window-kind': item.kind, 'data-tavern-embedded-title':embeddedTitles[item.kind]===item.title?true:undefined, style: style,
     onPointerDown: function () { setLayer(nextTavernFloatingLayer()); } },
     h('header', { className: 'dsh-floating-titlebar', onPointerDown: pointerDown, onPointerMove: pointerMove, onPointerUp: pointerUp, onLostPointerCapture: pointerUp },
       h('strong', null, item.title), h('span', { className: 'dsh-floating-controls' },
@@ -118,7 +165,7 @@ function TavernFloatingWindow(props) {
         button('最小化', function () { if (pipRef.current) pipRef.current.close(); tavernFloatingWindows.minimize(item.id); }),
         button('关闭', close))),
     error ? h('div', { className: 'dsh-floating-error', role: 'alert' }, error) : null,
-    h('div', { className: 'dsh-floating-content' }, props.renderContent(function (value) { dirty.current = value; }))
+    h('div', { className: 'dsh-floating-content' }, props.renderContent(reportDirty))
   ), container);
 }
 function TavernFloatingLauncher(props) {
@@ -130,10 +177,11 @@ function TavernFloatingLauncher(props) {
   function down(e){if(e.button!==0)return;moved.current=false;drag.current={x:e.clientX,y:e.clientY,position:current.current};e.currentTarget.setPointerCapture(e.pointerId)}
   function move(e){const start=drag.current;if(!start)return;const dx=e.clientX-start.x,dy=e.clientY-start.y;if(!moved.current&&Math.hypot(dx,dy)<4)return;moved.current=true;setPosition(clamp({x:start.position.x+dx,y:start.position.y+dy}));e.preventDefault()}
   function up(){if(drag.current){drag.current=null;if(moved.current)tavernPreferenceStorage('setItem',storageKey,JSON.stringify(current.current))}}
-  return ReactDom.createPortal(h('button',{type:'button',className:'dsh-original-floating-entry dsh-original-entry-'+kind,'data-floating-plugin':kind,'aria-label':'打开'+props.button.title+'浮窗',title:props.button.title+' · 点击打开，拖动可移动',style:{left:position.x,top:position.y},onContextMenu:e=>{if(kind==='preset'){e.preventDefault();props.open({...props.button,quick:true})}},onPointerDown:down,onPointerMove:move,onPointerUp:up,onLostPointerCapture:up,onClick:e=>{if(moved.current&&e.detail!==0){moved.current=false;return;}props.open(props.button)}},kind==='preset'?h('img',{src:'/api/dsh-tavern/client-assets/izumi-launcher.png',alt:'泉此方',draggable:false}):h('span',{'aria-hidden':true},'⚙')),document.body);
+  return ReactDom.createPortal(h('button',{type:'button',hidden:props.hidden,className:'dsh-original-floating-entry dsh-original-entry-'+kind,'data-floating-plugin':kind,'aria-label':'打开'+props.button.title+'浮窗',title:props.button.title+' · 点击打开，拖动可移动',style:{left:position.x,top:position.y},onContextMenu:e=>{if(kind==='preset'){e.preventDefault();props.open({...props.button,quick:true})}},onPointerDown:down,onPointerMove:move,onPointerUp:up,onLostPointerCapture:up,onClick:e=>{if(moved.current&&e.detail!==0){moved.current=false;return;}props.open(props.button)}},kind==='preset'?h('img',{src:'/api/dsh-tavern/client-assets/izumi-launcher.png',alt:'泉此方',draggable:false}):h('span',{'aria-hidden':true},'⚙')),document.body);
 }
 function TavernFloatingWorkspace(props) {
   const h=React.createElement,entries=React.useSyncExternalStore(tavernFloatingWindows.subscribe,tavernFloatingWindows.getSnapshot,tavernFloatingWindows.getSnapshot),live=useLiveTavernView(props.sessionId);
+  const launchersBlocked=useTavernModalState().blocked;
   if(!live.view||!['story','script'].includes(live.view.mode))return null;
   function version(kind,fallback){const name=live.view.tavernHelperScripts?.find(script=>script.uiKind===kind)?.name||'';return name.match(/V\d+(?:\.\d+)+/i)?.[0]||fallback;}
   const buttons=[
@@ -147,10 +195,18 @@ function TavernFloatingWorkspace(props) {
     {kind:'regex',title:'正则',page:'regex',icon:'.*'},
     {kind:'extensions',title:'扩展程序',page:'extensions',icon:'⌘'}
   ];
-  function renderPanel(item,onDirty){if(item.page==='resource-versions')return h(TavernResourceVersionPanel,{sessionId:item.sessionId,api:(method,args)=>rpc(method,args,item.sessionId),onOpenWorldbooks:()=>tavernFloatingWindows.open(item.sessionId,'worldbooks','世界书库','worldbooks')});const api=async(method,args)=>{const result=await rpc(method,args,item.sessionId);if(['changeTavernScriptLibrary','applyTavernScriptLibrary','changeTavernExtension','setTemplateEngineMode','runFullPromptTemplate','saveFullPromptTemplateSettings'].includes(method))liveTavernView.invalidate(item.sessionId);return result},common={sessionId:item.sessionId,api,onDirty};if(['companion','database-visualizer'].includes(item.kind))return h('section',{className:'dsh-plugin-panel'},h('h2',null,item.title),h('p',null,'尚未启用对应的原版脚本，请在酒馆助手中导入并启用。'),h('button',{className:'dsh-tavern-btn',onClick:()=>tavernFloatingWindows.open(item.sessionId,'helper','酒馆助手','helper')},'打开酒馆助手'));if(item.page==='resource-permissions')return h(TavernResourcePermissions,common);if(item.page==='play-settings')return h(TavernPlaySettings,common);if(item.page==='user-profile')return h(UserPreferenceProfileTab,{scope:{sessionId:item.sessionId},onDirty});if(item.page==='worldbooks')return h(worldBookLibraryFeature.Library,{scope:{sessionId:item.sessionId},onDirty});if(item.page==='personas')return h(TavernPersonaManager,common);if(item.page==='presets')return h(TavernPresetManager,common);if(item.page==='regex')return h(TavernPresetManager,{...common,regexOnly:true});if(item.page==='characters')return h(TavernCharacterManager,common);if(item.page==='extensions')return h(TavernExtensionsPanel,common);if(['helper','scripts','audio'].includes(item.page))return h(TavernHelperPanel,{...common,initialPage:item.page});if(item.page==='prompt-template')return h(TavernPromptTemplatePanel,common);return props.renderWorkbench({scope:{sessionId:item.sessionId},initialPage:item.page,floating:true,onDirty});}
+  function renderPanel(item,onDirty){if(item.page==='resource-versions')return h(TavernResourceVersionPanel,{embedded:true,sessionId:item.sessionId,api:(method,args)=>rpc(method,args,item.sessionId),onOpenWorldbooks:()=>tavernFloatingWindows.open(item.sessionId,'worldbooks','世界书库','worldbooks')});const api=async(method,args)=>{const result=await rpc(method,args,item.sessionId);if(['changeTavernScriptLibrary','applyTavernScriptLibrary','changeTavernExtension','setTemplateEngineMode','runFullPromptTemplate','saveFullPromptTemplateSettings'].includes(method))liveTavernView.invalidate(item.sessionId);return result},common={sessionId:item.sessionId,api,onDirty};if(['companion','database-visualizer'].includes(item.kind))return h('section',{className:'dsh-plugin-panel','data-tavern-owned-ui':true},h('h2',null,item.title),h('p',null,'尚未启用对应的原版脚本，请在酒馆助手中导入并启用。'),h('button',{className:'dsh-tavern-btn',onClick:()=>tavernFloatingWindows.open(item.sessionId,'helper','酒馆助手','helper')},'打开酒馆助手'));if(item.page==='resource-permissions')return h(TavernResourcePermissions,{...common,embedded:true});if(item.page==='play-settings')return h(TavernPlaySettings,common);if(item.page==='user-profile')return h('section',{'data-tavern-owned-ui':true},h(UserPreferenceProfileTab,{embedded:true,scope:{sessionId:item.sessionId},onDirty}));if(item.page==='worldbooks')return h('section',{'data-tavern-owned-ui':true},h(worldBookLibraryFeature.Library,{scope:{sessionId:item.sessionId},onDirty}));if(item.page==='personas')return h(TavernPersonaManager,common);if(item.page==='presets')return h(TavernPresetManager,common);if(item.page==='regex')return h(TavernPresetManager,{...common,regexOnly:true});if(item.page==='characters')return h(TavernCharacterManager,common);if(item.page==='extensions')return h(TavernExtensionsPanel,common);if(['helper','scripts','audio'].includes(item.page))return h(TavernHelperPanel,{...common,initialPage:item.page});if(item.page==='prompt-template')return h(TavernPromptTemplatePanel,common);return props.renderWorkbench({scope:{sessionId:item.sessionId},initialPage:item.page,floating:true,onDirty});}
   function open(button){if(button.kind==='database'&&live.view.tavernHelperScripts?.some(s=>s.uiKind==='extension-sp-database')){requestTavernScriptUi({sessionId:props.sessionId,kind:'extension-sp-database'});return}if(['preset','companion','database-visualizer'].includes(button.kind)&&live.view.tavernHelperScripts?.some(s=>s.uiKind===button.kind||button.kind==='companion'&&s.originalUi&&!s.uiKind))requestTavernScriptUi({sessionId:props.sessionId,kind:button.kind,quick:button.quick===true});else tavernFloatingWindows.open(props.sessionId,button.kind,button.title,button.page);}
+  const dockButtons=buttons.slice(2).filter(button=>button.kind!=='database'||live.view.extensions?.installed?.enabled!==false&&live.view.spDatabase);
+  function dockButton(button){const entry=entries.find(item=>item.sessionId===props.sessionId&&item.kind===button.kind);return h('button',{key:button.kind,type:'button',className:'dsh-floating-launcher','aria-label':'打开'+button.title+'浮窗','aria-expanded':!!entry&&!entry.minimized,onClick:()=>open(button)},button.icon+' '+button.title+(entry?.minimized?' · 恢复':''));}
+  const legacyMenus=h(TavernLegacyMenuLaunchers,{sessionId:props.sessionId,open:kind=>{const button=buttons.find(b=>b.kind===kind);if(button){open(button);return;}const routes={helper:['酒馆助手','helper'],template:['提示词模板','prompt-template'],presets:['预设管理','presets'],personas:['玩家身份','personas'],characters:['角色卡','characters']};const route=routes[kind];if(route)tavernFloatingWindows.open(props.sessionId,kind==='template'?'prompt-template':kind,route[0],route[1]);}});
   return h(React.Fragment,null,
-    ...buttons.slice(0,2).map(button=>h(TavernFloatingLauncher,{key:button.kind,button,open})),
-    h('nav',{className:'dsh-floating-launchers','data-plugin-dock':'anchored','aria-label':'酒馆插件工具栏'},h(TavernLegacyMenuLaunchers,{sessionId:props.sessionId,open:kind=>{const button=buttons.find(b=>b.kind===kind);if(button){open(button);return;}const routes={helper:['酒馆助手','helper'],template:['提示词模板','prompt-template'],presets:['预设管理','presets'],personas:['玩家身份','personas'],characters:['角色卡','characters']};const route=routes[kind];if(route)tavernFloatingWindows.open(props.sessionId,kind==='template'?'prompt-template':kind,route[0],route[1])}}),buttons.slice(2).filter(button=>button.kind!=='database'||live.view.extensions?.installed?.enabled!==false&&live.view.spDatabase).map(button=>{const entry=entries.find(item=>item.sessionId===props.sessionId&&item.kind===button.kind);return h('button',{key:button.kind,type:'button',className:'dsh-floating-launcher','aria-label':'打开'+button.title+'浮窗','aria-expanded':!!entry&&!entry.minimized,onClick:()=>open(button)},button.icon+' '+button.title+(entry?.minimized?' · 恢复':''))})),
+    ...buttons.slice(0,2).map(button=>h(TavernFloatingLauncher,{key:button.kind,button,open,hidden:launchersBlocked})),
+    h('nav',{className:'dsh-floating-launchers','data-plugin-dock':'anchored','aria-label':'酒馆插件工具栏'},
+      legacyMenus,
+      dockButtons.filter(button=>['play-settings','database'].includes(button.kind)).map(dockButton),
+      h('details',{className:'dsh-floating-tools-menu',onBlur:event=>{if(!event.currentTarget.contains(event.relatedTarget))event.currentTarget.open=false;},onKeyDown:event=>{if(event.key==='Escape'){event.stopPropagation();event.currentTarget.open=false;event.currentTarget.querySelector('summary').focus();}}},
+        h('summary',null,'更多工具'),
+        h('div',{className:'dsh-floating-tools-body',onClick:event=>{if(event.target.closest('button'))event.currentTarget.closest('details').open=false;}},dockButtons.filter(button=>!['play-settings','database'].includes(button.kind)).map(dockButton)))),
     ...entries.filter(item=>item.sessionId===props.sessionId).map(item=>h(TavernFloatingWindow,{key:item.id,item,renderContent:onDirty=>renderPanel(item,onDirty)})));
 }
