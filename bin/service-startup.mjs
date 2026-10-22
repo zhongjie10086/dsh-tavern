@@ -1,6 +1,12 @@
 import { performance } from 'node:perf_hooks'
 import { setTimeout as sleep } from 'node:timers/promises'
 
+// Measures command handling, not the desktop click or browser/page readiness.
+export function createStartupTiming({ now = () => performance.now(), report = value => console.info('[dsh-tavern.launcher]', JSON.stringify(value)) } = {}) {
+  const started = now()
+  return stage => report({ stage, elapsedMs: Math.round(now() - started) })
+}
+
 // Seconds at the environment boundary; use a monotonic deadline internally.
 // A cold first start (fresh install or update) can take well over 30 seconds on
 // Windows. The deadline only catches a hung service; an exited one fails at once.

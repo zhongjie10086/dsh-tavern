@@ -4,8 +4,13 @@ import {isDeepStrictEqual} from 'node:util'
 /** One private transport to a persistent SP realm. Browser requests may attach
  * to it; they cannot choose a dispatcher, evaluate code or supply its lease. */
 export function createTavernSpOwnerController({executor,dispatch,frontendDispatch,scope,retrySave,saveRecoveryState,now=Date.now,monotonicNow=()=>performance.now()}){
- const attachments=new Map(),owners=new Map(),surfaces=new Map(),deliveries=new Map()
+ const attachments=new Map(),retiredAttachments=new Map(),owners=new Map(),surfaces=new Map(),deliveries=new Map()
  const error=message=>new Error('SP 持久执行者：'+message)
+ function pruneRetiredAttachments(){for(const[key,row]of retiredAttachments)if(now()>=row.expiresAt||owners.get(row.entry.sessionId)!==row.entry.owner)retiredAttachments.delete(key)}
+ function retainDetach(key,entry){
+  pruneRetiredAttachments();retiredAttachments.set(key,{entry,expiresAt:now()+120000});
+  while(retiredAttachments.size>128)retiredAttachments.delete(retiredAttachments.keys().next().value);
+ }
  function caller(args,{retainedClose=false}={}){
   if(args?.scriptScope||args?.scriptId||!args?.runtimeId||!retainedClose&&!frontendDispatch.available(args.sessionId,args.runtimeId))throw error('游戏页面身份已失效')
  }
@@ -15,8 +20,9 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
   if(identity.chatId!==args.chatId||identity.lifecycleRevision!==args.lifecycleRevision||identity.sourceDigest!==args.sourceDigest)throw error('卡片、脚本或剧情版本已变化')
   return identity
  }
- async function attachment(args,{starting=false,retainedClose=false}={}){
-  const identity=await current(args,{retainedClose}),entry=attachments.get(args.capability)
+ async function attachment(args,{starting=false,retainedClose=false,retainedDetach=false}={}){
+  const identity=await current(args,{retainedClose});if(retainedDetach)pruneRetiredAttachments();
+  const entry=attachments.get(args.capability)||(retainedDetach?retiredAttachments.get(args.capability)?.entry:undefined)
   if(!entry||entry.runtimeId!==args.runtimeId||entry.sessionId!==args.sessionId||entry.ownerId!==args.ownerId||!isDeepStrictEqual(entry.identity,identity))throw error('界面连接已经失效')
   if(!starting){await entry.owner.promise;await executor.owned.assertOwner(args.sessionId,entry.owner.runtimeId)}entry.seenAt=now();return entry
  }
@@ -41,7 +47,7 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
    if(owner&&!isDeepStrictEqual(owner.identity,identity))throw error('上一个剧情版本的原实例尚未安全退出')
   }
   if(!owner){owner={id:randomUUID(),identity,runtimeId:null,initializing:true};owners.set(args.sessionId,owner);owner.promise=executor.owned.ensure(args.sessionId).then(ready=>{owner.runtimeId=ready.runtimeId;owner.initializing=false;return ready},cause=>{owner.initializing=false;owner.initializationError=cause;throw cause});owner.promise.catch(()=>{})}
-  for(const [key,value]of attachments)if(value.sessionId===args.sessionId&&value.runtimeId!==args.runtimeId)attachments.delete(key)
+  for(const [key,value]of attachments)if(value.sessionId===args.sessionId){retainDetach(key,value);attachments.delete(key)}
   owner.composerEpoch=(owner.composerEpoch||0)+1;const composerEpoch=owner.composerEpoch;for(const[id,row]of surfaces)if(row.sessionId===args.sessionId&&row.composerEpoch!==undefined&&row.composerEpoch!==composerEpoch){surfaces.delete(id);clearTimeout(row.timer);row.reject(error('输入框界面已更换；旧操作不会自动重播'))}
   const capability=randomUUID();attachments.set(capability,{sessionId:args.sessionId,runtimeId:args.runtimeId,ownerId:owner.id,owner,identity,composerEpoch,seenAt:now()})
   return {ownerId:owner.id,capability,composerEpoch,sourceDigest:identity.sourceDigest,lifecycleRevision:identity.lifecycleRevision}
@@ -109,15 +115,34 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
   if(commit){row.promise=Promise.resolve({completed:true,args:Array.isArray(args)?structuredClone(args):row.args,diagnostics:[]});row.savedRecovery=true;}
   return {eventId,ownerId:owner.id};
  }
+ function finishSurface(row,receipt){
+  surfaces.delete(row.id);clearTimeout(row.timer);if(receipt.error)row.reject(error(String(receipt.error)));else row.resolve(row.composerEpoch!==undefined&&receipt.result&&typeof receipt.result==='object'?{...receipt.result,composerEpoch:row.composerEpoch}:receipt.result);
+ }
+ function detachSurfaces(entry,receipts=[]){
+  if(!Array.isArray(receipts)||receipts.some(row=>!row||typeof row.id!=='string'||!row.id||typeof row.settled!=='boolean'||row.error!==undefined&&typeof row.error!=='string'))throw error('退出表面回执无效');
+  const supplied=new Map(receipts.map(row=>[row.id,row]));
+  for(const row of [...surfaces.values()]){
+   if(row.sessionId!==entry.sessionId||!isDeepStrictEqual(row.identity,entry.identity)||(row.viewerRuntimeId||row.deliveredTo)!==entry.runtimeId||row.composerEpoch!==undefined&&row.composerEpoch!==entry.composerEpoch)continue;
+   const receipt=supplied.get(row.id);
+   finishSurface(row,receipt?.settled===true?receipt:{error:'SP 前端游戏表面已关闭；未完成操作已取消，已执行操作不会自动重播'});
+  }
+ }
  async function command(args){
-  const input=args.operation
-  if(!input||!['database-command','ui','game-state','retry-save','composer-state','composer-intent'].includes(input.kind))throw error('原界面操作无效')
+  let input=args.operation
+  if(!input||!['database-command','ui','game-state','retry-save','composer-state','composer-intent','viewer-detach'].includes(input.kind))throw error('原界面操作无效')
+  const detachViewer=input.kind==='viewer-detach';
+  if(detachViewer){if(!Number.isSafeInteger(input.composerEpoch)||input.composerEpoch<1)throw error('退出界面epoch无效');input={kind:'ui',command:{operation:'close'},viewerDetachEpoch:input.composerEpoch,surfaceReceipts:input.surfaceReceipts}}
   if(input.kind==='composer-state'&&(!input.value||typeof input.value.draft!=='string'||!Number.isSafeInteger(input.value.revision)||input.value.revision<0||typeof input.value.attached!=='boolean'))throw error('输入框状态无效')
   if(input.kind==='composer-intent'&&(!input.value||typeof input.value!=='object'||Array.isArray(input.value)))throw error('输入框意图无效')
   const coldRead=input.kind==='database-command'&&input.operation?.kind==='zero-read'&&['snapshot','history'].includes(input.operation.method)
   const recoveryUi=input.kind==='ui'&&['recover','dialog','files','close'].includes(input.command?.operation)
   const retainedClose=input.kind==='ui'&&input.command?.operation==='close';
-  const authenticated=await attachment(args,{starting:recoveryUi||input.kind==='retry-save'||input.kind==='game-state'||coldRead,retainedClose})
+  const authenticated=await attachment(args,{starting:recoveryUi||input.kind==='retry-save'||input.kind==='game-state'||input.kind==='composer-state'||coldRead,retainedClose,retainedDetach:detachViewer})
+  if(detachViewer){
+   if(input.viewerDetachEpoch!==authenticated.composerEpoch)throw error('退出界面epoch无效');
+   detachSurfaces(authenticated,input.surfaceReceipts);delete input.surfaceReceipts;
+   if(authenticated.composerEpoch!==authenticated.owner.composerEpoch)return {completed:true,result:{detached:false,superseded:true}};
+  }
   if(input.kind==='ui'&&authenticated.composerEpoch!==authenticated.owner.composerEpoch)throw error('原确认界面连接已更换')
   if(input.kind==='ui'&&['recover','capture','dialog','files'].includes(input.command?.operation)&&authenticated.composerEpoch===authenticated.owner.composerEpoch)executor.owned.keepNativeDialogAlive?.(args.sessionId)
   if(input.kind==='composer-state'||input.kind==='composer-intent'){if(!Number.isSafeInteger(input.composerEpoch)||input.composerEpoch!==authenticated.composerEpoch||input.composerEpoch!==authenticated.owner.composerEpoch)throw error('输入框界面epoch已失效')}
@@ -125,10 +150,17 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
   // initialization completes. A canonical starting attachment permits only
   // this existing read command, never a mutation or a fabricated ready state.
   if(coldRead)return {completed:true,result:await executor.withOwnedInstance(args.sessionId,({page})=>page.evaluate(operation=>window.__dshBackgroundEngine.commandOwned(operation),input.operation))}
-  if(input.kind==='game-state')return {completed:true,result:await executor.withOwnedInstance(args.sessionId,({page})=>page.evaluate(ready=>window.__dshBackgroundEngine.commandOwned({kind:'game-state',ready}),input.ready===true))}
+  if(input.kind==='game-state'){
+   if(authenticated.composerEpoch!==authenticated.owner.composerEpoch)throw error('游戏表面界面epoch已失效');
+   return {completed:true,result:await executor.withOwnedInstance(args.sessionId,({page})=>page.evaluate(value=>window.__dshBackgroundEngine.commandOwned({kind:'game-state',...value}),{ready:input.ready===true,composerEpoch:authenticated.composerEpoch}))};
+  }
   if(input.kind==='retry-save'){if(typeof retrySave!=='function')throw error('仅保存恢复入口不可用');if(authenticated.composerEpoch!==authenticated.owner.composerEpoch)throw error('保存恢复界面连接已更换');return {completed:true,result:await retrySave(args.sessionId,authenticated.owner.runtimeId)}}
   const commandRuntimeId=authenticated.owner.runtimeId;
-  const authority=input.kind==='ui'?{initializingScope:()=>{caller(args,{retainedClose});if(attachments.get(args.capability)!==authenticated||owners.get(args.sessionId)!==authenticated.owner||authenticated.composerEpoch!==authenticated.owner.composerEpoch)throw error('原恢复界面连接已更换');if(authenticated.owner.initializationError)throw authenticated.owner.initializationError;return input.command?.operation==='recover'&&authenticated.owner.initializing===true?authenticated.identity:null;},authorizeUi:async()=>{
+  const authority=input.kind==='composer-state'?{authorizeComposer:async()=>{
+   const latest=await attachment(args,{starting:true});
+   const validate=()=>{caller(args);if(latest!==authenticated||attachments.get(args.capability)!==latest||owners.get(args.sessionId)!==latest.owner||latest.composerEpoch!==latest.owner.composerEpoch)throw error('输入框界面epoch已失效');if(latest.owner.initializationError)throw latest.owner.initializationError};
+   validate();return validate;
+  }}:input.kind==='ui'?{initializingScope:()=>{caller(args,{retainedClose});if(attachments.get(args.capability)!==authenticated||owners.get(args.sessionId)!==authenticated.owner||authenticated.composerEpoch!==authenticated.owner.composerEpoch)throw error('原恢复界面连接已更换');if(authenticated.owner.initializationError)throw authenticated.owner.initializationError;return input.command?.operation==='recover'&&authenticated.owner.initializing===true?authenticated.identity:null;},authorizeUi:async()=>{
    const latest=await attachment(args,{starting:recoveryUi,retainedClose});
    const validate=()=>{caller(args,{retainedClose});if(latest!==authenticated||attachments.get(args.capability)!==latest||owners.get(args.sessionId)!==latest.owner||latest.composerEpoch!==latest.owner.composerEpoch||(input.command?.operation!=='recover'||commandRuntimeId!==null)&&latest.owner.runtimeId!==commandRuntimeId)throw error('原界面连接已更换，旧输入未执行');};
    validate();return validate;
@@ -159,7 +191,7 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
   const identity=await scope(args.sessionId),requests=[];
   for(const row of surfaces.values())if(row.sessionId===args.sessionId&&isDeepStrictEqual(row.identity,identity)){
    if(row.viewerRuntimeId&&row.viewerRuntimeId!==args.runtimeId)continue;if(row.composerEpoch!==undefined&&row.composerEpoch!==attachments.get(args.capability)?.composerEpoch)continue;
-   row.delivered=true;if(row.operation?.kind==='composer'||row.operation?.kind==='slash')row.viewerRuntimeId=args.runtimeId;requests.push({id:row.id,operation:row.operation,lifecycleRevision:row.lifecycleRevision,...(row.composerEpoch===undefined?{}:{composerEpoch:row.composerEpoch})});
+   row.delivered=true;row.deliveredTo=args.runtimeId;if(row.operation?.kind==='composer'||row.operation?.kind==='slash')row.viewerRuntimeId=args.runtimeId;requests.push({id:row.id,operation:row.operation,lifecycleRevision:row.lifecycleRevision,...(row.composerEpoch===undefined?{}:{composerEpoch:row.composerEpoch})});
   }
   return {requests}
  }
@@ -167,7 +199,7 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
   await attachment(args,{starting:true});const row=surfaces.get(args.id)
   if(!row||row.sessionId!==args.sessionId||row.viewerRuntimeId&&row.viewerRuntimeId!==args.runtimeId||!isDeepStrictEqual(row.identity,await scope(args.sessionId)))throw error('实时显示回执已失效')
   if(row.composerEpoch!==undefined&&(args.composerEpoch!==row.composerEpoch||row.composerEpoch!==owners.get(args.sessionId)?.composerEpoch))throw error('输入框回执epoch已失效')
-  surfaces.delete(args.id);clearTimeout(row.timer);if(args.error)row.reject(error(String(args.error)));else row.resolve(row.composerEpoch!==undefined&&args.result&&typeof args.result==='object'?{...args.result,composerEpoch:row.composerEpoch}:args.result)
+  finishSurface(row,args)
   return {completed:true}
  }
  function hasViewers(sessionId){return [...attachments.values()].some(row=>row.sessionId===sessionId&&frontendDispatch.available(sessionId,row.runtimeId)&&now()-row.seenAt<20000)}
@@ -185,7 +217,7 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
    return {...scope,scope,scriptId:'extension-sp-database',ownerId:owners.get(sessionId)?.id,executionOwner:runtimeId,runtimeId,...rows[0],originalReady:rows[0].ready,hostAvailable,quarantined:quarantined===true,drainError:drainError||null,ready:hostAvailable===true&&quarantined!==true&&rows[0].ready===true,engine,errors,diagnostics:{originalPersisted:rows[0].originalPersisted,original:rows[0].originalDiagnostics,pendingWork:rows[0].pendingWork}}
   })
  }
- function retired(sessionId,runtimeId){const owner=owners.get(sessionId);if(owner?.runtimeId!==runtimeId)return;owners.delete(sessionId);for(const[key,row]of attachments)if(row.owner===owner)attachments.delete(key)}
- function dispose(){for(const row of surfaces.values()){clearTimeout(row.timer);row.reject(error('宿主已停止'))}surfaces.clear();attachments.clear();owners.clear();deliveries.clear()}
+ function retired(sessionId,runtimeId){const owner=owners.get(sessionId);if(owner?.runtimeId!==runtimeId)return;owners.delete(sessionId);for(const[key,row]of attachments)if(row.owner===owner)attachments.delete(key);pruneRetiredAttachments()}
+ function dispose(){for(const row of surfaces.values()){clearTimeout(row.timer);row.reject(error('宿主已停止'))}surfaces.clear();attachments.clear();retiredAttachments.clear();owners.clear();deliveries.clear()}
  return {prepare,attach,emit,command,ui,surfaceRequest,surfaceRequests,surfaceComplete,hasViewers,retired,inspect,confirmSaveFailureBoundary,savedTaskEvent,dispose}
 }

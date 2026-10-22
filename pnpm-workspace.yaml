@@ -10,3 +10,4 @@ minimumReleaseAgeExclude:
 patchedDependencies:
   dsh-better-sidebar@0.17.1: patches/dsh-better-sidebar@0.17.1.patch
   dsh-web-mobile@2.3.0: patches/dsh-web-mobile@2.3.0.patch
+  playwright-core@1.62.1: tavern-plugin/patches/playwright-core@1.62.1.patch

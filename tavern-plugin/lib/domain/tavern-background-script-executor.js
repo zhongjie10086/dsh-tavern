@@ -243,7 +243,7 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,o
    }
    // No await between the checks and insertion: concurrent views/startups must
    // see this working-slot reservation before acquiring a browser context.
-   const instance={sessionId,hasOriginal,hasMvu,starting:true,ownedLeaseRegistered:false,closed:false,busy:true,lastUsed:Date.now(),runtimeId:'',errors:[],generations:new Map()};instances.set(sessionId,instance);admitted.add(instance)
+   const instance={sessionId,hasOriginal,hasMvu,startupTask:task,starting:true,ownedLeaseRegistered:false,closed:false,busy:true,lastUsed:Date.now(),runtimeId:'',errors:[],generations:new Map()};instances.set(sessionId,instance);admitted.add(instance)
    let yieldStartup;const frontendAcquired=new Promise(resolve=>{yieldStartup=()=>resolve('foreground')})
    try{
     if(ownedMode){if(typeof ownedOptions.scope!=='function')throw new Error('SP 专用后台缺少canonical scope提供者');instance.ownedScope=await ownedOptions.scope(sessionId)}
@@ -584,8 +584,30 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,o
   if(typeof ownedOptions.scope!=='function')throw new Error('SP 专用后台缺少canonical scope提供者')
   return fn({page:instance.page,runtimeId:instance.runtimeId,scope:await ownedOptions.scope(sessionId),hostAvailable:!instance.quarantined&&dispatch.available(sessionId,instance.runtimeId),quarantined:!!instance.quarantined,drainError:instance.drainError||null,errors:instance.errors.slice()})
  }
- async function ownedCommand(sessionId,command,{authorizeUi,initializingScope}={}){
-  requireOwned();const composerCommand=command?.kind==='composer-state'||command?.kind==='composer-intent',recoveryUi=command?.kind==='ui'&&['recover','dialog','files','close'].includes(command.command?.operation);let instance=command?.kind==='save-retry'||composerCommand||recoveryUi?instances.get(sessionId):await ensure(sessionId);if(command?.kind==='save-retry'&&(!instance||instance.closed||instance.crashed||!instance.page||command.runtimeId&&command.runtimeId!==instance.runtimeId))throw new Error('SP original save realm no longer available');if(command?.kind==='ui'&&command.command?.operation==='recover'&&(!instance||instance.starting===true&&instance.ownedLeaseRegistered===false)){const starting=await recoverStartingMetadata(sessionId,instance,authorizeUi,initializingScope);if(starting!==null)return starting;instance=instances.get(sessionId);}if(!instance)throw new Error('SP 专用后台不可用');if(command?.kind==='save-retry'&&instance.quarantined)await assertSaveRecovery(sessionId,instance.runtimeId,command.recovery);else if(recoveryUi&&['recover','dialog','close'].includes(command.command?.operation))await assertRetainedUiOwner(sessionId,instance);else await assertOwnedOwner(sessionId,instance.runtimeId)
+ async function ownedCommand(sessionId,command,{authorizeUi,initializingScope,authorizeComposer}={}){
+  requireOwned();
+  let validateComposer;
+  if(command?.kind==='composer-state'){
+   if(typeof authorizeComposer!=='function')throw new Error('SP 输入框状态缺少认证');
+   validateComposer=await authorizeComposer();
+   const deadline=monotonicNow()+timeoutMs,startup=pending.get(sessionId);let observedInstance=instances.get(sessionId);
+   for(;;){
+    validateComposer();const current=instances.get(sessionId);
+    if(!current){if(observedInstance||!startup||pending.get(sessionId)!==startup)throw new Error('SP 原输入框实例已失效')}
+    else{
+     if(!observedInstance&&startup&&(current.startupTask!==startup||(pending.has(sessionId)&&pending.get(sessionId)!==startup)))throw new Error('SP 原输入框实例已失效');
+     if((observedInstance&&observedInstance!==current)||current.closed||current.crashed||current.quarantined)throw new Error('SP 原输入框实例已失效');
+     observedInstance=current;
+    }
+    if(current?.page&&current.ownedLeaseRegistered){
+     let installed=false;for(const frame of current.page.frames())if(await frame.evaluate(()=>window.__dshOwnedComposerScriptId==='extension-sp-database'&&!!window.__dshOwnedComposerBridgeReady)){installed=true;break}
+     if(installed)break;
+    }
+    if(monotonicNow()>=deadline)throw new Error('SP 原输入框桥安装等待超时');
+    await new Promise(resolve=>setTimeout(resolve,100));
+   }
+  }
+  const composerCommand=command?.kind==='composer-state'||command?.kind==='composer-intent',recoveryUi=command?.kind==='ui'&&['recover','dialog','files','close'].includes(command.command?.operation);let instance=command?.kind==='save-retry'||composerCommand||recoveryUi?instances.get(sessionId):await ensure(sessionId);if(command?.kind==='save-retry'&&(!instance||instance.closed||instance.crashed||!instance.page||command.runtimeId&&command.runtimeId!==instance.runtimeId))throw new Error('SP original save realm no longer available');if(command?.kind==='ui'&&command.command?.operation==='recover'&&(!instance||instance.starting===true&&instance.ownedLeaseRegistered===false)){const starting=await recoverStartingMetadata(sessionId,instance,authorizeUi,initializingScope);if(starting!==null)return starting;instance=instances.get(sessionId);}if(!instance)throw new Error('SP 专用后台不可用');if(command?.kind==='save-retry'&&instance.quarantined)await assertSaveRecovery(sessionId,instance.runtimeId,command.recovery);else if(recoveryUi&&['recover','dialog','close'].includes(command.command?.operation))await assertRetainedUiOwner(sessionId,instance);else await assertOwnedOwner(sessionId,instance.runtimeId)
   // Commands, including real UI actions, must prevent idle retirement. A task
   // may wait for another command, so no common serial queue spans these awaits.
   instance.ownedCommands=(instance.ownedCommands||0)+1
@@ -604,11 +626,26 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,o
     }
     const validateUi=typeof authorizeUi==='function'?await authorizeUi():null;
     if(validateUi!==null&&typeof validateUi!=='function')throw new Error('SP 原界面最终认证回执无效');
-    validateUi?.();return await ui.operate(command.command,{validate:validateUi})
+    validateUi?.();const result=await ui.operate(command.command,{validate:validateUi});
+    if(command.viewerDetachEpoch!==undefined){
+     validateUi?.();
+     // A viewer release carries no draft and cannot replay an input. Check the
+     // original bridge epoch again in its own realm before changing readiness.
+     const originals=[];for(const frame of instance.page.frames())if(await frame.evaluate(()=>window.__dshOwnedComposerScriptId==='extension-sp-database'&&!!window.__dshOwnedComposerBridgeReady))originals.push(frame);
+     if(originals.length!==1)throw new Error('SP 专用后台原包窗口缺失或不唯一');
+     validateUi?.();
+     const detached=await originals[0].evaluate(async epoch=>{const bridge=await window.__dshOwnedComposerBridgeReady;if(!bridge)throw Error('SP 原输入框桥不可用');return bridge.detach(epoch)},command.viewerDetachEpoch);
+     if(detached.detached!==true)return detached;
+     validateUi?.();
+     await instance.page.evaluate(composerEpoch=>window.__dshBackgroundEngine.commandOwned({kind:'game-state',ready:false,composerEpoch}),command.viewerDetachEpoch);
+     return {...result,...detached};
+    }
+    return result
    }
    const matches=[]
-   for(const frame of instance.page.frames())if(await frame.evaluate(()=>window.__dshOriginalExtensionState?.id==='sp-database'))matches.push(frame)
+   for(const frame of instance.page.frames())if(await frame.evaluate(composer=>composer?window.__dshOwnedComposerScriptId==='extension-sp-database'&&!!window.__dshOwnedComposerBridgeReady:window.__dshOriginalExtensionState?.id==='sp-database',composerCommand))matches.push(frame)
    if(matches.length!==1)throw new Error('SP 专用后台原包窗口缺失或不唯一')
+   validateComposer?.();
    return await matches[0].evaluate(async command=>{
     if(command?.kind==='composer-state'||command?.kind==='composer-intent'){if(!window.__dshOwnedComposerBridgeReady)throw Error('SP 原输入框桥未安装');const bridge=await window.__dshOwnedComposerBridgeReady;if(!bridge)throw Error('SP 原输入框桥不可用');const value={...command.value,composerEpoch:command.composerEpoch};if(command.kind==='composer-intent')return bridge.intent(value);bridge.apply(value);return {delivered:true}}
     if(command?.kind==='task'){if(typeof window.AutoCardUpdaterAPI?.__dshExecuteOwnedTask!=='function')throw Error('SP owned-task API unavailable');return window.AutoCardUpdaterAPI.__dshExecuteOwnedTask(command.task)}

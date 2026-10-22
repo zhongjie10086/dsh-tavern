@@ -80,26 +80,50 @@ async function openBrowserTarget(url) {
 }
 
 export function needsFrontendBootstrap(record, requiredVersion = FRONTEND_BOOTSTRAP_VERSION) {
-  return !record || Number(record.version) < requiredVersion
+  const version = Number(record?.version)
+  return !Number.isSafeInteger(version) || version < requiredVersion
 }
 
-export async function bootstrapFrontendOnce(state) {
+function readFrontendBootstrap(file) {
+  try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return null }
+}
+
+function recordFrontendBootstrap(file) {
+  mkdirSync(path.dirname(file), { recursive: true })
+  writeFileSync(file, `${JSON.stringify({ version: FRONTEND_BOOTSTRAP_VERSION, completedAt: new Date().toISOString() }, null, 2)}\n`)
+}
+
+export async function bootstrapFrontendOnce(state, { timing = () => {} } = {}) {
   if (!state?.webUrl) return false
   if (process.env.DSH_TAVERN_NO_OPEN === '1') return false
-  let record = null
-  try { record = JSON.parse(readFileSync(FRONTEND_BOOTSTRAP_FILE, 'utf8')) } catch {}
+  const record = readFrontendBootstrap(FRONTEND_BOOTSTRAP_FILE)
   if (!needsFrontendBootstrap(record)) return false
   const target = restartBrowserTarget(state.port, state.runtimeGeneration, state.webUrl)
   try {
+    timing('browser.open.requested')
     await openBrowserTarget(target)
+    timing('browser.open.accepted')
   } catch (error) {
     console.warn(error.message)
     return false
   }
-  mkdirSync(LOG_DIR, { recursive: true })
-  writeFileSync(FRONTEND_BOOTSTRAP_FILE, `${JSON.stringify({ version: FRONTEND_BOOTSTRAP_VERSION, completedAt: new Date().toISOString() }, null, 2)}\n`)
+  recordFrontendBootstrap(FRONTEND_BOOTSTRAP_FILE)
   console.log(`已一次性打开新版前端：${target}`)
   return true
+}
+
+// Explicit start-and-open entry. Unlike start's optional upgrade bootstrap, this
+// always requests one page, including when a current bootstrap marker exists.
+export async function launchService({ start = startService, openBrowser = openBrowserTarget, bootstrapFile = FRONTEND_BOOTSTRAP_FILE, timing = () => {} } = {}) {
+  const state = await start({ timing })
+  if (!state?.webUrl) throw new Error('尚未取得有效的 Web 访问链接，无法打开酒馆。请运行 dsh-tavern status 检查。')
+  const bootstrap = needsFrontendBootstrap(readFrontendBootstrap(bootstrapFile))
+  const target = bootstrap ? restartBrowserTarget(state.port, state.runtimeGeneration, state.webUrl) : state.webUrl
+  timing('browser.open.requested')
+  await openBrowser(target)
+  timing('browser.open.accepted')
+  if (bootstrap) recordFrontendBootstrap(bootstrapFile)
+  return state
 }
 
 function verifyProfile() {
@@ -239,14 +263,18 @@ function printServiceWebUrl(url) {
   console.log('带 token 的地址包含访问凭证，请勿分享。关掉页面后可运行 dsh-tavern open 重新打开。')
 }
 
-export async function openService() {
+export async function openService({ timing = () => {} } = {}) {
   verifyProfile()
+  timing('service.checking')
   const state = await serviceState()
   if (!state.record || !state.ready) throw new Error('DSH Tavern 尚未就绪，请先运行 dsh-tavern start。')
+  timing('service.ready')
   const url = await currentServiceWebUrl(state)
   printServiceWebUrl(url)
   if (!url) { process.exitCode = 1; return }
+  timing('browser.open.requested')
   await openBrowserTarget(url)
+  timing('browser.open.accepted')
 }
 
 export async function stopService({ force = false } = {}) {
@@ -292,14 +320,16 @@ async function stopServiceLocked(force) {
   throw new Error(`服务未能在 10 秒内停止；${force ? '已请求强制结束' : '没有强制结束进程'}，请手动检查 PID ${state.record.pid}。`)
 }
 
-export async function startService() {
+export async function startService({ timing = () => {} } = {}) {
   verifyProfile()
-  return lifecycleLocks.withLock(path.join(LOG_DIR, 'tavern.start'), startServiceLocked, { waitMs: 35_000 })
+  timing('service.checking')
+  return lifecycleLocks.withLock(path.join(LOG_DIR, 'tavern.start'), () => startServiceLocked(timing), { waitMs: 35_000 })
 }
 
-async function startServiceLocked() {
+async function startServiceLocked(timing) {
   const state = await serviceState()
   if (state.record && state.ready) {
+    timing('service.reused')
     console.log(`DSH Tavern 已经在运行：PID ${state.record.pid}。`)
     const webUrl = await currentServiceWebUrl(state)
     printServiceWebUrl(webUrl)
@@ -312,6 +342,7 @@ async function startServiceLocked() {
     throw new Error(`端口 ${state.occupiedPorts.join(', ')} 已被其他进程占用，拒绝启动。`)
   }
 
+  timing('service.preparing')
   await ensureSidebarDefaults()
 
   const runtimeHost = RUNTIME_HOST
@@ -348,6 +379,7 @@ async function startServiceLocked() {
     closeSync(logDescriptor)
   }
   child.unref()
+  timing('service.spawned')
   await writePidRecord(child.pid, state.port, logOffset, control)
 
   const exited = () => child.exitCode !== null || child.signalCode !== null || !isProcessAlive(child.pid)
@@ -370,6 +402,7 @@ async function startServiceLocked() {
     if (exited()) throw await startupFailed()
     throw new Error(`${error.message}，日志：${LOG_FILE}`, { cause: error })
   }
+  timing('service.ready')
   const webUrl = await currentServiceWebUrl({ port: state.port, record: { logOffset } })
   if (exited()) throw await startupFailed()
   await rememberServicePort(state.port)

@@ -149,6 +149,19 @@ function openingPreviewSelection(preview, swipeId) {
 function installSessionOpeningBridge(token, descriptor) {
   const swipes = descriptor.swipes.slice();
   const chat = [{ is_user: false, name: descriptor.characterName, mes: swipes[descriptor.selectedIndex], swipe_id: descriptor.selectedIndex, swipes }];
+  const getChatMessages = window.getChatMessages;
+  if (typeof getChatMessages === 'function') window.getChatMessages = function (target, options) {
+    // Preserve the host's range/filter semantics and all message metadata. A
+    // legacy greeting may store only its menu marker; its available openings
+    // belong to this descriptor, just as they do for the setter below.
+    const messages = getChatMessages.call(this, target, options);
+    if (!options || options.include_swipes !== true) return messages;
+    return messages.map(function (message) {
+      return Number(message.message_id) === 0 ? Object.assign({}, message, {
+        message: chat[0].mes, swipe_id: chat[0].swipe_id, swipes: swipes.slice()
+      }) : message;
+    });
+  };
   const pending = new Map();
   let sequence = 0, saved = null, starting = null;
   function call(method, args) {

@@ -79,7 +79,9 @@ async function installTavernScriptComposer(win, call, token, options={}) {
   const controls=doc.createElement('div'),area=doc.createElement('textarea'),button=doc.createElement('button');
   controls.hidden=true;controls.dataset.dshScriptComposer='true';area.id='send_textarea';button.id='send_but';button.type='button';
   controls.append(area,button);doc.body.append(controls);
-  let latest={draft:'',revision:-1,composerEpoch:0},optimistic='',pending=0,tail=Promise.resolve(),sending=false,disposed=false,writeError=null,previewIntent=false,attached=true;
+  let latest={draft:'',revision:-1,composerEpoch:0},optimistic='',pending=0,tail=Promise.resolve(),sending=false,disposed=false,writeError=null,previewIntent=false,attached=options.owned!==true;
+  let resolveReady;
+  const ready=options.owned===true?new Promise(resolve=>{resolveReady=resolve}):Promise.resolve();
   const epochCurrent=epoch=>options.owned!==true||epoch===latest.composerEpoch;
   function assertEpoch(epoch){if(!epochCurrent(epoch))throw Error('SP 输入连接代次已变化，旧操作未应用')}
   function applyReply(value,epoch){assertEpoch(epoch);if(options.owned===true&&value?.composerEpoch!==epoch)throw Error('SP 输入回执连接代次已变化');apply(value);return value}
@@ -94,8 +96,10 @@ async function installTavernScriptComposer(win, call, token, options={}) {
     }
     if(!advanced&&Number(value.revision)<latest.revision)return;
     latest={draft:String(value.draft||''),revision:Number(value.revision)||0,composerEpoch:options.owned===true?value.composerEpoch:0};
+    if(options.owned===true)win.__dshOwnedComposerEpoch=latest.composerEpoch;
     if(options.owned===true)attached=value.attached!==false;
     if(!pending){area.value=latest.draft;optimistic=latest.draft}
+    if(options.owned===true&&attached){resolveReady();resolveReady=()=>{}}
   }
   function report(error){win.toastr?.error?.(String(error?.message||error),'输入框');win.console.error('[DSH Tavern] 脚本输入操作失败',error)}
   function receive(event){const data=event.data;if(event.source===win.parent&&data?.token===token&&data.type==='dsh-tavern-composer-state')apply(data.value)}
@@ -133,8 +137,11 @@ async function installTavernScriptComposer(win, call, token, options={}) {
   button.addEventListener('click',send);
   area.addEventListener('keydown',event=>{if(!previewIntent&&event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}});
   win.addEventListener('pagehide',()=>{disposed=true;win.removeEventListener('message',receive)},{once:true});
-  apply(await call('tavernHelperComposer',{operation:{kind:'read'}}));
-  return {apply,async flush(){await tail;if(writeError)throw writeError},async intent(value){
+  // Persistent SP receives its first snapshot through the authenticated owner
+  // command. Installing the bridge must not wait on a disposable viewer read:
+  // a failed read would otherwise poison this realm's bridge promise forever.
+  if(options.owned!==true)apply(await call('tavernHelperComposer',{operation:{kind:'read'}}));
+  return {apply,ready,detach(epoch){if(epoch!==latest.composerEpoch)return {detached:false,superseded:true};attached=false;return {detached:true}},async flush(){await tail;if(writeError)throw writeError},async intent(value){
     const epoch=value?.composerEpoch;assertEpoch(epoch);await tail;assertEpoch(epoch);if(writeError)throw writeError;if(!attached)throw Error('真实游戏输入框已关闭');
     if(!value||typeof value.draft!=='string'||!Number.isSafeInteger(value.revision)||!['click','keydown'].includes(value.type))throw Error('SP 发送意图无效');
     apply({...value,attached:true});if(value.revision!==latest.revision||value.draft!==latest.draft)throw Error('发送前草稿版本已变化');
@@ -147,11 +154,19 @@ async function installTavernScriptComposer(win, call, token, options={}) {
 // One authenticated fixed-SP viewer. The native input remains the draft owner.
 function installTavernSpRemoteComposer({window:win,input,getRoot,current,command,report,running=()=>false,composerEpoch}){
  if(!Number.isSafeInteger(composerEpoch)||composerEpoch<1)throw Error('SP 输入连接代次无效');
- let revision=0,disposed=false,pending=false,tail=Promise.resolve();
+ let revision=0,disposed=false,pending=false,tail=Promise.resolve(),lastDraft=String(input.state.getSnapshot().draft||''),lastState,stateFailed=false;
+ const cancelledSnapshot=error=>disposed&&(error?.name==='AbortError'||error?.code==='DSH_TAVERN_RUNTIME_REPLACED');
  const snapshot=()=>({draft:String(input.state.getSnapshot().draft||''),revision,attached:!disposed&&current(),composerEpoch});
- function publish(){const value=snapshot();tail=tail.catch(()=>{}).then(()=>command({kind:'composer-state',composerEpoch,value}));void tail.catch(report);return tail}
- const unsubscribe=input.state.subscribe(()=>{revision++;void publish()});
- const initial=publish();
+ function publish({retryFailed=false}={}){
+  if(disposed)return tail;
+  const value=snapshot();
+  if(value.draft!==lastDraft){revision++;lastDraft=value.draft;value.revision=revision}
+  if(lastState&&lastState.draft===value.draft&&lastState.attached===value.attached&&!(retryFailed&&stateFailed))return tail;
+  lastState=value;
+  tail=tail.catch(()=>{}).then(()=>{if(disposed)return;return command({kind:'composer-state',composerEpoch,value})}).then(result=>{if(lastState===value)stateFailed=false;return result},error=>{if(lastState===value)stateFailed=true;throw error});void tail.catch(error=>{if(!cancelledSnapshot(error))report(error)});return tail;
+ }
+ const unsubscribe=input.state.subscribe(()=>{void publish()});
+ void publish();
  function receive(event){
   if(disposed||!current())return;
   const root=getRoot(),editor=root?.querySelector('[data-composer-input]'),buttons=root?.querySelectorAll('button'),send=buttons?.[buttons.length-1];
@@ -161,19 +176,19 @@ function installTavernSpRemoteComposer({window:win,input,getRoot,current,command
   // Its cancellation must reach the original native handler without a handshake.
   if(running())return;
   event.preventDefault();event.stopImmediatePropagation();if(pending){report(Error('SP 正在处理发送意图，输入已保留'));return}
-  pending=true;const expected=snapshot();
+  pending=true;let intentStarted=false;const expected=snapshot();
   void (async()=>{
-   await initial;await tail;if(!current()||disposed)throw Error('SP 游戏页面已关闭，输入未发送');
-   const value=await command({kind:'composer-intent',composerEpoch,value:{...expected,type:click?'click':'keydown',key:event.key||'Enter',shiftKey:false}});
+   await publish({retryFailed:true});await tail;if(!current()||disposed)throw Error('SP 游戏页面已关闭，输入未发送');
+   intentStarted=true;const value=await command({kind:'composer-intent',composerEpoch,value:{...expected,type:click?'click':'keydown',key:event.key||'Enter',shiftKey:false}});
    if(typeof value?.prevented!=='boolean'||typeof value.draft!=='string'||!Number.isSafeInteger(value.revision)||value.composerEpoch!==composerEpoch)throw Error('SP 原发送意图未获当前连接确认');
    if(value.prevented)return;
    if(!current()||disposed||snapshot().draft!==value.draft||revision!==value.revision)throw Error('发送期间输入框已变化，当前草稿已保留');
    performTavernComposerOperation(input,{kind:'send',expectedDraft:value.draft},{running:running()});
-  })().catch(report).finally(()=>{pending=false});
+  })().catch(error=>{if(intentStarted||!cancelledSnapshot(error))report(error)}).finally(()=>{pending=false});
  }
  win.addEventListener('click',receive,true);win.addEventListener('keydown',receive,true);
  const visibility=()=>{void publish()};win.document?.addEventListener('visibilitychange',visibility);
- return {snapshot,publish,dispose(){if(disposed)return;disposed=true;unsubscribe();win.document?.removeEventListener('visibilitychange',visibility);win.removeEventListener('click',receive,true);win.removeEventListener('keydown',receive,true);void command({kind:'composer-state',composerEpoch,value:snapshot()}).catch(report)}};
+ return {snapshot,publish,dispose({notify=true}={}){if(disposed)return;disposed=true;unsubscribe();win.document?.removeEventListener('visibilitychange',visibility);win.removeEventListener('click',receive,true);win.removeEventListener('keydown',receive,true);if(notify)void command({kind:'composer-state',composerEpoch,value:snapshot()}).catch(report)}};
 }
 
 function performTavernComposerOperation(input, operation, options={}) {

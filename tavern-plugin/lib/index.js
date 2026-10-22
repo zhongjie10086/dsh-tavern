@@ -1095,6 +1095,7 @@ export async function apply(ctx) {
     const lifecycleRevision=Number(chat.tavernHelperLifecycleRevision||0),scriptTreeRevision=Number(chat.tavernScriptTreeRevision||0)
     maintenanceChatIdentity.set(chat.id,{id:chat.id,sessionId:chat.sessionId,_storageRevision:chat._storageRevision,lifecycleRevision,scriptTreeRevision,mode:chat.mode||'story',
       ...(previous?.lifecycleRevision===lifecycleRevision&&previous.scriptTreeRevision===scriptTreeRevision&&previous.sessionId===chat.sessionId&&previous.mode===(chat.mode||'story')?{unloadSource:previous.unloadSource}:{}),
+      ...(previous?.lifecycleRevision===lifecycleRevision&&previous.sessionId===chat.sessionId&&previous.mode===(chat.mode||'story')?{spOwnedSource:previous.spOwnedSource}:{}),
       taskMailbox:{tasks:Object.fromEntries(Object.keys(chat.taskMailbox?.tasks||{}).map(id=>[id,true]))},
       timeline:{participants:Object.fromEntries(Object.entries(chat.timeline?.participants||{}).map(([key,value])=>[key,{sessionId:value.sessionId}]))}})
   }
@@ -1117,6 +1118,17 @@ export async function apply(ctx) {
     participants.sort((a,b)=>a.scriptId.localeCompare(b.scriptId));
     if(participants.some(p=>!p.scriptId||!p.sourceDigest)||new Set(participants.map(p=>p.scriptId)).size!==participants.length)return;
     identity.unloadSource={chatId:chat.id,lifecycleRevision:identity.lifecycleRevision,scriptTreeRevision:identity.scriptTreeRevision,scriptId:'extension-sp-database',sourceDigest:original[0].sourceDigest,packageDigest,extensionRevision,participants};
+    identity.spOwnedSource={...identity.unloadSource,extensionSource:{id:source.id,scope:source.scope,content:source.content,type:source.type,enabled:source.enabled,extension:source.extension}};
+  }
+  // A card tree edit invalidates unload's complete participant inventory, but
+  // does not replace the dedicated original SP source. Revalidate that source
+  // without requiring a full view projection to publish a new unload scope.
+  function originalSpOwnedScope(sessionId){
+    const id=maintenanceChatSessionIds.get(sessionId),identity=maintenanceChatIdentity.get(id),scope=identity?.spOwnedSource;
+    if(!scope||deletedChatIds.has(id)||deletingChatIds.has(id)||identity.sessionId!==sessionId||identity.lifecycleRevision!==scope.lifecycleRevision||!['story','script'].includes(identity.mode)||!extensionRuntime.installed()||!extensionRuntime.usesOriginal(sessionId)||extensionRuntime.status().installed?.digest!==scope.packageDigest||extensionRuntime.status().revision!==scope.extensionRevision)return null;
+    const current=extensionRuntime.scripts(sessionId).filter(script=>script.id==='extension-sp-database'),source=scope.extensionSource;
+    if(current.length!==1||!source||['id','scope','content','type','enabled','extension'].some(key=>current[0][key]!==source[key]))return null;
+    return scope;
   }
   const frameUnloads=createFrameUnloadCapabilities({dispatch:tavernScriptDispatch,scopeFor:originalSpUnloadScope})
   async function readChat(chatId) {
@@ -1729,8 +1741,8 @@ export async function apply(ctx) {
   const backgroundScripts=createTavernBackgroundScriptExecutor({...backgroundScriptOptions,rpc:dispatchMethod,dispatch:tavernScriptDispatch})
   ctx.effect(()=>()=>backgroundScripts.dispose(),'dsh-tavern: background script executor')
   async function spOwnedScope(sessionId){
-    const chat=await chatForSessionReadonly(sessionId),source=chat&&maintenanceChatIdentity.get(chat.id)?.unloadSource
-    if(!chat||!source||source.lifecycleRevision!==Number(chat.tavernHelperLifecycleRevision||0)||!extensionRuntime.usesOriginal(sessionId)||extensionRuntime.status().installed?.version!=='1.2.9'||extensionRuntime.status().installed?.digest!==source.packageDigest)throw Error('SP 专用执行者的卡片、脚本或版本身份已变化')
+    const chat=await chatForSessionReadonly(sessionId),source=chat&&originalSpOwnedScope(sessionId)
+    if(!chat||!source||source.lifecycleRevision!==Number(chat.tavernHelperLifecycleRevision||0)||extensionRuntime.status().installed?.version!=='1.2.9')throw Error('SP 专用执行者的卡片、脚本或版本身份已变化')
     return {chatId:chat.id,branchId:chat.timeline?.branchId||'',lifecycleRevision:Number(chat.tavernHelperLifecycleRevision)||0,sourceDigest:source.sourceDigest,packageDigest:source.packageDigest,scriptId:'extension-sp-database'}
   }
   const spOwnedRpcMethods={getTavernSpOwnedTaskIdentity:'identity',registerTavernSpOwnedTask:'register',cancelTavernSpOwnedTask:'cancel',dispatchTavernSpOwnedTask:'dispatch',checkpointTavernSpOwnedTask:'checkpoint',modelTavernSpOwnedTask:'modelStep',assertTavernSpOwnedTask:'assertTaskOwner',commandTavernSpOwnedTask:'ownerCommand',prepareTavernSpOwnedSaveRetry:'prepareSaveRetry'}

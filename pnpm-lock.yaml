@@ -5,8 +5,9 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
-  dsh-web-mobile@2.3.0: 8988461b23999ee4b0d392bf2049a57dc7d8e6d5d2f02e93b2ae77e5018415d9
   dsh-better-sidebar@0.17.1: 2f7eb3b8b51f54533dfb6800af1f5d1c384515060b3b3b057d4dc8a7e76b15d0
+  dsh-web-mobile@2.3.0: 8988461b23999ee4b0d392bf2049a57dc7d8e6d5d2f02e93b2ae77e5018415d9
+  playwright-core@1.62.1: d63b94f6b1719b0dab92a3f64671eb7ece52f2f6320da1da8e5151f02eb81ab4
 
 importers:
 
@@ -44,7 +45,7 @@ importers:
         version: 12.4.3
       playwright-core:
         specifier: 1.62.1
-        version: 1.62.1
+        version: 1.62.1(patch_hash=d63b94f6b1719b0dab92a3f64671eb7ece52f2f6320da1da8e5151f02eb81ab4)
       quickjs-emscripten-core:
         specifier: 0.32.0
         version: 0.32.0
@@ -1643,7 +1644,7 @@ snapshots:
 
   path-data-parser@0.1.0: {}
 
-  playwright-core@1.62.1: {}
+  playwright-core@1.62.1(patch_hash=d63b94f6b1719b0dab92a3f64671eb7ece52f2f6320da1da8e5151f02eb81ab4): {}
 
   points-on-curve@0.2.0: {}
 

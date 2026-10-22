@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  playwright-core@1.62.1: d63b94f6b1719b0dab92a3f64671eb7ece52f2f6320da1da8e5151f02eb81ab4
+
 importers:
 
   .:
@@ -37,7 +40,7 @@ importers:
         version: 16.3.0
       playwright-core:
         specifier: 1.62.1
-        version: 1.62.1
+        version: 1.62.1(patch_hash=d63b94f6b1719b0dab92a3f64671eb7ece52f2f6320da1da8e5151f02eb81ab4)
       sql.js:
         specifier: 1.14.1
         version: 1.14.1
@@ -1268,7 +1271,7 @@ snapshots:
 
   picomatch@4.0.7: {}
 
-  playwright-core@1.62.1: {}
+  playwright-core@1.62.1(patch_hash=d63b94f6b1719b0dab92a3f64671eb7ece52f2f6320da1da8e5151f02eb81ab4): {}
 
   quansync@1.0.0: {}
 
