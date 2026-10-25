@@ -1,5 +1,6 @@
 import {mutableJsonDraft,immutableJsonSnapshot} from './json-draft.js'
 import {captureOriginalSpPersistence,restoreOriginalSpPersistence} from './sp-authority.js'
+import { restoreManualMvuState } from './manual-mvu-edit.js'
 import {projectCharacterDesignRollback} from './character-design-rollback.js'
 
 function clone(value) {
@@ -113,6 +114,7 @@ export function createStoryTimeline(options = {}) {
       presentationWarnings: Array.isArray(chat.presentationWarnings) ? chat.presentationWarnings : [],
       macroState: chat.macroState === undefined ? null : chat.macroState,
       tavernScriptPrompts: chat.tavernScriptPrompts || [],
+      manualMvuNotice: chat.manualMvuNotice || null,
       runtimeInputs: chat.runtimeInputs === undefined ? null : chat.runtimeInputs,
       ...Object.fromEntries(['worldbookState','openingWorldbookSnapshot','chatWorldbookBindings','characterDesignDocument','variables','tavernHelperScriptVariables','tavernPluginMetadata'].map(key => [key, chat[key] ?? null])),
       spDatabase: chat.spDatabase || null,
@@ -132,6 +134,7 @@ export function createStoryTimeline(options = {}) {
 
   function restore(chat, state, { preserveSpDatabase = false, originalSpDeletion = null } = {}) {
     const source = object(state)
+    restoreManualMvuState(chat,source)
     const originalSp = preserveSpDatabase || chat.spAuthority?.owner === 'original' ? captureOriginalSpPersistence(chat) : null
     chat.messages = clone(Array.isArray(source.messages) ? source.messages : [])
     chat.presentation = clone(source.presentation === undefined ? null : source.presentation)

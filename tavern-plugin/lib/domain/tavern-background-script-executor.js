@@ -346,7 +346,7 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,o
      // Match the existing foreground HTTP JSON wire contract before Playwright can preserve undefined.
      const invoke=(method,args,_sessionId)=>window.__dshHelperRpc(method,ownedMode?JSON.parse(JSON.stringify({...args,sessionId})):{...args,sessionId})
      let syncing=null,refreshRequested=false
-     const update=()=>{refreshRequested=true;return syncing ||= (async()=>{do{refreshRequested=false;const {view}=await invoke('getSession',{});engine.sync(sessionId,view);}while(refreshRequested)})().finally(()=>{syncing=null})}
+     const update=expectedContextRevision=>{if(typeof expectedContextRevision==='string'&&expectedContextRevision&&!refreshRequested&&!syncing&&engine.ownedState?.()?.contextRevision===expectedContextRevision)return Promise.resolve();refreshRequested=true;return syncing ||= (async()=>{do{refreshRequested=false;const {view}=await invoke('getSession',{});engine.sync(sessionId,view);}while(refreshRequested)})().finally(()=>{syncing=null})}
      const listeners=new Map()
      window.__dshBackgroundSignal=signal=>{for(const receive of [...(listeners.get(signal.kind)||[])])receive(signal)}
      const engine=window.__dshBackgroundEngine=ui.createTavernScriptExecutionModule({window,background:true,ownedSp:ownedMode,rpc:invoke,invalidate:()=>{void update().catch(console.error)},signals:{subscribe(_id,kind,receive){let set=listeners.get(kind);if(!set){set=new Set();listeners.set(kind,set)}set.add(receive);return()=>{set.delete(receive);if(!set.size)listeners.delete(kind)}}},heartbeatIntervalMs:1000})
@@ -599,15 +599,39 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,o
      if((observedInstance&&observedInstance!==current)||current.closed||current.crashed||current.quarantined)throw new Error('SP 原输入框实例已失效');
      observedInstance=current;
     }
-    if(current?.page&&current.ownedLeaseRegistered){
-     let installed=false;for(const frame of current.page.frames())if(await frame.evaluate(()=>window.__dshOwnedComposerScriptId==='extension-sp-database'&&!!window.__dshOwnedComposerBridgeReady)){installed=true;break}
-     if(installed)break;
-    }
     if(monotonicNow()>=deadline)throw new Error('SP 原输入框桥安装等待超时');
+    if(current?.page&&current.ownedLeaseRegistered){
+     // A newly mounted frame can navigate while being inspected. Only snapshot
+     // synchronization is repeatable: apply updates the draft/epoch and resolves
+     // bridge readiness; it never writes or sends an input through the host API.
+     const navigationTransient=error=>String(error?.message||error).includes('Execution context was destroyed, most likely because of a navigation');
+     current.ownedCommands=(current.ownedCommands||0)+1;
+     try{
+      const matches=[];
+      for(const frame of current.page.frames()){
+       try{if(await frame.evaluate(()=>window.__dshOwnedComposerScriptId==='extension-sp-database'&&!!window.__dshOwnedComposerBridgeReady))matches.push(frame)}
+       catch(error){if(!navigationTransient(error))throw error}
+      }
+      if(matches.length>1)throw new Error('SP 专用后台原包窗口缺失或不唯一');
+      if(matches.length===1){
+       await assertOwnedOwner(sessionId,current.runtimeId);
+       validateComposer();
+       if(instances.get(sessionId)!==current||current.closed||current.crashed||current.quarantined)throw new Error('SP 原输入框实例已失效');
+       if(monotonicNow()>=deadline)throw new Error('SP 原输入框桥安装等待超时');
+       try{
+        return await matches[0].evaluate(async command=>{
+         if(!window.__dshOwnedComposerBridgeReady)throw Error('SP 原输入框桥未安装');
+         const bridge=await window.__dshOwnedComposerBridgeReady;if(!bridge)throw Error('SP 原输入框桥不可用');
+         bridge.apply({...command.value,composerEpoch:command.composerEpoch});return {delivered:true};
+        },command);
+       }catch(error){if(!navigationTransient(error))throw error}
+      }
+     }finally{current.ownedCommands--;armIdle(current)}
+    }
     await new Promise(resolve=>setTimeout(resolve,100));
    }
   }
-  const composerCommand=command?.kind==='composer-state'||command?.kind==='composer-intent',recoveryUi=command?.kind==='ui'&&['recover','dialog','files','close'].includes(command.command?.operation);let instance=command?.kind==='save-retry'||composerCommand||recoveryUi?instances.get(sessionId):await ensure(sessionId);if(command?.kind==='save-retry'&&(!instance||instance.closed||instance.crashed||!instance.page||command.runtimeId&&command.runtimeId!==instance.runtimeId))throw new Error('SP original save realm no longer available');if(command?.kind==='ui'&&command.command?.operation==='recover'&&(!instance||instance.starting===true&&instance.ownedLeaseRegistered===false)){const starting=await recoverStartingMetadata(sessionId,instance,authorizeUi,initializingScope);if(starting!==null)return starting;instance=instances.get(sessionId);}if(!instance)throw new Error('SP 专用后台不可用');if(command?.kind==='save-retry'&&instance.quarantined)await assertSaveRecovery(sessionId,instance.runtimeId,command.recovery);else if(recoveryUi&&['recover','dialog','close'].includes(command.command?.operation))await assertRetainedUiOwner(sessionId,instance);else await assertOwnedOwner(sessionId,instance.runtimeId)
+  const composerCommand=command?.kind==='composer-intent',recoveryUi=command?.kind==='ui'&&['recover','dialog','files','close'].includes(command.command?.operation);let instance=command?.kind==='save-retry'||composerCommand||recoveryUi?instances.get(sessionId):await ensure(sessionId);if(command?.kind==='save-retry'&&(!instance||instance.closed||instance.crashed||!instance.page||command.runtimeId&&command.runtimeId!==instance.runtimeId))throw new Error('SP original save realm no longer available');if(command?.kind==='ui'&&command.command?.operation==='recover'&&(!instance||instance.starting===true&&instance.ownedLeaseRegistered===false)){const starting=await recoverStartingMetadata(sessionId,instance,authorizeUi,initializingScope);if(starting!==null)return starting;instance=instances.get(sessionId);}if(!instance)throw new Error('SP 专用后台不可用');if(command?.kind==='save-retry'&&instance.quarantined)await assertSaveRecovery(sessionId,instance.runtimeId,command.recovery);else if(recoveryUi&&['recover','dialog','close'].includes(command.command?.operation))await assertRetainedUiOwner(sessionId,instance);else await assertOwnedOwner(sessionId,instance.runtimeId)
   // Commands, including real UI actions, must prevent idle retirement. A task
   // may wait for another command, so no common serial queue spans these awaits.
   instance.ownedCommands=(instance.ownedCommands||0)+1
@@ -647,7 +671,7 @@ export function createTavernBackgroundScriptExecutor({rpc,dispatch,view,assets,o
    if(matches.length!==1)throw new Error('SP 专用后台原包窗口缺失或不唯一')
    validateComposer?.();
    return await matches[0].evaluate(async command=>{
-    if(command?.kind==='composer-state'||command?.kind==='composer-intent'){if(!window.__dshOwnedComposerBridgeReady)throw Error('SP 原输入框桥未安装');const bridge=await window.__dshOwnedComposerBridgeReady;if(!bridge)throw Error('SP 原输入框桥不可用');const value={...command.value,composerEpoch:command.composerEpoch};if(command.kind==='composer-intent')return bridge.intent(value);bridge.apply(value);return {delivered:true}}
+    if(command?.kind==='composer-intent'){if(!window.__dshOwnedComposerBridgeReady)throw Error('SP 原输入框桥未安装');const bridge=await window.__dshOwnedComposerBridgeReady;if(!bridge)throw Error('SP 原输入框桥不可用');const value={...command.value,composerEpoch:command.composerEpoch};return bridge.intent(value)}
     if(command?.kind==='task'){if(typeof window.AutoCardUpdaterAPI?.__dshExecuteOwnedTask!=='function')throw Error('SP owned-task API unavailable');return window.AutoCardUpdaterAPI.__dshExecuteOwnedTask(command.task)}
     if(command?.kind==='save-retry'){if(typeof window.AutoCardUpdaterAPI?.__dshRetryOwnedTaskSave!=='function')throw Error('SP save retry API unavailable');return window.AutoCardUpdaterAPI.__dshRetryOwnedTaskSave(command.taskId,command.recovery)}
     if(command?.kind==='task-prepare'){if(typeof window.AutoCardUpdaterAPI?.__dshPrepareQueuedOwnedTask!=='function')throw Error('SP queued preparation API unavailable');return window.AutoCardUpdaterAPI.__dshPrepareQueuedOwnedTask(command.task)}

@@ -1,10 +1,44 @@
 // The host owns this baseline. Only signatures survive between updates, so a
 // script's optimistic edits and RPC replies cannot change the comparison data.
+const messageJsonCache = new WeakMap();
+const immutableContextMessageNodes = new WeakSet();
+function isImmutableContextMessage(value, visiting = new WeakSet()) {
+    if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+    if (typeof value === "number") return Number.isFinite(value);
+    if (!value || typeof value !== "object") return false;
+    if (immutableContextMessageNodes.has(value)) return true;
+    if (!Object.isFrozen(value) || visiting.has(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== null && prototype !== Object.prototype && prototype !== Array.prototype) return false;
+    visiting.add(value);
+    for (const key of Reflect.ownKeys(value)) {
+        const property = Object.getOwnPropertyDescriptor(value, key);
+        if (typeof key !== "string" || !Object.hasOwn(property, "value") || !isImmutableContextMessage(property.value, visiting)) {
+            visiting.delete(value); return false;
+        }
+    }
+    visiting.delete(value);
+    immutableContextMessageNodes.add(value);
+    return true;
+}
+function serializeContextMessage(item) {
+    if (item === null || typeof item !== "object") return JSON.stringify(item);
+    if ("toJSON" in Object.prototype || "toJSON" in Array.prototype) return JSON.stringify(item);
+    // A shallow freeze can still contain writable variables. Never memoize
+    // caller-owned mutable rows or freeze them merely to admit this cache.
+    if (!isImmutableContextMessage(item)) return JSON.stringify(item);
+    let cached = messageJsonCache.get(item);
+    if (cached === undefined) {
+        cached = JSON.stringify(item);
+        messageJsonCache.set(item, cached);
+    }
+    return cached;
+}
 function createTavernScriptContextSender() {
     let sequence = 0, fields = new Map(), messages = [], identity = "";
     function encode(context, force) {
         const nextIdentity = JSON.stringify([context.chatId, context.lifecycleRevision]);
-        const values = new Map(), nextMessages = (context.messages || []).map(item => JSON.stringify(item));
+        const values = new Map(), nextMessages = (context.messages || []).map(serializeContextMessage);
         for (const key of Object.keys(context)) if (key !== "messages" && !["__proto__", "constructor", "prototype"].includes(key)) values.set(key, JSON.stringify(context[key]));
         const snapshot = force || sequence === 0 || nextIdentity !== identity;
         const set = {}, remove = [], replace = [];

@@ -307,7 +307,7 @@ export function createFileResourceStore(options = {}) {
     return { card: saved, originalPath: 'originals/cards/' + payload.name, backupPath: backupRelative }
   }
 
-  async function version(relative){return durableFiles.version(absolute(await canonicalPath(relative)))}
+  async function version(relative,options){return durableFiles.version(absolute(await canonicalPath(relative)),options)}
   async function readText(relative) {
     const target = absolute(await canonicalPath(relative))
     const value = await durableFiles.read(target)

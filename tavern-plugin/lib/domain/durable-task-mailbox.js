@@ -192,14 +192,30 @@ export function createDurableTaskMailbox(options = {}) {
 
   async function sync(chatId, selector = {}) {
     return await serialize(chatId, async function () {
+      if (typeof store.readChatReadonly === 'function') {
+        const readonlyChat = await store.readChatReadonly(chatId)
+        if (!readonlyChat) return { mailboxVersion: 0, task: null, chat: undefined }
+        const rawMailbox = readonlyChat.taskMailbox
+        if (!Array.isArray(rawMailbox?.tasks)) {
+          if (!rawMailbox || typeof rawMailbox !== 'object' || !rawMailbox.tasks || typeof rawMailbox.tasks !== 'object') {
+            return { mailboxVersion: 0, task: null, chat: readonlyChat }
+          }
+          const version = Number.isSafeInteger(rawMailbox.version) && rawMailbox.version >= 0 ? rawMailbox.version : 0
+          const latestByKind = rawMailbox.latestByKind && typeof rawMailbox.latestByKind === 'object' ? rawMailbox.latestByKind : {}
+          const readonlyTask = findTask({ version, tasks: rawMailbox.tasks, latestByKind }, selector)
+          if (!readonlyTask) return { mailboxVersion: version, task: null, chat: readonlyChat }
+          const repair = await reconcile(readonlyChat, publicTask(readonlyTask))
+          if (!repair || typeof repair !== 'object') return { mailboxVersion: version, task: publicTask(readonlyTask), chat: readonlyChat }
+        }
+      }
       const chat = await store.readChat(chatId)
-      if (!chat) return { mailboxVersion: 0, task: null }
+      if (!chat) return { mailboxVersion: 0, task: null, chat: undefined }
       const mailbox = await loadMailbox(chat)
       const task = findTask(mailbox, selector)
-      if (!task) return { mailboxVersion: mailbox.version, task: null }
+      if (!task) return { mailboxVersion: mailbox.version, task: null, chat }
       const repair = await reconcile(chat, publicTask(task))
       if (repair && typeof repair === 'object' && applyPatch(mailbox, task, repair)) {prune(mailbox,task.taskId);await store.writeChat(chat, { source: str(task.kind) + '.mailbox.reconcile', requestId: str(task.requestId), operationId: str(task.operationId) })}
-      return { mailboxVersion: mailbox.version, task: publicTask(task) }
+      return { mailboxVersion: mailbox.version, task: publicTask(task), chat }
     })
   }
 

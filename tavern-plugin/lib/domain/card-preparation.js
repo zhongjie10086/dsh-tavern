@@ -494,6 +494,13 @@ export function createCardPreparation(options = {}) {
     }
     if (applyWorldBookOperations(data, request.worldBookOperations) && !changedFields.includes('character_book')) changedFields.push('character_book')
     data.name = str(data.name).trim() || '未命名角色'
+    // V2/V3 cards may carry V1 compatibility copies at the root. Only fields
+    // edited through the structured patch update their existing mirror.
+    if (data !== workspace.raw) {
+      for (const field of changedFields) {
+        if (field !== 'character_book' && CARD_FIELDS.has(field) && Object.prototype.hasOwnProperty.call(workspace.raw, field)) workspace.raw[field] = clone(data[field])
+      }
+    }
     if (changedFields.length > 0) {
       workspace.meta.updatedAt = now()
       if (request.revision !== undefined && request.revision !== null) {

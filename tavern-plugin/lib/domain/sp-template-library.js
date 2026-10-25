@@ -1,5 +1,6 @@
 import { normalizeTemplateRowIds_ACU } from '../vendor/sp-database/template-row-id-normalizer.js'
 import { validateTableData, sheetKeys } from './sp-database.js'
+import {parseDDLTableName} from '../vendor/sp-database/ddl-utils.js'
 
 /** Accept table exports and named template exports, preserving all non-runtime fields. */
 export function importSpTemplate(source, { withData = true } = {}) {
@@ -11,6 +12,8 @@ export function importSpTemplate(source, { withData = true } = {}) {
   if (!document || typeof document !== 'object' || !sheetKeys(document).length) throw new Error('未识别出 SP 表格或模板 JSON')
   document.mate ||= {}
   for (const key of sheetKeys(document)) {
+    const authored=parseDDLTableName(document[key].sourceData?.ddl||'')
+    if(authored){const sourceData=document[key].sourceData,aliases=sourceData.tableAliases;if(aliases!==undefined&&(!Array.isArray(aliases)||aliases.some(alias=>typeof alias!=='string')))throw Error('模板 tableAliases 无效');sourceData.tableAliases=[...new Set([...(aliases||[]),authored])]}
     if (!document[key].seedRows && Array.isArray(document[key]._seedRows)) document[key].seedRows = document[key]._seedRows
     delete document[key]._seedRows
   }

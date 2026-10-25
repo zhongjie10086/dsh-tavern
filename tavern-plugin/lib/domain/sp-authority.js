@@ -1,6 +1,7 @@
 import {originalSpTableFields,originalSp129MaterialFields,originalSp129CarrierFields,originalSp129RecoveryFields} from './sp-original-fields.js'
 import {createHash,randomUUID} from 'node:crypto'
 import {publicSpTables,validateTableData} from './sp-database.js'
+import {finishJsonDraft} from './json-draft.js'
 
 const clone=value=>structuredClone(value)
 const stable=value=>Array.isArray(value)?value.map(stable):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,stable(value[key])])):value
@@ -126,11 +127,11 @@ function check(chat,request,{initial=false}={}){
  return state
 }
 function cache(chat,data){
- const current=chat.spDatabase||{version:1,revision:0,locks:{},settings:{},snapshots:[]}
+ const current=finishJsonDraft(chat.spDatabase)||{version:1,revision:0,locks:{},settings:{},snapshots:[]}
  const next=clone(data)
  // The original API omits the native allocator. Preserve it only for unchanged
  // sheets, never copy a counter onto a changed original schema or row set.
- for(const [key,sheet]of Object.entries(next))if(key.startsWith('sheet_')&&sheet&&spAuthorityStamp({[key]:sheet})===spAuthorityStamp({[key]:current.data?.[key]})&&current.data?.[key]?._dshLastRowId!==undefined)sheet._dshLastRowId=current.data[key]._dshLastRowId
+ for(const [key,sheet]of Object.entries(next))if(key.startsWith('sheet_')&&sheet&&current.data?.[key]&&spAuthorityStamp({[key]:sheet})===spAuthorityStamp({[key]:current.data?.[key]}))next[key]=current.data[key]
  if(spAuthorityStamp(current.data||{})!==spAuthorityStamp(next))chat.spDatabase={...current,data:next,revision:(current.revision||0)+1}
  else if(!chat.spDatabase)chat.spDatabase={...current,data:next}
 }
@@ -177,9 +178,9 @@ export function publishSpAuthorityCache(chat,request){
  // every first publication after a claim) has not *changed* scope: the scope is
  // recorded, but the cache revision only advances for different tables or for a
  // scope that differs from a recorded one.
- const stamp=spAuthorityStamp(data),recordedScope=chat.spDatabase?.isolationCode
+ const rawSp=finishJsonDraft(chat.spDatabase),stamp=spAuthorityStamp(data),recordedScope=rawSp?.isolationCode
  const scopeUnrecorded=typeof request.isolationCode==='string'&&recordedScope!==request.isolationCode,scopeChanged=scopeUnrecorded&&recordedScope!==undefined
- if(!scopeUnrecorded&&state.phase==='ready'&&state.cacheStamp===stamp&&spAuthorityStamp(chat.spDatabase?.data||{})===stamp)return {revision:state.revision,cacheRevision:chat.spDatabase.revision,stamp,unchanged:true};
+ if(!scopeUnrecorded&&state.phase==='ready'&&state.cacheStamp===stamp&&spAuthorityStamp(rawSp?.data||{})===stamp)return {revision:state.revision,cacheRevision:chat.spDatabase.revision,stamp,unchanged:true};
  const cacheRevision=chat.spDatabase?.revision||0;cache(chat,data);if(scopeUnrecorded){chat.spDatabase.isolationCode=request.isolationCode;if(scopeChanged&&chat.spDatabase.revision===cacheRevision)chat.spDatabase.revision++;}state.phase='ready';state.cacheStamp=stamp;state.revision++
  if(state.claim){state.migration.receipt=clone(state.claim);delete state.claim}
  return {revision:state.revision,cacheRevision:chat.spDatabase.revision,stamp:state.cacheStamp}

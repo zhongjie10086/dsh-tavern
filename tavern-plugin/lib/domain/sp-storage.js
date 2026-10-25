@@ -27,7 +27,7 @@ export function createSpStorageStore(journal, { dataRoot, readOnly = false }) {
   const denyWrite=()=>{throw Error('SP storage is read-only')}
   const decoded = new WeakMap()
   const archives=createProfileDataStore({dataRoot}),writtenLayers=new Set();
-  async function archiveLayers(value){if(!value||typeof value!=='object')return;const records=value.layerRecords?.checkpoints;if(records)for(const [hash,payload]of Object.entries(records)){if(!/^[a-f0-9]{64}$/.test(hash))throw new Error('楼层记录标识损坏');if(payload?.spLayerArchive)continue;if(createHash('sha256').update(JSON.stringify(payload)).digest('hex')!==hash)throw new Error('楼层记录内容损坏');if(!writtenLayers.has(hash)){const encoded=await encodeSpFloorArchive(payload,archives);await archives.updateJson('sp-floor-archives/'+hash+'.json',async current=>{if(current){await decodeSpFloorArchive(current,hash,archives.readReadonly);return undefined}return encoded});writtenLayers.add(hash);if(writtenLayers.size>1024)writtenLayers.delete(writtenLayers.values().next().value)}records[hash]={spLayerArchive:hash};}for(const [k,child]of Object.entries(value))if(!['layerRecords','data','templateData','guideData','vectorIndex'].includes(k))await archiveLayers(child);if(Array.isArray(value.snapshots))for(const snapshot of value.snapshots)if(snapshot.layerRecords){snapshot.layerRecords={...snapshot.layerRecords};delete snapshot.layerRecords.checkpoints}}
+  async function archiveLayers(value){if(!value||typeof value!=='object')return;const records=value.layerRecords?.checkpoints;if(records)for(const [hash,payload]of Object.entries(records)){if(!/^[a-f0-9]{64}$/.test(hash))throw new Error('楼层记录标识损坏');if(payload?.spLayerArchive)continue;if(createHash('sha256').update(JSON.stringify(payload)).digest('hex')!==hash)throw new Error('楼层记录内容损坏');if(!writtenLayers.has(hash)){const encoded=await encodeSpFloorArchive(payload,archives);await archives.updateJson('sp-floor-archives/'+hash+'.json',async current=>{if(current){await decodeSpFloorArchive(current,hash,archives.readReadonly);return undefined}return encoded});writtenLayers.add(hash);if(writtenLayers.size>1024)writtenLayers.delete(writtenLayers.values().next().value)}records[hash]={spLayerArchive:hash};}for(const [k,child]of Object.entries(value))if(!['layerRecords','data','templateData','guideData','vectorIndex'].includes(k))await archiveLayers(child);if(Array.isArray(value.snapshots))for(const snapshot of value.snapshots)if(snapshot.layerRecords&&Object.hasOwn(snapshot.layerRecords,'checkpoints')){snapshot.layerRecords={...snapshot.layerRecords};delete snapshot.layerRecords.checkpoints}}
   async function archiveVectors(value){
     if(!value||typeof value!=='object')return
     if(value.vectorIndex?.documents)value.vectorIndex=await persistSpVectorIndex(value.vectorIndex,archives)
@@ -99,8 +99,15 @@ export function createSpStorageStore(journal, { dataRoot, readOnly = false }) {
     for (const checkpoint of chat.timeline?.checkpoints || []) if (checkpoint.before?.spDatabase) await visit(checkpoint.before.spDatabase)
     return finishJsonDraft(chat)
   }
+  function hasSqliteSnapshot(value) {
+    if (!value || typeof value !== 'object') return false
+    if (value.data && Object.hasOwn(value.data, 'spSqliteSnapshot')) return true
+    for (const [key, child] of Object.entries(value)) if (key !== 'data' && hasSqliteSnapshot(child)) return true
+    return false
+  }
   async function decode(input) {
     if (!input) return input
+    if (!hasSqliteSnapshot(input.spDatabase) && !(input.timeline?.checkpoints || []).some(checkpoint => hasSqliteSnapshot(checkpoint.before?.spDatabase))) return input
     const chat = copySpBranches(input)
     if (chat === input) return input
     async function visit(value) {
@@ -151,7 +158,7 @@ export function createSpStorageStore(journal, { dataRoot, readOnly = false }) {
     },
     read: async id => mutableJsonDraft(await decode(await journal.read(id))),
     readRevision: async (id, revision) => mutableJsonDraft(await decode(await journal.readRevision(id, revision))),
-    update: async (id, mutation, metadata) => {if(readOnly)denyWrite();const saved=await decode(await journal.update(id, async stored => encode(await mutation(mutableJsonDraft(await decode(stored)))), metadata));return metadata?.readonlyResult?freezeJson(saved):mutableJsonDraft(saved)},
+    update: async (id, mutation, metadata) => {if(readOnly)denyWrite();const raw=await journal.update(id, async stored => encode(await mutation(mutableJsonDraft(await decode(stored)))), metadata);const saved=await decode(raw);if(metadata?.readonlyResult){const frozen=freezeJson(saved);if(raw&&typeof raw==='object')decoded.set(raw,frozen);return frozen}return mutableJsonDraft(saved)},
     close: async () => { if(!readOnly){if(connection)(await connection).close();connection=null;return}const pending=connection;connection=null;if(pending){const sql=await pending.catch(()=>null);sql?.close()} }
   }
 }

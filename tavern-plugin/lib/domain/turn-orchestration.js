@@ -3,6 +3,7 @@ import { personaFrameInput } from './play-management.js'
 import { inputAttachments } from './player-input-content.js'
 import { scriptPromptFrameInputs, consumeScriptPrompts } from './tavern-script-prompts.js'
 import { openingCommandPrompt, consumeOpeningCommandPrompt, settleOpeningCommandPrompt } from './opening-command.js'
+import { bindManualMvuNotice, manualMvuPrompt, commitManualMvuNotice } from './manual-mvu-edit.js'
 import { effectiveGamePreset, resolveGamePreset, adviceFrameInput } from './st-game-features.js'
 import { databaseState, databaseRecall } from './sp-database.js'
 import { rememberTavernResources } from './workspace-resources.js'
@@ -303,6 +304,9 @@ export function createTurnOrchestrator(options) {
       chat = begun.chat
       foregroundOperation = begun.value
       const operation=chat.timeline.operations[foregroundOperation.operationId]
+      bindManualMvuNotice(chat,{turn,requestId})
+      operation.manualMvuRequestId=requestId
+      chatChanged=true
       operation.runtimeRandomSeed ||= requestId?JSON.stringify([chat.id,operation.basedOn.branchId,requestId]):operation.id
       const cachedFrame = rememberedFrame(chat, foregroundOperation.operationId)
       if (cachedFrame !== null) {
@@ -414,7 +418,7 @@ export function createTurnOrchestrator(options) {
       basedOnRevision: foregroundOperation.basedOn.revision,
       operationId: foregroundOperation.operationId,
       turn,
-      inputs: foregroundFrameInputs(plan, userText, runtimeUserText, resolved.snapshot, chat, plot, options.databaseEnabled?.(chat)!==false,options.promptLimits),
+      inputs: [...foregroundFrameInputs(plan, userText, runtimeUserText, resolved.snapshot, chat, plot, options.databaseEnabled?.(chat)!==false,options.promptLimits), ...(requestId&&manualMvuPrompt(chat,requestId)?[{kind:'foreground.current-state',text:manualMvuPrompt(chat,requestId).content,required:true,source:{stage:'manual-mvu-edit'}}]:[])],
       source: { ...source, ...(openingCommandPrompt(chat) ? { openingCommandPrompt: openingCommandPrompt(chat) } : {}), ...(sceneWorldbook ? { sceneWorldbook } : {}) }
     })
     consumeOpeningCommandPrompt(chat, frame.source.openingCommandPrompt, { turn, requestId })
@@ -447,6 +451,8 @@ export function createTurnOrchestrator(options) {
     const begun = timeline.apply({ chat, intent: { kind: 'body.begin', turn, userText } })
     chat = begun.chat
     const operation = chat.timeline.operations[begun.value.operationId]
+    bindManualMvuNotice(chat,{turn,requestId})
+    operation.manualMvuRequestId=requestId
     operation.runtimeRandomSeed ||= requestId?JSON.stringify([chat.id,operation.basedOn.branchId,requestId]):operation.id
     if (operation && !Object.hasOwn(operation, 'sceneWorldbook') && typeof options.captureSceneWorldbook === 'function') {
       operation.sceneWorldbook = await options.captureSceneWorldbook(chat, await store.readCard(cardPathOf(chat)))
@@ -482,6 +488,14 @@ export function createTurnOrchestrator(options) {
       chat.cardName = result.card.name
     }
     if (chat.pendingCardChanges) delete chat.pendingCardChanges[String(input.turn)]
+    const turn = Math.max(0, Number(input.turn) || 0)
+    if (turn) {
+      // A later no-op save in the same turn must not erase an earlier write.
+      const previous = Number(chat.lastCardSave?.turn) === turn ? chat.lastCardSave : null
+      chat.lastCardSave = { turn, path: chat.cardPath,
+        createsCard: !cardPath || previous?.createsCard === true,
+        changed: result.changed === true || previous?.changed === true }
+    }
     await store.writeChat(chat, { source: 'card.save' })
     return { saved: true, mode: 'card', changed: result.changed, createsCard: !cardPath, changedFields: result.changedFields || [] }
   }
@@ -577,18 +591,20 @@ export function createTurnOrchestrator(options) {
     }
     if (assistantText === '') throw new Error('本轮最终回复为空，无法保存酒馆状态')
     const stage = takeStage(chat, turn)
+    const savedThisTurn = Number(chat.lastCardSave?.turn) === turn ? chat.lastCardSave : null
+    const savedChanged = savedThisTurn !== null && (savedThisTurn.changed === true || savedThisTurn.createsCard === true)
 
     const cardPath = cardPathOf(chat)
     if (mode === 'card' && cardPath === '') {
       const state = object(chat.workspace)
-      let changed = false
+      let changed = savedChanged
       const hasCardChanges = Object.keys(object(stage.fields)).length > 0
       if (hasCardChanges) {
         const draftChange = cards.update({ kind: 'draft', card: object(state.draft), player: state.player, patch: stage.fields })
         state.draft = draftChange.card
         state.player = draftChange.player
         chat.workspace = state
-        changed = draftChange.changed
+        changed = draftChange.changed || changed
       }
       const created = hasCardChanges ? await store.createCard(chat, state) : null
       if (created !== null) {
@@ -615,13 +631,13 @@ export function createTurnOrchestrator(options) {
     }
 
     if (mode === 'card') {
-      let changed = false
+      let changed = savedChanged
       let savedCard = { name: chat.cardName }
       if (Object.keys(object(stage.fields)).length > 0 || (Array.isArray(stage.rawOperations) && stage.rawOperations.length > 0)) {
         const result = await store.updateCard(cardPath, object(stage.fields), {
           ts: now(), instruction: userText, summary: '通过卡片模式设定对话更新人物卡'
         }, Array.isArray(stage.rawOperations) ? stage.rawOperations : [])
-        changed = result.changed
+        changed = result.changed || changed
         savedCard = result.card
       }
       workspace.commit(chat, turn)
@@ -715,12 +731,13 @@ export function createTurnOrchestrator(options) {
             // Timeline owns its transaction; the merged remainder also carries deletions.
             for(const key of Object.keys(draft))if(key!=='timeline'&&!Object.hasOwn(merged,key))delete draft[key]
             Object.assign(draft,merged)
+            commitManualMvuNotice(draft,{turn,requestId})
           }
         })
         if (committed.value.status !== 'committed') throw new Error('正文生成期间剧情状态已变化，本轮结果已作废')
         return committed.chat
       }, metadata)
-    } else await store.writeChat(chat, metadata)
+    } else {commitManualMvuNotice(chat,{turn,requestId});await store.writeChat(chat, metadata)}
     if (typeof options.afterCommit === 'function') options.afterCommit(chat)
     return { saved: true, mode, changed: false, chatId: chat.id, cardName: chat.cardName, reply }
   }

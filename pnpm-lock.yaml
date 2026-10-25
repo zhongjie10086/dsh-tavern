@@ -5,8 +5,8 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
-  dsh-better-sidebar@0.17.1: 2f7eb3b8b51f54533dfb6800af1f5d1c384515060b3b3b057d4dc8a7e76b15d0
-  dsh-web-mobile@2.3.0: 8988461b23999ee4b0d392bf2049a57dc7d8e6d5d2f02e93b2ae77e5018415d9
+  dsh-better-sidebar@0.17.1: cc3af4b97e14e26c379770fa342a0dd06da3765ac0aaa214e3bbe0a47be74d60
+  dsh-web-mobile@2.3.0: 7f5400f69418c97b9572cc4880a4cf1997a0a40ad659a3dcbdf02031269f73ce
   playwright-core@1.62.1: d63b94f6b1719b0dab92a3f64671eb7ece52f2f6320da1da8e5151f02eb81ab4
 
 importers:
@@ -27,7 +27,7 @@ importers:
         version: 11.2.0
       dsh-better-sidebar:
         specifier: 0.17.1
-        version: 0.17.1(patch_hash=2f7eb3b8b51f54533dfb6800af1f5d1c384515060b3b3b057d4dc8a7e76b15d0)
+        version: 0.17.1(patch_hash=cc3af4b97e14e26c379770fa342a0dd06da3765ac0aaa214e3bbe0a47be74d60)
       dsh-tavern-plugin:
         specifier: link:./tavern-plugin
         version: link:tavern-plugin
@@ -36,7 +36,7 @@ importers:
         version: link:tavern-plugin/packages/dsh-tavern-remote
       dsh-web-mobile:
         specifier: 2.3.0
-        version: 2.3.0(patch_hash=8988461b23999ee4b0d392bf2049a57dc7d8e6d5d2f02e93b2ae77e5018415d9)
+        version: 2.3.0(patch_hash=7f5400f69418c97b9572cc4880a4cf1997a0a40ad659a3dcbdf02031269f73ce)
       ejs:
         specifier: 3.1.9
         version: 3.1.9
@@ -567,20 +567,19 @@ packages:
     engines: {node: '>=20'}
     peerDependencies:
       '@deepseek-ai/cordis': ^4.0.1
-      '@deepseek-ai/dsh-agent': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-locale': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-ui-conversation': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-ui-primitives': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-ui-settings': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-ui-slots': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-host-webserver': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-invariants': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-llm': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-session': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-settings': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-subagent': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-tools': ^0.1.0-rc.8 || 0.2.0-rc.2
-      '@deepseek-ai/schemastery': '>=3.18.0 <4'
+      '@deepseek-ai/dsh-agent': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-client-locale': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-client-ui-conversation': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-client-ui-primitives': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-client-ui-settings': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-client-ui-slots': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-host-webserver': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-invariants': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-llm': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-session': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-settings': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-subagent': ^0.1.0-rc.8
+      '@deepseek-ai/dsh-tools': ^0.1.0-rc.8
       '@huanlin/dsh-plugin-better-locale': ^0.1.0
       react: ^18.2.0
       react-dom: ^18.2.0
@@ -592,15 +591,15 @@ packages:
     resolution: {integrity: sha512-MGPMviYkC2X4IAvnjRo7voCPv1mA7ZtgoOlNP6ea6taUW91E1RZyiSxYiySub9dThcdHZElDgTG08Zlj+LRanQ==}
     peerDependencies:
       '@deepseek-ai/cordis': ^4.0.1
-      '@deepseek-ai/dsh-client-locale': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-runtime': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-ui-conversation': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-ui-layout': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-ui-primitives': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-ui-settings': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-ui-sidebar': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-client-ui-slots': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0 || 0.2.0-rc.2
-      '@deepseek-ai/dsh-session-log-export': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || 0.2.0-rc.2
+      '@deepseek-ai/dsh-client-locale': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0
+      '@deepseek-ai/dsh-client-runtime': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0
+      '@deepseek-ai/dsh-client-ui-conversation': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0
+      '@deepseek-ai/dsh-client-ui-layout': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0
+      '@deepseek-ai/dsh-client-ui-primitives': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0
+      '@deepseek-ai/dsh-client-ui-settings': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0
+      '@deepseek-ai/dsh-client-ui-sidebar': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0
+      '@deepseek-ai/dsh-client-ui-slots': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0 || >=0.1.2-a <0.2.0
+      '@deepseek-ai/dsh-session-log-export': ^0.1.0-rc.6 || >=0.1.1-rc.0 <0.2.0
       react: ^18.2.0
     peerDependenciesMeta:
       '@deepseek-ai/dsh-client-ui-primitives':
@@ -1499,7 +1498,7 @@ snapshots:
     optionalDependencies:
       '@types/trusted-types': 2.0.7
 
-  dsh-better-sidebar@0.17.1(patch_hash=2f7eb3b8b51f54533dfb6800af1f5d1c384515060b3b3b057d4dc8a7e76b15d0):
+  dsh-better-sidebar@0.17.1(patch_hash=cc3af4b97e14e26c379770fa342a0dd06da3765ac0aaa214e3bbe0a47be74d60):
     dependencies:
       '@codemirror/commands': 6.11.0
       '@codemirror/lang-cpp': 6.0.3
@@ -1535,7 +1534,7 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  dsh-web-mobile@2.3.0(patch_hash=8988461b23999ee4b0d392bf2049a57dc7d8e6d5d2f02e93b2ae77e5018415d9): {}
+  dsh-web-mobile@2.3.0(patch_hash=7f5400f69418c97b9572cc4880a4cf1997a0a40ad659a3dcbdf02031269f73ce): {}
 
   ejs@3.1.9:
     dependencies:

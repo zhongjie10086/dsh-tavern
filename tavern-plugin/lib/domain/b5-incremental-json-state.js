@@ -104,11 +104,11 @@ export function createIncrementalJsonState({read,write,decodedCacheBytes=0,decod
   return {ref:await s.put({type:array?'array':'object',size:keys.length,nextOrder:keys.length,entries:items.length?await bucket(s,items):null})}
  }
  async function decode(s,link,cacheResult=true){
-  if(own(link,'value'))return link.value
+  if(own(link,'value'))return link.value!==null&&typeof link.value==='object'?copyJsonTree(link.value):link.value
   const previous=decodedCache.get(link.ref)
   if(previous)return copyJsonTree(previous.value)
   const node=await s.get(link.ref)
-  if(node.type==='scalar'){if(cacheResult)rememberDecoded(link.ref,node.value);return node.value}
+  if(node.type==='scalar'){if(cacheResult)rememberDecoded(link.ref,node.value);return node.value!==null&&typeof node.value==='object'?copyJsonTree(node.value):node.value}
   if(!['object','array'].includes(node.type))throw fail('Corrupt state value')
   const value=node.type==='array'?[]:{}
   for(const [key,child] of (await entries(s,node.entries)).sort((a,b)=>a[2]-b[2])){

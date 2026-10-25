@@ -1,6 +1,7 @@
 import { fork } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { parseDDLTableName, parseDDLColumnNames } from '../vendor/sp-database/ddl-utils.js'
+import {spSqlAliasBindings,bindSpSqlMutationTarget} from './sp-sql-aliases.js'
 
 const quote = value => '"' + String(value).replaceAll('"', '""') + '"'
 export const SP_SQL_LIMITS = Object.freeze({ timeoutMs:30000, maxInputBytes:32*1024*1024, maxOutputBytes:32*1024*1024, maxCellBytes:512*1024, maxRows:100000, maxSqlBytes:128*1024, sqliteHeapBytes:256*1024*1024, maxPages:65536, jsHeapMiB:256 })
@@ -33,7 +34,7 @@ function positionalCount(sql) {
   for(const token of sqlTokens(sql))if(token.char==='?'){const match=/^\d+/.exec(sql.slice(token.index+1));count=match?Math.max(count,Number(match[0])):count+1}
   return count
 }
-export function spSqlSchema(data) {
+export function spSqlSchema(data,{tableAliases={}}={}) {
   return Object.keys(data).filter(key=>key.startsWith('sheet_')).map(key=>{
     const sheet=data[key],source=String(sheet.sourceData?.ddl||'').trim(),name=source?parseDDLTableName(source):key
     if(!name)throw new Error(sheet.name+' 的 DDL 表名无法解析')
@@ -42,7 +43,12 @@ export function spSqlSchema(data) {
     const ddl=source||'CREATE TABLE '+quote(name)+' ('+columns.map((column,index)=>quote(column)+(index===0&&column==='row_id'?' INTEGER PRIMARY KEY':' TEXT')).join(', ')+')'
     const statements=splitSqlStatements(ddl)
     if(statements.length!==1||verb(statements[0])!=='CREATE'||!/^CREATE\s+TABLE\s/i.test(statements[0].replace(/^\s*--[^\n]*\n/g,'')))throw new Error('模板 DDL 必须是单条 CREATE TABLE')
-    return {key,name,columns,ddl:statements[0]}
+    if(sheet.sourceData?.tableAliases!==undefined&&!Array.isArray(sheet.sourceData.tableAliases))throw Error(sheet.name+' 的 tableAliases 无效')
+    if(tableAliases[key]!==undefined&&!Array.isArray(tableAliases[key]))throw Error(sheet.name+' 的模板别名绑定无效')
+    const declared=[...(sheet.sourceData?.tableAliases||[]),...(tableAliases[key]||[])]
+    if(declared!==undefined&&(!Array.isArray(declared)||declared.length>128||declared.some(alias=>typeof alias!=='string'||!alias.trim()||alias.length>256||alias.includes('\0'))))throw Error(sheet.name+' 的 tableAliases 无效')
+    const aliases=[...new Set([key,sheet.uid,...(declared||[])].filter(alias=>typeof alias==='string'&&alias.trim()).map(alias=>alias.trim()))]
+    return {key,name,columns,ddl:statements[0],aliases}
   })
 }
 function checkCell(value,limit){if(typeof value==='string'&&Buffer.byteLength(value)>limit)throw budgetError('单元格大小超限');if(ArrayBuffer.isView(value)&&value.byteLength>limit)throw budgetError('单元格大小超限')}
@@ -72,7 +78,7 @@ export async function runSpSql(data,source,options={}) {
     child.on('error',finish);child.on('exit',(code,signal)=>finish(budgetError('执行进程退出 ('+(signal||code)+')，未提交')))
     child.on('message',message=>message.error?finish(Object.assign(new Error(message.error.message),{code:message.error.code})):finish(null,message.result))
     options.signal?.addEventListener('abort',abort,{once:true});if(options.signal?.aborted)return abort()
-    child.send({data,source:String(source),options:{mutate:options.mutate===true,parameters,allowedSheets:options.allowedSheets,discardUnauthorizedTables:options.discardUnauthorizedTables===true,...limits}},error=>{if(error)finish(error)})
+    child.send({data,source:String(source),options:{mutate:options.mutate===true,parameters,allowedSheets:options.allowedSheets,tableAliases:options.tableAliases,discardUnauthorizedTables:options.discardUnauthorizedTables===true,...limits}},error=>{if(error)finish(error)})
   })}finally{release()}
 }
 
@@ -82,7 +88,8 @@ export async function executeSpSqlWorker(data,source,options={}) {
   checkInput(data,source,limits)
   const {DatabaseSync,constants:c}=await import('node:sqlite'),db=new DatabaseSync(':memory:',{enableForeignKeyConstraints:false,allowExtension:false})
   if(typeof db.setAuthorizer!=='function'){db.close();throw Error('SQL 功能需要 Node.js 24.10 或更高版本；表格编辑仍可使用。')}
-  const schema=spSqlSchema(data),names=new Set(schema.map(t=>t.name.toLowerCase())),warnings=[]
+  const schema=spSqlSchema(data,{tableAliases:options.tableAliases}),names=new Set(schema.map(t=>t.name.toLowerCase())),warnings=[]
+  const bindings=spSqlAliasBindings(schema)
   if(names.size!==schema.length){db.close();throw Error('模板包含重复的 SQL 表名')}
   let phase='hydrate',statementReads=new Set(),statementWrites=new Set()
   const allowedNames=allowedSheets?new Set(schema.filter(t=>allowedSheets.includes(t.key)).map(t=>t.name.toLowerCase())):null
@@ -92,10 +99,10 @@ export async function executeSpSqlWorker(data,source,options={}) {
       if([c.SQLITE_ATTACH,c.SQLITE_DETACH,c.SQLITE_CREATE_VTABLE,c.SQLITE_DROP_VTABLE].includes(action))return c.SQLITE_DENY
       if(action===c.SQLITE_FUNCTION&&['load_extension','readfile','writefile'].includes(String(arg2||arg1).toLowerCase()))return c.SQLITE_DENY
       if(phase!=='execute')return c.SQLITE_OK
-      if(action===c.SQLITE_READ)statementReads.add(String(arg1).toLowerCase())
+      if(action===c.SQLITE_READ)statementReads.add((bindings.aliases.get(String(arg1).toLowerCase())||String(arg1)).toLowerCase())
       if([c.SQLITE_INSERT,c.SQLITE_UPDATE,c.SQLITE_DELETE].includes(action))statementWrites.add(String(arg1).toLowerCase())
       if(action===c.SQLITE_SELECT||action===c.SQLITE_FUNCTION)return c.SQLITE_OK
-      if(action===c.SQLITE_READ&&names.has(String(arg1).toLowerCase()))return c.SQLITE_OK
+      if(action===c.SQLITE_READ&&(names.has(String(arg1).toLowerCase())||bindings.aliases.has(String(arg1).toLowerCase())))return c.SQLITE_OK
       if(mutate&&[c.SQLITE_INSERT,c.SQLITE_UPDATE,c.SQLITE_DELETE].includes(action)&&names.has(String(arg1).toLowerCase()))return c.SQLITE_OK
       return c.SQLITE_DENY
     })
@@ -112,6 +119,9 @@ export async function executeSpSqlWorker(data,source,options={}) {
       let last=Number(data[table.key]._dshLastRowId)||0;for(const row of data[table.key].content.slice(1))if(Number.isSafeInteger(Number(row[0])))last=Math.max(last,Number(row[0]));table.last=last
       if(table.auto){db.prepare('UPDATE sqlite_sequence SET seq=? WHERE name=?').run(last,table.name);if(!db.prepare('SELECT 1 FROM sqlite_sequence WHERE name=?').get(table.name))db.prepare('INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)').run(table.name,last)}
     }
+    // Read aliases use native SQLite name resolution, including JOIN/CTE/quoted
+    // identifiers. Writes are rebound to the real table, never INSTEAD OF triggers.
+    for(const [alias,physical]of bindings.aliases)db.exec('CREATE VIEW '+quote(alias)+' AS SELECT * FROM main.'+quote(physical))
     const statements=splitSqlStatements(source)
     if(!statements.length||statements.length>200||(!mutate&&statements.length!==1))throw Error('SQL 语句数量无效')
     if(statements.some(sql=>!(mutate?['INSERT','UPDATE','DELETE']:['SELECT']).includes(verb(sql))))throw Error(mutate?'只允许 INSERT、UPDATE 和 DELETE':'查询只允许一条 SELECT')
@@ -126,8 +136,9 @@ export async function executeSpSqlWorker(data,source,options={}) {
       const iterator=invoke(statement,'iterate',values);for(const row of iterator){if(rows.length>=limit){limited=true;break}for(const cell of Object.values(row))checkCell(cell,limits.maxCellBytes);bytes+=Buffer.byteLength(JSON.stringify(row));if(bytes>limits.maxOutputBytes)throw budgetError('查询结果大小超限');rows.push({...row})}verifyRemaining();result={rows,limited}
     }else{
       let changes=0
-      for(const [index,sql]of statements.entries()){
-        statementReads=new Set();statementWrites=new Set();const statement=db.prepare(sql),values=binding(sql,index)
+      for(const [index,sourceSql]of statements.entries()){
+        const sql=bindSpSqlMutationTarget(sourceSql,bindings)
+        statementReads=new Set();statementWrites=new Set();const statement=db.prepare(sql),values=binding(sourceSql,index)
         if(allowedNames&&[...statementWrites].some(n=>!allowedNames.has(n))){if(discardUnauthorizedTables&&statementWrites.size&&[...statementWrites,...statementReads].every(n=>!allowedNames.has(n)))continue;throw Error('SQL 涉及未选择的表格或跨表操作')}
         changes+=Number(invoke(statement,'run',values).changes)
       }

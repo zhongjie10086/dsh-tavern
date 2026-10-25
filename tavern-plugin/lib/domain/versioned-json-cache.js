@@ -14,5 +14,6 @@ export function createVersionedJsonCache({maxBytes=64*1024*1024,maxEntries=32}={
   }
   throw Error('资源正在连续修改，请稍后重试')
  }
- return{read,stats:()=>({entries:entries.size,bytes,hits,loads})}
+ function invalidate(key){const entry=entries.get(key);if(entry){bytes-=entry.bytes;entries.delete(key)}}
+ return{read,invalidate,stats:()=>({entries:entries.size,bytes,hits,loads})}
 }

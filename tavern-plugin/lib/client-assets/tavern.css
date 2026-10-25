@@ -113,6 +113,12 @@
 /* Legacy card resizers may write an inline height larger than the host slot. */
 .dsh-tavern-message-frame-slot > iframe:not([aria-hidden="true"]) { max-height: 100% !important; }
 .dsh-tavern-message-frame { display: block; width: 100%; min-height: 48px; border: 0; background: transparent; overflow: hidden; }
+/* Apply saved browser reading preferences only to Tavern-owned prose. Without
+   the marker, native Markdown/theme defaults and embedded controls stay intact. */
+body[data-dsh-tavern-reading-spacing] :is(.dsh-tavern-plain-text,.dsh-migration-input-line,.dsh-tavern-colored-markdown,.dsh-tavern-colored-markdown > *, .dsh-tavern-colored-markdown :where(p,li,blockquote,td,th)) {
+  line-height: var(--dsh-content-line-height, inherit);
+  letter-spacing: var(--dsh-content-letter-spacing, inherit);
+}
 /* Z96: shown over a card's opening while it waits for MVU; clicks still reach the card. */
 .dsh-tavern-frame-wait-notice { position: absolute; left: 50%; top: 50%; z-index: 2; transform: translate(-50%, -50%); box-sizing: border-box; max-width: calc(100% - 24px); padding: 8px 14px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary); font-size: 13px; line-height: 18px; text-align: center; box-shadow: 0 4px 16px rgba(0, 0, 0, .18); pointer-events: none; }
 .dsh-tavern-status-runtime { width: 100%; min-width: 0; margin: 0 0 10px; overflow: hidden; border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; background: var(--dsw-alias-bg-base); }
@@ -330,6 +336,26 @@ body.dsh-tavern-shell-active [data-ref-chip="file"] { max-width: calc(100% - 4px
 .dsh-tavern-preset-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; margin-top: 8px; }
 .dsh-tavern-preset-detail-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 14px; }
 .dsh-tavern-preset-detail { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px 24px; }
+/* U4 uses one scrolling page; its cards never become nested flex scrollers. */
+.dsh-tavern-usability { height: 100%; min-height: 0; box-sizing: border-box; overflow: auto; padding: 16px; color: var(--dsw-alias-label-primary); background: var(--dsw-specific-sidebar-fill); }
+.dsh-tavern-usability-card { display: grid; align-content: start; gap: 12px; flex: none; min-width: 0; overflow: visible; box-sizing: border-box; padding: 16px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-base, var(--dsw-specific-sidebar-fill)); font-size: 13px; line-height: 1.6; }
+.dsh-tavern-usability-card + .dsh-tavern-usability-card { margin-top: 16px; }
+.dsh-tavern-usability-card :is(h3,p,pre) { margin: 0; }
+.dsh-tavern-usability-card h3 { font-size: 15px; line-height: 1.5; font-weight: 650; }
+.dsh-tavern-usability-card :is(p,small,pre) { overflow-wrap: anywhere; }
+.dsh-tavern-usability-card small { color: var(--dsw-alias-label-secondary); }
+.dsh-tavern-usability-card pre { white-space: pre-wrap; }
+.dsh-tavern-usability-card > .dsh-tavern-btn { justify-self: start; }
+.dsh-tavern-usability-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.dsh-tavern-usability-card :is(input:not([type="checkbox"]),select,textarea) { box-sizing: border-box; width: 100%; min-width: 0; padding: 7px 9px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; background: var(--dsw-specific-input-major); color: inherit; font: inherit; }
+.dsh-tavern-usability-card textarea { resize: vertical; }
+.dsh-tavern-usability-number-fields { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%,110px),1fr)); gap: 12px; }
+.dsh-tavern-usability-checks,.dsh-tavern-usability-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; min-width: 0; }
+.dsh-tavern-usability-check { display: inline-flex; align-items: flex-start; gap: 7px; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.dsh-tavern-usability-check input { flex: none; margin: 4px 0 0; }
+.dsh-tavern-usability-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.dsh-tavern-usability-fieldset legend { margin-bottom: 8px; }
+.dsh-tavern-usability-import-item { display: grid; gap: 10px; min-width: 0; padding: 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; }
 .dsh-tavern-preset-summary { margin-bottom: 10px; padding: 9px 10px; border: 1px solid rgba(166,107,53,.35); border-radius: 9px; background: rgba(166,107,53,.08); color: var(--dsw-alias-label-secondary); font-size: 11px; line-height: 1.5; }
 .dsh-tavern-external-preset-notice { padding: 14px 16px; font-size: 14px; line-height: 1.7; }
 .dsh-tavern-external-preset-notice p { margin: 4px 0 0; }
@@ -1091,6 +1117,8 @@ html.dsh-tavern-hide-process [data-chat-flow-kind="context"],
 html.dsh-tavern-hide-process [data-chat-flow-kind="system-prompt"],
 html.dsh-tavern-hide-process .dsh-tavern-assistant-reasoning,
 html.dsh-tavern-hide-process [data-chat-flow-kind="turn-process"]:has([data-turn-process-tool-calls="0"][data-turn-process-subagents="0"]) { display: none !important; }
+/* Story memory remains inspectable even when ordinary process injections are hidden. */
+html.dsh-tavern-hide-process [data-chat-flow-kind="context"]:has(.dsh-tavern-story-summary) { display: block !important; }
 
 /* Guide library (upstream 2a5aea0d and follow-ups). */
 .dsh-tavern-guide-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }

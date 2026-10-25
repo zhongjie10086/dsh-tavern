@@ -5,11 +5,14 @@ const nameOf = path => path.split('/').pop().replace(/\.json$/i,'')
 // SillyTavern 1.18 openai.js sensitiveFields. Only the native connection
 // envelope is projected; prompt text and unknown extension data stay intact.
 const sensitiveFields=['reverse_proxy','proxy_password','custom_url','custom_include_body','custom_exclude_body','custom_include_headers','vertexai_region','vertexai_express_project_id','azure_base_url','azure_deployment_name','workers_ai_account_id']
+export function omitNativePresetConnectionFields(value) {
+ const document=structuredClone(value)
+ for(const field of sensitiveFields)delete document[field]
+ return document
+}
 function project(preset,omitSensitive) {
  if(!omitSensitive)return preset
- const document=structuredClone(preset.document)
- for(const field of sensitiveFields)delete document[field]
- return {...preset,document}
+ return {...preset,document:omitNativePresetConnectionFields(preset.document)}
 }
 /** Native ST documents are retained losslessly. Named library edits never mutate a game's snapshot. */
 export function createNativePresetLibrary({presets,chats,store,assertOwner,remove,isBusy=()=>false}) {

@@ -1,6 +1,7 @@
 import {isDeepStrictEqual} from 'node:util'
 import {createHash,randomUUID} from 'node:crypto'
 import {exportSillyTavernWorldBook,inspectWorldBookDocument} from './worldbook-resource.js'
+import {finishJsonDraft} from './json-draft.js'
 const copy=value=>structuredClone(value)
 export const worldbookSourceKey=source=>source?.resourceId|| (source?.kind==='card'?'card:'+source.cardPath:source?.kind==='chat'?'chat:'+source.id:'standalone:'+source?.path)
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -11,7 +12,7 @@ function apply(object,patch){const result=copy(object);for(const [key,row]of Obj
 export function privateWorldbookState(chat){return chat.worldbookState||{version:1,revision:0,books:{},bindings:{}}}
 /** Public content is a base. Automatic writes only record this chat's changes. */
 export function projectPrivateWorldbook(chat,source,live){
- const key=worldbookSourceKey(source),local=privateWorldbookState(chat).books[key]
+ const key=worldbookSourceKey(source),local=finishJsonDraft(privateWorldbookState(chat)).books[key]
  if(local?.deleted)return null
  if(!live&&!local)return null
  const base=native(live?.document??live?.view?.raw??local.base),publicEntries=apply(base.entries,local?.entries),entries={},sourceUids={},aliases={...local?.aliases}
@@ -24,20 +25,36 @@ export function projectPrivateWorldbook(chat,source,live){
  }
  for(const [uid,value]of Object.entries(additions))entries[uid]=copy(value)
  const document={...apply(meta(base),local?.metadata),entries}
- return {source:copy(source),document,view:inspectWorldBookDocument(document),baseDocument:base,localChatId:chat.id,privateKey:key,sourceUids,aliases}
+ return {source:copy(source),document,view:inspectWorldBookDocument(document),baseDocument:local?.base&&isDeepStrictEqual(local.base,base)?local.base:base,localChatId:chat.id,privateKey:key,sourceUids,aliases}
 }
 export function storePrivateWorldbook(chat,record,requested){
  if(!record?.source)throw Error('世界书缺少来源')
- const document=native(requested),base=native(record.baseDocument??record.document??record.view?.raw)
- const state=copy(privateWorldbookState(chat)),key=worldbookSourceKey(record.source),previous=state.books[key]
+ const currentState=finishJsonDraft(privateWorldbookState(chat)),state={...currentState,books:{...currentState.books}},key=worldbookSourceKey(record.source),previous=state.books[key]
+ const document=native(requested)
+ let base,baseDigest
+ if(previous?.base&&previous.baseDigest&&record.baseDocument===previous.base){
+  base=previous.base;baseDigest=previous.baseDigest
+ }else{
+  const rawBase=native(record.baseDocument??record.document??record.view?.raw)
+  baseDigest=digest(rawBase)
+  base=previous?.base&&previous.baseDigest===baseDigest&&isDeepStrictEqual(previous.base,rawBase)?previous.base:rawBase
+ }
  const sourceUids=record.sourceUids||Object.fromEntries(Object.keys(base.entries).map(uid=>[uid,uid])),desiredPublic={},additions={}
  for(const [uid,value]of Object.entries(document.entries)){
   const original=sourceUids[uid]
   if(original!==undefined)desiredPublic[original]={...copy(value),uid:Number(original)}
-  else additions[uid]=copy(value)
+  else{
+   const nextValue=copy(value),prevAdd=previous?.additions?.[uid]
+   additions[uid]=prevAdd!==undefined&&isDeepStrictEqual(prevAdd,nextValue)?prevAdd:nextValue
+  }
  }
- const entry={source:copy(record.source),name:document.name||record.view?.displayName||previous?.name||'',base,baseDigest:digest(base),entries:difference(base.entries,desiredPublic),additions,aliases:copy(record.aliases||previous?.aliases||{}),metadata:difference(meta(base),meta(document)),...(previous?.created?{created:true}:{})}
- if(isDeepStrictEqual(previous,entry))return false
+ const entries=difference(base.entries,desiredPublic)
+ for(const [k,row]of Object.entries(entries))if(Object.hasOwn(row,'value')&&previous?.entries?.[k]?.value!==undefined&&isDeepStrictEqual(previous.entries[k].value,row.value))entries[k]=previous.entries[k]
+ const sameEntries=Boolean(previous?.entries)&&Object.keys(entries).length===Object.keys(previous.entries).length&&Object.keys(entries).every(k=>entries[k]===previous.entries[k]||(entries[k]?.deleted===true&&previous.entries[k]?.deleted===true))
+ const sameAdditions=Boolean(previous?.additions)&&Object.keys(additions).length===Object.keys(previous.additions).length&&Object.keys(additions).every(u=>additions[u]===previous.additions[u])
+ const rawAliases=copy(record.aliases||previous?.aliases||{}),rawMetadata=difference(meta(base),meta(document))
+ const entry={source:previous?.source&&isDeepStrictEqual(previous.source,record.source)?previous.source:copy(record.source),name:document.name||record.view?.displayName||previous?.name||'',base,baseDigest,entries:sameEntries?previous.entries:entries,additions:sameAdditions?previous.additions:additions,aliases:previous?.aliases&&isDeepStrictEqual(previous.aliases,rawAliases)?previous.aliases:rawAliases,metadata:previous?.metadata&&isDeepStrictEqual(previous.metadata,rawMetadata)?previous.metadata:rawMetadata,...(previous?.created?{created:true}:{})}
+ if(previous&&!previous.deleted&&entry.source===previous.source&&entry.name===previous.name&&entry.base===previous.base&&entry.baseDigest===previous.baseDigest&&entry.entries===previous.entries&&entry.additions===previous.additions&&entry.aliases===previous.aliases&&entry.metadata===previous.metadata&&Boolean(entry.created)===Boolean(previous.created))return false
  state.books[key]=entry;state.revision++;chat.worldbookState=state;chat.cardContextSnapshotVersion=0;delete chat.preparedWorldBook;return true
 }
 export function createPrivateWorldbook(chat,name,document){
@@ -45,8 +62,9 @@ export function createPrivateWorldbook(chat,name,document){
  storePrivateWorldbook(chat,record,{...document,name});chat.worldbookState.books[worldbookSourceKey(source)].created=true;return source
 }
 export function deletePrivateWorldbook(chat,source){
- const state=copy(privateWorldbookState(chat)),key=worldbookSourceKey(source)
- if(state.books[key]?.deleted)return false
+ const currentState=finishJsonDraft(privateWorldbookState(chat)),key=worldbookSourceKey(source)
+ if(currentState.books[key]?.deleted)return false
+ const state={...currentState,books:{...currentState.books}}
  state.books[key]={...state.books[key],source:copy(source),deleted:true};state.revision++;chat.worldbookState=state;chat.cardContextSnapshotVersion=0;delete chat.preparedWorldBook;return true
 }
 
@@ -84,6 +102,6 @@ export function storeMergedPrivateWorldbook(chat,record,document){
  for(const [uid,value]of Object.entries(requested.entries))if(!known.has(uid)){let id=uid;while(used.has(id))id=String(spare++);used.add(id);primary.entries[id]={...copy(value),uid:Number(id)}}
  Object.assign(primary,meta(requested));let changed=false
  for(let i=0;i<parts.length;i++)changed=storePrivateWorldbook(chat,record.mergedRecords[i],parts[i])||changed
- const state=copy(privateWorldbookState(chat));if(!isDeepStrictEqual(state.mergeUids,record.mergeUids)){state.mergeUids=copy(record.mergeUids);state.revision++;chat.worldbookState=state;changed=true}
+ const currentState=finishJsonDraft(privateWorldbookState(chat));if(!isDeepStrictEqual(currentState.mergeUids,record.mergeUids)){chat.worldbookState={...currentState,mergeUids:copy(record.mergeUids),revision:(currentState.revision||0)+1};changed=true}
  return changed
 }

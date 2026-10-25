@@ -53,9 +53,9 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
   return {ownerId:owner.id,capability,composerEpoch,sourceDigest:identity.sourceDigest,lifecycleRevision:identity.lifecycleRevision}
  }
  async function attach(args){
-  let remaining=91000,last=monotonicNow()
+  let remaining=91000,last=monotonicNow(),chargedAt=-Infinity
   const charge=async()=>{
-   const at=monotonicNow();let paused=false
+   const at=monotonicNow();if(at>=chargedAt&&at-chargedAt<250&&remaining>1000)return;chargedAt=at;let paused=false
    if(args.capability){const entry=await attachment(args,{starting:true});caller(args);if(attachments.get(args.capability)!==entry||entry.composerEpoch!==entry.owner.composerEpoch)throw error('等待期间界面连接已更换');paused=executor.owned.nativeDialogPending?.(args.sessionId)===true;if(paused&&executor.owned.keepNativeDialogAlive?.(args.sessionId)===false)throw error('原确认执行权已失效')}
    if(!paused)remaining-=Math.max(0,at-last);last=Math.max(last,at)
    if(remaining<=0)throw error('原插件初始化等待超时，原实例与任务保留')
@@ -63,8 +63,8 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
   const bounded=work=>new Promise((resolve,reject)=>{
    let timer,finished=false
    const finish=(ok,value)=>{if(finished)return;finished=true;clearTimeout(timer);ok?resolve(value):reject(value)}
-   const monitor=async()=>{try{await charge();if(!finished)timer=setTimeout(monitor,Math.min(1000,remaining))}catch(cause){finish(false,cause)}}
-   void monitor()
+   const monitor=async()=>{try{chargedAt=-Infinity;await charge();if(!finished)timer=setTimeout(monitor,Math.min(1000,remaining))}catch(cause){finish(false,cause)}}
+   timer=setTimeout(monitor,Math.min(1000,remaining))
    Promise.resolve().then(work).then(async value=>{try{await charge();finish(true,value)}catch(cause){finish(false,cause)}},cause=>finish(false,cause))
   })
   if(!args.capability){const prepared=await bounded(()=>prepare(args));args={...args,...prepared}}
@@ -76,7 +76,7 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
   const pendingSave=typeof saveRecoveryState==='function'?await bounded(()=>saveRecoveryState(args.sessionId,runtimeId)):null;
   if(pendingSave?.required===true){if(await bounded(()=>attachment(args))!==entry)throw error('保存恢复期间界面连接已变化');return {ready:false,recoveryRequired:true,quarantined:false,error:pendingSave.error||'SP 正文优化结果尚未确认保存，请仅重试保存。',ownerId:entry.ownerId,capability:args.capability,composerEpoch:entry.composerEpoch,executionOwner:runtimeId};}
   const inOwner=work=>bounded(()=>executor.withOwnedInstance(args.sessionId,context=>{if(context.runtimeId!==runtimeId||!isDeepStrictEqual(context.scope,identity))throw error('等待初始化期间原执行者或剧情身份已变化');return work(context.page)}))
-  if(args.refresh)await inOwner(page=>page.evaluate(()=>window.__dshBackgroundRefresh()))
+  if(args.refresh)await inOwner(page=>page.evaluate(expected=>window.__dshBackgroundRefresh(expected),args.expectedContextRevision))
   for(;;){
    if(await bounded(()=>attachment(args))!==entry)throw error('等待初始化期间界面连接已变化')
    const state=await inOwner(page=>page.evaluate(()=>window.__dshBackgroundEngine.ownedState()))
@@ -187,8 +187,8 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
   surfaces.set(id,row);return promise
  }
  async function surfaceRequests(args){
-  await attachment(args,{starting:true})
-  const identity=await scope(args.sessionId),requests=[];
+  const entry=await attachment(args,{starting:true})
+  const identity=entry.identity,requests=[];
   for(const row of surfaces.values())if(row.sessionId===args.sessionId&&isDeepStrictEqual(row.identity,identity)){
    if(row.viewerRuntimeId&&row.viewerRuntimeId!==args.runtimeId)continue;if(row.composerEpoch!==undefined&&row.composerEpoch!==attachments.get(args.capability)?.composerEpoch)continue;
    row.delivered=true;row.deliveredTo=args.runtimeId;if(row.operation?.kind==='composer'||row.operation?.kind==='slash')row.viewerRuntimeId=args.runtimeId;requests.push({id:row.id,operation:row.operation,lifecycleRevision:row.lifecycleRevision,...(row.composerEpoch===undefined?{}:{composerEpoch:row.composerEpoch})});
@@ -196,8 +196,8 @@ export function createTavernSpOwnerController({executor,dispatch,frontendDispatc
   return {requests}
  }
  async function surfaceComplete(args){
-  await attachment(args,{starting:true});const row=surfaces.get(args.id)
-  if(!row||row.sessionId!==args.sessionId||row.viewerRuntimeId&&row.viewerRuntimeId!==args.runtimeId||!isDeepStrictEqual(row.identity,await scope(args.sessionId)))throw error('实时显示回执已失效')
+  const entry=await attachment(args,{starting:true});const row=surfaces.get(args.id)
+  if(!row||row.sessionId!==args.sessionId||row.viewerRuntimeId&&row.viewerRuntimeId!==args.runtimeId||!isDeepStrictEqual(row.identity,entry.identity))throw error('实时显示回执已失效')
   if(row.composerEpoch!==undefined&&(args.composerEpoch!==row.composerEpoch||row.composerEpoch!==owners.get(args.sessionId)?.composerEpoch))throw error('输入框回执epoch已失效')
   finishSurface(row,args)
   return {completed:true}

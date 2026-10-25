@@ -6,12 +6,12 @@ function str(value) {
 
 // Own the candidate command lifecycle; mailbox and generator retain their data rules.
 export function createCandidateTasks({ chats, generator, backgroundTasks, sessions, prepareLegacy, now = Date.now }) {
-  const { read: readChat, write: writeChat, forSession: chatForSession } = chats
+  const { read: readChat, readReadonly: readChatReadonly = readChat, write: writeChat, forSession: chatForSession, forSessionReadonly: chatForSessionReadonly = chatForSession } = chats
   const candidateGenerator = generator
   const runtimeGeneration = sessions.runtimeGeneration
   const candidateTaskJobs = new Map()
   const taskMailbox = createDurableTaskMailbox({
-    store: { readChat, writeChat },
+    store: { readChat, readChatReadonly, writeChat },
     now,
     reconcile(chat, task) {
       if (task.kind !== 'candidate') return null
@@ -70,12 +70,13 @@ export function createCandidateTasks({ chats, generator, backgroundTasks, sessio
   }
 
   async function sessionSync(sessionId, selector = {}) {
-    const chat = await chatForSession(sessionId)
+    const initialChat = await chatForSessionReadonly(sessionId)
     const liveSession = sessions.isLive(str(sessionId))
-    if (chat === undefined) {
+    if (initialChat === undefined) {
       return { runtimeGeneration, liveSession, projectionRevision: 0, activity: null, mailboxVersion: 0, task: null, tasks: { candidate: null, background: null } }
     }
-    const synced = await taskMailbox.sync(chat.id, selector)
+    const synced = await taskMailbox.sync(initialChat.id, selector)
+    const chat = synced.chat || await readChatReadonly(initialChat.id) || initialChat
     let task = synced.task
     if (task === null && str(selector.kind) === 'candidate' && chat.candidates && typeof chat.candidates === 'object') {
       task = {
@@ -86,7 +87,7 @@ export function createCandidateTasks({ chats, generator, backgroundTasks, sessio
         createdAt: Number(chat.candidates.generatedAt) || 0, updatedAt: Number(chat.candidates.generatedAt) || 0
       }
     }
-    const activity = backgroundTasks.activity(await readChat(chat.id))
+    const activity = backgroundTasks.activity(chat)
     const backgroundTask = activity.operationId === '' ? null : {
       taskId: activity.operationId,
       requestId: '',

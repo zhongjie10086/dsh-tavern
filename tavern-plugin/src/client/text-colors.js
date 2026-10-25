@@ -7,27 +7,71 @@ function findTavernQuoteRanges(text) {
 function installTavernTextColors(root, options, findQuotes) {
     const doc = root.ownerDocument, win = doc.defaultView;
     if (!win.CSS || !win.CSS.highlights || typeof win.Highlight !== 'function') return { setEnabled() {}, setColors() {}, dispose() {} };
-    const prefix = 'dsh-tavern-text-' + Math.random().toString(36).slice(2);
     const colors = { 'quote-light': '#875000', 'quote-dark': '#edb75f', 'em-light': '#75529b', 'em-dark': '#bba4e3' };
-    const highlights = new Map();
-    const style = doc.createElement('style');
-    style.setAttribute('data-dsh-tavern-text-colors', '');
-    function setColors(overrides) {
-        style.textContent = Object.entries(colors).map(([kind, fallback]) => {
-            const value = overrides && overrides[kind.startsWith('quote') ? 'quote' : 'em'];
-            const color = typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value : fallback;
-            return '::highlight(' + prefix + '-' + kind + '){color:' + color + '}';
-        }).join('\n');
+    // Self-contained because HTML frames receive this function as source text.
+    // Equal palettes share four highlights; different callers retain their colors.
+    const shared = win.__dshTavernTextColors || (win.__dshTavernTextColors = { users: 0, groups: new Map(), nextGroup: 0, themed: new Set() });
+    function themeKey() {
+        return win.getComputedStyle(doc.documentElement).colorScheme + '|' + win.getComputedStyle(doc.body || doc.documentElement).color;
     }
-    setColors(options.colors);
-    doc.head.appendChild(style);
-    for (const kind of Object.keys(colors)) {
-        const highlight = new win.Highlight();
-        highlight.priority = kind.startsWith('quote') ? 2 : 1;
-        highlights.set(kind, highlight);
-        win.CSS.highlights.set(prefix + '-' + kind, highlight);
+    if (!shared.users++) {
+        shared.themeKey = themeKey();
+        shared.theme = new win.MutationObserver(function () {
+            const next = themeKey();
+            if (next === shared.themeKey) return;
+            shared.themeKey = next;
+            shared.themed.forEach(function (notify) { notify(); });
+        });
+        const attributes = { attributes: true, attributeFilter: ['style', 'class', 'data-ds-dark-theme', 'data-ds-theme-source', 'color-scheme'] };
+        shared.theme.observe(doc.documentElement, attributes);
+        if (doc.body) shared.theme.observe(doc.body, attributes);
+    }
+    let group;
+    const owned = [];
+    function releaseGroup(value) {
+        if (!value || --value.users) return;
+        for (const kind of Object.keys(colors)) win.CSS.highlights.delete(value.prefix + '-' + kind);
+        value.style.remove();
+        shared.groups.delete(value.key);
+    }
+    function setColors(overrides) {
+        if (disposed) return;
+        const resolved = Object.entries(colors).map(([kind, fallback]) => {
+            const value = overrides && overrides[kind.startsWith('quote') ? 'quote' : 'em'];
+            return [kind, typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value.toLowerCase() : fallback];
+        });
+        const key = JSON.stringify(resolved);
+        if (group?.key === key) return;
+        let next = shared.groups.get(key);
+        if (!next) {
+            const prefix = 'dsh-tavern-text-' + (++shared.nextGroup);
+            const style = doc.createElement('style'), highlights = new Map();
+            style.setAttribute('data-dsh-tavern-text-colors', '');
+            style.textContent = resolved.map(([kind, color]) => '::highlight(' + prefix + '-' + kind + '){color:' + color + '}').join('\n');
+            doc.head.appendChild(style);
+            for (const kind of Object.keys(colors)) {
+                const highlight = new win.Highlight();
+                highlight.priority = kind.startsWith('quote') ? 2 : 1;
+                highlights.set(kind, highlight);
+                win.CSS.highlights.set(prefix + '-' + kind, highlight);
+            }
+            next = { key, prefix, style, highlights, users: 0 };
+            shared.groups.set(key, next);
+        }
+        next.users++;
+        for (const [kind, range] of owned) {
+            group.highlights.get(kind).delete(range);
+            next.highlights.get(kind).add(range);
+        }
+        releaseGroup(group);
+        group = next;
+    }
+    function clearOwned() {
+        for (const [kind, range] of owned) group.highlights.get(kind).delete(range);
+        owned.length = 0;
     }
     let enabled = options.enabled !== false, disposed = false, timer = null;
+    setColors(options.colors);
     const excluded = 'script,style,textarea,input,select,button,a,code,pre,kbd,samp,svg,math,[hidden],[contenteditable]:not([contenteditable="false"]),[role="button"],[role="textbox"]';
     const blocks = 'p,div,li,td,th,blockquote,section,article,h1,h2,h3,h4,h5,h6';
     function explicitColor(element) {
@@ -59,11 +103,12 @@ function installTavernTextColors(root, options, findQuotes) {
     function add(kind, entry, start, end) {
         const range = doc.createRange();
         range.setStart(entry.node, start); range.setEnd(entry.node, end);
-        highlights.get(kind + '-' + entry.palette).add(range);
+        group.highlights.get(kind + '-' + entry.palette).add(range);
+        owned.push([kind + '-' + entry.palette, range]);
     }
     function refresh() {
         timer = null;
-        for (const highlight of highlights.values()) highlight.clear();
+        clearOwned();
         if (disposed || !enabled) return;
         const walker = doc.createTreeWalker(root, 4); // SHOW_TEXT; never edit React/card-owned DOM.
         let group = [], block = null, text = '';
@@ -91,8 +136,8 @@ function installTavernTextColors(root, options, findQuotes) {
     function schedule() { if (!disposed && enabled && timer === null) timer = win.setTimeout(refresh, 32); }
     const observer = new win.MutationObserver(schedule);
     observer.observe(root, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['style', 'class', 'color', 'hidden'] });
-    if (doc.documentElement !== root) observer.observe(doc.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
-    // Batch mounts before reading computed styles; each message adds a stylesheet.
+    shared.themed.add(schedule);
+    // Batch mounts before reading computed styles.
     schedule();
     return {
         setColors,
@@ -101,12 +146,13 @@ function installTavernTextColors(root, options, findQuotes) {
             if (timer !== null) win.clearTimeout(timer);
             timer = null;
             if (enabled) schedule();
-            else for (const highlight of highlights.values()) highlight.clear();
+            else clearOwned();
         },
         dispose() {
+            if (disposed) return;
             disposed = true; observer.disconnect(); if (timer !== null) win.clearTimeout(timer);
-            for (const kind of highlights.keys()) win.CSS.highlights.delete(prefix + '-' + kind);
-            style.remove();
+            clearOwned(); releaseGroup(group); shared.themed.delete(schedule);
+            if (!--shared.users) { shared.theme.disconnect(); shared.theme = null; }
         }
     };
 }

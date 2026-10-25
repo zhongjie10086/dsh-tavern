@@ -1,6 +1,6 @@
 import { projectAgentContent } from './runtime-content-projection.js'
 import { freezeJson, isFrozenJson } from './readonly-json.js'
-import { immutableJsonSnapshot } from './json-draft.js'
+import { immutableJsonSnapshot, mutableJsonDraft, finishJsonDraft } from './json-draft.js'
 const readonlyContexts=new WeakMap()
 const readonlyRows=new WeakMap()
 const readonlyMessageLists=new WeakMap()
@@ -71,9 +71,10 @@ export function projectTavernHelperContext(chat,{readonly=false}={}) {
     if (!source || typeof source !== 'object') continue
     const messageId = messages.length
     const cacheKey=JSON.stringify([messageId,chat.cardName,chat.macroState?.userName])
-    const cached=readonly&&isFrozenJson(source)?readonlyRows.get(source)?.get(cacheKey):null
+    const sourceKey=isFrozenJson(source)?source:finishJsonDraft(source)
+    const cached=isFrozenJson(sourceKey)?readonlyRows.get(sourceKey)?.get(cacheKey):null
     if(cached){
-      messages.push(cached)
+      messages.push(readonly?cached:mutableJsonDraft(cached))
       const turn=Math.max(0,Number(source.turn)||(source.greeting===true?1:0))
       if(cached.role==='assistant'&&turn>0)turnMessageIds[String(turn)]=messageId
       continue

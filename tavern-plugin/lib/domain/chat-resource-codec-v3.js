@@ -1,5 +1,5 @@
 import {createProfileDataStore} from '../profile-data-store.js'
-import {immutableJsonSnapshot} from './json-draft.js'
+import {finishJsonDraft,immutableJsonSnapshot} from './json-draft.js'
 import {createContentResourceStore,contentReference} from './content-resource-store.js'
 import {createResourceVersionStorage} from './resource-version-storage.js'
 
@@ -85,5 +85,6 @@ export function createChatResourceCodecV3({dataRoot,store=createProfileDataStore
   return visit(value,[],false,false,readContext())
  }
  async function encodeChatIncremental(value,base,encoded){return {$dshVersionedChat:1,_storageRevision:value?._storageRevision,value:await visit(value,[],true,true,{reuse:true,base,encoded})}}
- return Object.freeze({encodeChat,encodeChatIncremental,decodeChat,encodeChanges:rows=>changes(rows,true),decodeChanges:rows=>changes(rows,false),logical:value=>{const next={...value};delete next.resolvedRuntimePreset;return immutableJsonSnapshot(next)}})
+ const logical=value=>{const next={...value};delete next.resolvedRuntimePreset;return immutableJsonSnapshot(next)}
+ return Object.freeze({encodeChat,encodeChatIncremental,decodeChat,encodeChanges:rows=>changes(rows,true),decodeChanges:rows=>changes(rows,false),serializeLogical(value){if(this.logical!==logical)return JSON.stringify(this.logical(value));const next={...value};delete next.resolvedRuntimePreset;return JSON.stringify(finishJsonDraft(next))},logical})
 }

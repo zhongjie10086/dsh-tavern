@@ -224,12 +224,15 @@ export function createChatPersistence(options = {}) {
     for(const [key]of baselines)if(key.startsWith(id+':'))revisions.push(Number(key.slice(id.length+1)))
     return revisions
   })
-  function remember(chat) {
+  let lastSaved
+  function remember(chat, rawSource = lastSaved) {
+    lastSaved = undefined
     if (!chat || typeof chat !== 'object') return chat
     const revision = Math.max(0, Number(chat[STORAGE_REVISION]) || 0)
     if(chat[STORAGE_REVISION]!==revision)chat={...chat,[STORAGE_REVISION]:revision}
     const snapshot=immutableJsonSnapshot(chat)
     cacheBaseline(snapshot.id + ':' + revision, snapshot)
+    if (rawSource && Object.isFrozen(rawSource)) normalizedViews.set(rawSource, snapshot)
     return track(mutableJsonDraft(snapshot))
   }
 
@@ -289,6 +292,7 @@ export function createChatPersistence(options = {}) {
         : Math.max(Number(latest.updatedAt) || 0, Number(desired.updatedAt) || 0)
       return next
     }, {...metadata,readonlyResult:true})
+    lastSaved = saved
     const normalized = remember(normalize(clone(saved)))
     if (merged !== undefined) refreshDraft(input, desired, merged)
     input[STORAGE_REVISION] = normalized[STORAGE_REVISION]
@@ -314,6 +318,7 @@ export function createChatPersistence(options = {}) {
       next.updatedAt = touchUpdatedAt ? Math.max(Number(next.updatedAt) || 0, now()) : Math.max(0, Number(next.updatedAt) || 0)
       return next
     }, {...metadata,readonlyResult:true})
+    lastSaved = saved
     return saved === undefined ? undefined : remember(normalize(clone(saved)))
   }
 

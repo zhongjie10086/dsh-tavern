@@ -122,9 +122,8 @@ export function createBackgroundAgentTask(options) {
   }
 
   function setupFor(state, descriptor, appendDescriptor) {
-    const backgroundPersona = state.input.task === 'phone'
-      ? '你是与故事正文隔离的手机私聊 Agent。你只代表指定联系人回复当前手机消息，不推进正文、不修改状态，也不把私聊虚构成已经发生的现场剧情。'
-      : '你是与前台正文生成隔离的酒馆后台 Agent。你会在同一个剧情分支中依次承担状态结算与候选生成，并可在任务确有需要时加载人物设计 Skill；严格按每轮末尾追加的任务协议输出，不得把某类任务的输出格式混入另一类任务。最新权威状态优先于 Session 中的旧动态状态。'
+    const phonePersona = '你是与故事正文隔离的手机私聊 Agent。你只代表指定联系人回复当前手机消息，不推进正文、不修改状态，也不把私聊虚构成已经发生的现场剧情。'
+    const backgroundPersona = '你是与前台正文生成隔离的酒馆后台 Agent。你会在同一个剧情分支中依次承担状态结算与候选生成，并可在任务确有需要时加载人物设计 Skill；严格按每轮末尾追加的任务协议输出，不得把某类任务的输出格式混入另一类任务。最新权威状态优先于 Session 中的旧动态状态。'
     let descriptorAppended = !appendDescriptor
     return async function (childCtx) {
       if (setupAgent !== null) await setupAgent(childCtx)
@@ -174,8 +173,11 @@ export function createBackgroundAgentTask(options) {
         complete: true,
         // DSH restores complete sections after the assembly waterfall, so the
         // additional instruction must be part of this authoritative text.
-        text: () => {
-          const assembly = { sections: [{ name: 'deployment:persona', text: state.input.task === 'image' ? readSceneImageSystemInstruction() : backgroundPersona }] }
+        text: context => {
+          const fixed = sessionStablePrefixSections(context?.agent?.session)
+          const sections = state.currentWorldbook === undefined ? fixed : withCurrentWorldbook(fixed, state.currentWorldbook)
+          const persona = state.input.task === 'image' ? readSceneImageSystemInstruction() : state.input.task === 'phone' ? phonePersona : backgroundPersona
+          const assembly = { sections: [{ name: 'deployment:persona', text: persona }, ...sections] }
           return prependSystemInstruction(assembly, options.systemAppend?.()).sections.map(section => section.text).join('\n\n')
         }
       })
@@ -206,8 +208,6 @@ export function createBackgroundAgentTask(options) {
       refreshRestriction()
       childCtx.on('system-prompt/assemble', async function (_assembly, _context, next) {
         const assembly = await next()
-        const sections = [...(assembly.sections || []), ...sessionStablePrefixSections(_context?.agent?.session)]
-        assembly.sections = state.currentWorldbook === undefined ? sections : withCurrentWorldbook(sections, state.currentWorldbook)
         prependSystemInstruction(assembly, options.systemAppend?.())
         if (state.input.task === 'phone') {
           assembly.sections = (assembly.sections || []).filter(function (section) {
@@ -408,7 +408,7 @@ export function createBackgroundAgentTask(options) {
         const revision = typeof options.resolveStablePrefixRevision === 'function' ? await options.resolveStablePrefixRevision(input) : 0
         const background = existing && revision <= Number(existing.message.source.cardContextRevision || 0) ? existing.text : typeof options.resolveStablePrefix === 'function'
           ? await options.resolveStablePrefix(input) : input.backgroundContext
-        const prefix = await ensureSessionStablePrefix(agent.session, background, options.stablePrefixStorage, revision)
+        const prefix = await ensureSessionStablePrefix(agent.session, background, options.stablePrefixStorage, revision, { surface: false })
         if (prefix && prefix.event !== existing?.event && typeof options.flushSession === 'function') await options.flushSession(agent.session)
       }
       state.currentWorldbook = typeof options.resolveCurrentWorldbook === 'function'

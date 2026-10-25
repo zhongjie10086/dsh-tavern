@@ -63,6 +63,10 @@ export function createContentResourceStore(store){
    }
    return expand?freezeJson(Object.fromEntries(entries)):undefined
   }
+  if(expand&&object(result)&&Object.isFrozen(result)){
+   if(!encoded.has(result))encoded.set(result,new Map())
+   encoded.get(result).set('',ref)
+  }
   return expand?result:undefined
  }
  const load=(ref,ancestors=new Set(),reads=new Map())=>visit(ref,ancestors,reads,true)

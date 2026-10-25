@@ -44,7 +44,7 @@ export function createPageChatRecords({dataRoot,pageRoot='chats-v4',resourceCode
   for(const [revision,ref]of Object.entries(value.revisionRoots))if(!/^\d+$/.test(revision)||!Number.isSafeInteger(Number(revision))||!/^([a-f0-9]{64})$/.test(ref))throw failure('Invalid page revision map')
   return value
  }
- const tree=id=>createIncrementalJsonState({read:ref=>store.readRecord(id,ref),write:()=>{throw Error('Readonly page tree')}})
+ const tree=id=>{const records=new Map();return createIncrementalJsonState({read:ref=>{if(!records.has(ref))records.set(ref,store.readRecord(id,ref));return records.get(ref)},write:()=>{throw Error('Readonly page tree')}})}
  async function pin(chatId,snapshotId){
   const id=canonicalChatId(chatId),head=await store.readHead(id,{snapshotId})
   if(!head||head.metadata?.kind!=='tavern-chat-records-v1'||head.metadata.chatId!==id||!Number.isSafeInteger(head.metadata.storageRevision)||!Array.isArray(head.metadata.keys))throw failure('Missing or invalid selected Chat root')
@@ -58,7 +58,7 @@ export function createPageChatRecords({dataRoot,pageRoot='chats-v4',resourceCode
  }
  function wrapped(pinned,body){return pinned.head.metadata.resourceEncoding===3?{$dshVersionedChat:1,_storageRevision:pinned.storageRevision,value:body}:body}
  async function decode(pinned,body){const value=wrapped(pinned,body);return codec?codec.decodeChat(value):body}
- async function readSnapshot(chatId,snapshotId){
+ async function readSnapshot(chatId,snapshotId,baseSnapshot){
   const pinned=await pin(chatId,snapshotId),reader=tree(pinned.id),header=await reader.get(pinned.head.state.headerRef),refs=await messageRefs(pinned),messages=[]
   for(const ref of refs)messages.push(await reader.get(ref))
   const body={};for(const key of pinned.head.metadata.keys)own(body,key,key==='messages'?messages:header[key])
@@ -66,8 +66,22 @@ export function createPageChatRecords({dataRoot,pageRoot='chats-v4',resourceCode
   if(pageDigest(JSON.stringify(encoded))!==pinned.head.metadata.encodedSha256)throw failure('Encoded Chat closure hash mismatch')
   const chat=await decode(pinned,body);requiredChatStorageContract(chat)
   if(chat?._storageRevision!==pinned.storageRevision||canonicalChatId(chat.id)!==pinned.id)throw failure('Decoded Chat identity mismatch')
-  const snapshot=freezeJson(chat)
-  snapshotProofs.set(snapshot,{id:pinned.id,snapshotId:pinned.snapshotId,encoding:pinned.head.metadata.resourceEncoding,headerRef:pinned.head.state.headerRef,body,messages:messages.map((message,index)=>({digest:pageDigest(JSON.stringify(message)),ref:refs[index]}))})
+  let snapshot=freezeJson(chat)
+  // Full graph/resource verification above is always independent of identity
+  // reuse. Only the builtin decoder has this path-local JSON tree contract.
+  const prior=resourceCodec===undefined?snapshotProofs.get(baseSnapshot):undefined
+  if(prior?.id===pinned.id&&prior.encoding===pinned.head.metadata.resourceEncoding&&Array.isArray(snapshot.messages)&&Array.isArray(baseSnapshot.messages)){
+   let reusedMessageCount=0
+   const retainedMessages=snapshot.messages.map((message,index)=>{
+    if(prior.messages[index]?.ref!==refs[index])return message
+    reusedMessageCount++;return baseSnapshot.messages[index]
+   })
+   const sameList=reusedMessageCount===snapshot.messages.length&&snapshot.messages.length===baseSnapshot.messages.length
+   if(reusedMessageCount||sameList){
+    snapshot=freezeJson({...snapshot,messages:sameList?baseSnapshot.messages:retainedMessages})
+   }
+  }
+  snapshotProofs.set(snapshot,{id:pinned.id,snapshotId:pinned.snapshotId,encoding:pinned.head.metadata.resourceEncoding,headerRef:pinned.head.state.headerRef,body,messages:messages.map((message,index)=>prior?.id===pinned.id&&prior.messages[index]?.ref===refs[index]?prior.messages[index]:{digest:pageDigest(JSON.stringify(message)),ref:refs[index]})})
   return snapshot
  }
  function captureChanges(baseSnapshot,value){
@@ -109,9 +123,9 @@ export function createPageChatRecords({dataRoot,pageRoot='chats-v4',resourceCode
   await buffered.flush([headerRef,...refs])
   const metadata={kind:'tavern-chat-records-v1',chatId:id,storageRevision:value._storageRevision,keys,resourceEncoding:codec?3:0,encodedSha256:pageDigest(JSON.stringify(encoded))}
   const previous=await store.readHead(id),verifyBeforePublish=async snapshotId=>{
-   const restored=await readSnapshot(id,snapshotId)
-   const expected=codec?codec.logical(value):value
-   if(JSON.stringify(restored)!==JSON.stringify(expected))throw failure('Page Chat roundtrip differs')
+   const restored=await readSnapshot(id,snapshotId,reuse?baseSnapshot:undefined)
+   const expected=codec?.serializeLogical?codec.serializeLogical(value):JSON.stringify(codec?codec.logical(value):value)
+   if(JSON.stringify(restored)!==expected)throw failure('Page Chat roundtrip differs')
    await beforePublish?.({snapshotId})
   }
   let result
@@ -122,9 +136,9 @@ export function createPageChatRecords({dataRoot,pageRoot='chats-v4',resourceCode
    result=await store.commit(id,{expectedRevision:previous.revision,state:{headerRef},metadata,edits,truncateTo:common,append:refs.slice(common).map(ref=>({ref}))},{verifyBeforePublish})
   }
   // A construction head is not authoritative until the caller publishes route.
-  const snapshot=await readSnapshot(id,result.snapshotId)
-  const expected=codec?codec.logical(value):value
-  if(JSON.stringify(snapshot)!==JSON.stringify(expected))throw failure('Page Chat final roundtrip differs')
+  const snapshot=await readSnapshot(id,result.snapshotId,reuse?baseSnapshot:undefined)
+  const expected=codec?.serializeLogical?codec.serializeLogical(value):JSON.stringify(codec?codec.logical(value):value)
+  if(JSON.stringify(snapshot)!==expected)throw failure('Page Chat final roundtrip differs')
   return Object.defineProperty({...result,storageRevision:value._storageRevision},'snapshot',{value:snapshot})
  }
  async function publish(chatId,value){await mkdir(path.dirname(routePath(chatId)),{recursive:true});await writePageAuthority(files,routePath(chatId),value)}

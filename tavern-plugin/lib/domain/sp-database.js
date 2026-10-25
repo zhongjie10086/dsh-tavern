@@ -8,6 +8,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { mergeConcurrentFields } from './chat-persistence.js'
 import { runSpSql, spSqlSchema } from './sp-sql.js'
+import {archivedSpTableAliases} from './sp-template-aliases.js'
 import { SP_DEFAULT_SETTINGS, normalizeDatabaseSettings } from './sp-plot-config.js'
 import { contextForFill } from './sp-context-rules.js'
 import { executeSpPlot } from './sp-plot-runtime.js'
@@ -322,6 +323,7 @@ export function createSpDatabase({ chats, generate, books, loadLayer, sqlLimits=
     state.summaryArchives = (state.summaryArchives || []).map(({ sheet, at }) => ({ sheet, at }))
     state.basis = { database: state.revision, branch: chat.timeline?.branchId || '', story: Number(chat.timeline?.revision) || 0 }
     state.management=spDataManagement(chat,state)
+    state.sqlTableAliases=archivedSpTableAliases(chat,state.data,state.isolationCode)
     delete state.layerRecords;delete state.isolationSpaces;delete state.dormant
     state.snapshots = (state.snapshots || []).filter(s=>(s.isolation||"main")===(state.isolationCode||"main")).map(({ data, locks, fillProgress, templateData,guideData,settings,dormant,layerRecords, ...metadata }) => metadata)
     return state
@@ -354,7 +356,7 @@ export function createSpDatabase({ chats, generate, books, loadLayer, sqlLimits=
     else if(command.kind==='replace')data=validateTableData(command.data)
     else if(command.kind==='sql'){
       let result
-      try{result=await runSpSql(state.data,command.sql,{...sqlLimits,mutate:true,parameters:command.parameters||[]})}
+      try{result=await runSpSql(state.data,command.sql,{...sqlLimits,mutate:true,parameters:command.parameters||[],tableAliases:archivedSpTableAliases(chat,state.data,state.isolationCode)})}
       catch(error){throw originalSqlFailure(error,command.sql,state.data)}
       data=validateTableData(result.data);changes=result.changes
     }
@@ -389,7 +391,7 @@ export function createSpDatabase({ chats, generate, books, loadLayer, sqlLimits=
         state.data = data
       }
       else if (command.kind === 'sql') {
-        const result = await runSpSql(state.data, command.sql, { ...sqlLimits,mutate: true, parameters: command.parameters || [] })
+        const result = await runSpSql(state.data, command.sql, { ...sqlLimits,mutate: true, parameters: command.parameters || [],tableAliases:archivedSpTableAliases(current,state.data,state.isolationCode) })
         validateTableData(result.data); assertTableLocks(state.data, result.data, state.locks)
         changes=result.changes
         if(isDeepStrictEqual(state.data,result.data))return undefined
@@ -544,7 +546,7 @@ export function createSpDatabase({ chats, generate, books, loadLayer, sqlLimits=
           try {
             result = sqlMode ? null : JSON.parse(raw)
             if (!sqlMode && (!object(result) || !Array.isArray(result.operations) || result.operations.some(op => !op || !['insert', 'update', 'delete'].includes(op.kind) || !selected.includes(op.sheet)))) throw new Error('填表结果含不允许的操作或未选择的表格')
-            candidate = sqlMode ? (/^--[^\n]*$/.test(raw) ? state.data : (await runSpSql(state.data, raw, { ...sqlLimits,mutate: true, allowedSheets:selected, discardUnauthorizedTables:state.settings.fill.discardUnauthorizedSql })).data) : applyTableOperations(state.data, result.operations, state.locks)
+            candidate = sqlMode ? (/^--[^\n]*$/.test(raw) ? state.data : (await runSpSql(state.data, raw, { ...sqlLimits,mutate: true, allowedSheets:selected, discardUnauthorizedTables:state.settings.fill.discardUnauthorizedSql,tableAliases:archivedSpTableAliases(chat,state.data,state.isolationCode) })).data) : applyTableOperations(state.data, result.operations, state.locks)
             validateTableData(candidate); assertTableLocks(state.data, candidate, state.locks)
             if (sheetKeys(state.data).some(key => !selected.includes(key) && !isDeepStrictEqual(state.data[key], candidate[key]))) throw new Error('填表结果修改了未选择的表格')
             break
@@ -714,8 +716,8 @@ export function createSpDatabase({ chats, generate, books, loadLayer, sqlLimits=
   async function cancelPlot(sessionId) { const chat = await resolve(sessionId), job = plotJobs.get(chat.id); job?.controller.abort(new Error('用户停止召回与推进')); return { cancelled: Boolean(job) } }
 
   async function query(sessionId, sql, parameters) {
-    const state = databaseState(await resolve(sessionId))
-    return await runSpSql(state.data, sql, { ...sqlLimits,parameters: parameters || [] })
+    const chat=await resolve(sessionId),state = databaseState(chat)
+    return await runSpSql(state.data, sql, { ...sqlLimits,parameters: parameters || [],tableAliases:archivedSpTableAliases(chat,state.data,state.isolationCode) })
   }
   async function maintenance(sessionId, kind, execute, options = {}) {
     const chat = await resolve(sessionId), state = databaseState(chat)

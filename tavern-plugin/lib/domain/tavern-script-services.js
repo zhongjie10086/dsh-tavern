@@ -2,16 +2,17 @@ import {applySpVectorFlushTask} from './sp-vector-flush-store.js'
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { spSqlSchema } from './sp-sql.js'
+import {archivedSpTableAliases} from './sp-template-aliases.js'
 import { checkScriptStorageBudget, scriptStorageLimits } from './script-storage-budget.js'
 // One original table whose DDL no longer matches its header (an earlier template
 // state an undo can restore) must not take the whole session view down. Such a
 // table has no SQL view; the others keep theirs and the snapshot says why.
-function snapshotSchema(data) {
-  try { return { schema: spSqlSchema(data) } } catch (error) {
+function snapshotSchema(data,tableAliases) {
+  try { return { schema: spSqlSchema(data,{tableAliases}) } } catch (error) {
     const schema = [], schemaErrors = [], names = new Set()
     for (const key of Object.keys(data || {}).filter(key => key.startsWith('sheet_'))) {
       try {
-        for (const table of spSqlSchema({ [key]: data[key] })) {
+        for (const table of spSqlSchema({ [key]: data[key] },{tableAliases})) {
           if (names.has(table.name.toLowerCase())) { schemaErrors.push(table.name + ' 与其他表重名'); continue }
           names.add(table.name.toLowerCase()); schema.push(table)
         }
@@ -20,8 +21,9 @@ function snapshotSchema(data) {
     return { schema, schemaErrors: schemaErrors.length ? schemaErrors : [String(error?.message || error)] }
   }
 }
-export function scriptDatabaseSnapshot(state) {
-  const { schema, schemaErrors } = snapshotSchema(state.data), dataRevision = createHash('sha256').update(JSON.stringify([state.data, schema])).digest('hex')
+export function scriptDatabaseSnapshot(state,{chat}={}) {
+  const aliases=chat?archivedSpTableAliases(chat,state.data,state.isolationCode):state.sqlTableAliases
+  const { schema, schemaErrors } = snapshotSchema(state.data,aliases), dataRevision = createHash('sha256').update(JSON.stringify([state.data, schema])).digest('hex')
   return { revision: state.revision, dataRevision, data: structuredClone(state.data), settings: structuredClone(state.settings), schema, ...(schemaErrors ? { schemaErrors } : {}), activity: structuredClone(state.activity || null) }
 }
 const SP_VECTOR_QUEUE_KEY='__dsh_internal_sp129_vector_flush_v1'

@@ -33,8 +33,8 @@ export function createB5ShadowPageStore({root,onIO=()=>{},linkFile=link,promotio
  function cachePacked(dir,id,value,size){
   const key=dir+'/'+id,old=packed.get(key)
   if(old){packedBytes-=old.size;packed.delete(key)}
-  while(packed.size&&packedBytes+size>8*1024*1024){const oldest=packed.keys().next().value;packedBytes-=packed.get(oldest).size;packed.delete(oldest)}
-  if(size<=8*1024*1024){packed.set(key,{value,size});packedBytes+=size}
+  while(packed.size&&packedBytes+size>16*1024*1024){const oldest=packed.keys().next().value;packedBytes-=packed.get(oldest).size;packed.delete(oldest)}
+  if(size<=16*1024*1024){packed.set(key,{value,size});packedBytes+=size}
  }
  function decodeBlock(dir,id,bytes,batch){
   const digest=hash(bytes),remembered=batch?.entries.get(digest)

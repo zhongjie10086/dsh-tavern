@@ -1,4 +1,5 @@
 import {applyWorldSimulationProjection} from './sp-world-simulation-projection.js'
+import { validateManualMvuEdit, stageManualMvuNotice } from './manual-mvu-edit.js'
 import {cardMvuContextIdentity} from './card-mvu-work-identity.js'
 import { resourceSaveSummary, observeResourceSave } from './resource-save-summary.js'
 import { templateInputView, persistTemplateInputView } from './full-prompt-template-input.js'
@@ -139,7 +140,8 @@ export function createTavernScriptHostAdapter(options = {}) {
     })
   }
 
-  async function updateVariables(sessionId, option, variables, expectedLifecycleRevision, eventId, expectedVariables, mutationMode) {
+  async function updateVariables(sessionId, option, variables, expectedLifecycleRevision, eventId, expectedVariables, mutationMode, manualEdit = false) {
+    if(manualEdit&&(option?.type!=='message'||expectedVariables===undefined||mutationMode!=='replace'||str(eventId).startsWith('mvu:')))throw Error('人工 MVU 编辑需要最新消息快照及整体替换 CAS')
     const transactionalEvent = str(eventId).startsWith('mvu:')
     let chat = transactionalEvent ? await mutationChat(sessionId, eventId) : await resolveChat(sessionId)
     await assertScriptEnabled(chat)
@@ -153,6 +155,7 @@ export function createTavernScriptHostAdapter(options = {}) {
         if (!mutationIsCurrent(current, expectedLifecycleRevision)) {stale=current;return current}
         const input = templateInputView(current), draft = input.input ? input.chat : current
         const latest = readTavernHelperVariables(draft, option)
+        if (manualEdit) validateManualMvuEdit(draft, option, expectedVariables, desired)
         let next = desired
         if (expectedVariables !== undefined) {
           if (mutationMode === 'patch') {
@@ -162,6 +165,7 @@ export function createTavernScriptHostAdapter(options = {}) {
           }
         }
         target = replaceTavernHelperVariables(draft, {option,variables:next})
+        if (manualEdit) stageManualMvuNotice(draft, latest, next)
         savedVariables = readTavernHelperVariables(draft, option)
         return persistTemplateInputView(draft,input.input)
       }

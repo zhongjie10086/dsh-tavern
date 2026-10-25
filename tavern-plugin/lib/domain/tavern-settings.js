@@ -5,6 +5,8 @@ import { SYSTEM_PROMPT_NAMES } from '../prompt-catalog.js'
 import { worldBookRecallLimit } from './worldbook-recall.js'
 import { foregroundModelRevision } from './foreground-model-selection.js'
 import { normalizeBackgroundGeneration } from './background-generation-policy.js'
+import { applySystemPromptSetOperation, syncSelectedSystemPromptSet, systemPromptSets } from './system-prompt-sets.js'
+import { normalizeHeaderShortcuts } from './usability-preferences.js'
 
 function object(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {}
@@ -29,6 +31,7 @@ export function normalizeBackgroundTasks(value) {
 export function applyTavernSettingsPatch(current, patch) {
   const next = Object.assign({}, object(current))
   const input = object(patch)
+  if (Object.hasOwn(input, 'headerShortcuts')) next.headerShortcuts = normalizeHeaderShortcuts(input.headerShortcuts)
   if (Object.hasOwn(input, 'backgroundScriptGeneration')) next.backgroundScriptGeneration = normalizeBackgroundGeneration(input.backgroundScriptGeneration)
   if (Object.hasOwn(input, 'fakeIpMode')) {
     if (input.fakeIpMode !== 'trusted-proxy') throw new Error('Fake-IP 仅支持信任本机代理模式')
@@ -110,7 +113,8 @@ export function applyTavernSettingsPatch(current, patch) {
     if (Object.keys(overrides).length === 0) delete next.promptOverrides
     else next.promptOverrides = overrides
   } else if (input.resetSystemPrompts === true) delete next.promptOverrides
-  return next
+  const synced = syncSelectedSystemPromptSet(next)
+  return Object.hasOwn(input, 'systemPromptSet') ? applySystemPromptSetOperation(synced, input.systemPromptSet) : synced
 }
 
 export function presentTavernSettings(document, defaults) {
@@ -120,6 +124,8 @@ export function presentTavernSettings(document, defaults) {
   })
   const story = prompts.find(function (item) { return item.name === 'story' }) || { text: '', customized: false }
   return {
+    systemPromptSets: systemPromptSets(object(document)),
+    headerShortcuts: normalizeHeaderShortcuts(object(document).headerShortcuts),
     fakeIpMode: 'trusted-proxy',
     backgroundScriptGeneration: normalizeBackgroundGeneration(object(document).backgroundScriptGeneration),
     candidateDismissMode: object(document).candidateDismissMode === 'after-send' ? 'after-send' : 'after-fill',

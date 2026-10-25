@@ -65,8 +65,9 @@ export async function encodePackedJson(value,{pretty=true,storageVersion=1,requi
   const bodyText=JSON.stringify(data),bytes=Buffer.byteLength(bodyText)
   let body
   if(bytes>=minimum&&bytes<=maximum){
-    const compressed=(await compress(bodyText)).toString('base64')
-    if(compressed.length+128<bytes)body={sha256:hash(bodyText),bytes,data:compressed}
+    const bodySha=hash(bodyText),cachedBody=cache.get(bodySha)
+    const compressed=cachedBody?.text===bodyText?cachedBody.data:(await compress(bodyText)).toString('base64')
+    if(compressed.length+128<bytes){remember(bodySha,{text:bodyText,data:compressed});body={sha256:bodySha,bytes,data:compressed}}
   }
   const expandedBytes=references.reduce((n,r)=>n+chunks[r.index].bytes,0)
   if(![1,2,3].includes(storageVersion))throw new Error('不支持的写入存储格式')
@@ -87,7 +88,7 @@ export async function decodePackedJson(input){
     texts.push(await readChunk(row))
   }
   let result=value.data,expandedBytes=0
-  if(own(value,'body')){try{result=JSON.parse(await readChunk(value.body,false))}catch{throw fail()}}
+  if(own(value,'body')){try{result=JSON.parse(await readChunk(value.body,true))}catch{throw fail()}}
   for(const ref of value.references){
     if(!ref||!Array.isArray(ref.path)||ref.path.length>256||!Number.isInteger(ref.index)||ref.index<0||ref.index>=texts.length||ref.path.some(k=>typeof k!=='string'&&(!Number.isSafeInteger(k)||k<0)))throw fail()
     expandedBytes+=value.chunks[ref.index].bytes

@@ -285,7 +285,29 @@ export function createUserPreferenceProfile({ store, now = Date.now, authorizeCo
     const context = await createSingleProfile({now, store:{readJson:async()=>selected.data}}).stableContext()
     return context ? { ...context, profileId: selected.id } : null
   }
-  return Object.freeze({ read, manage, stableContext,
+  async function importBundle(item, choice) {
+    const source = item.document
+    if (source?.spec !== SPEC || ![2,3].includes(source.version)) throw Error('长期偏好版本无效')
+    const content = source.draft || source.confirmed
+    if (!content || typeof content !== 'object') throw Error('长期偏好没有可导入内容')
+    let id
+    await store.updateJson(PROFILE_PATH, raw => {
+      const value=collection(raw), revision=Math.max(0,...value.profiles.map(item=>integer(item.data.revision)))+1
+      let target
+      if(choice.action==='replace') {
+        if(choice.confirmed!==true)throw Error('覆盖长期偏好需要明确确认')
+        target=entry(value,choice.target)
+      } else {
+        id=randomUUID();target={id,name:str(item.name,100)||'导入画像',data:document(null)}
+        value.profiles.push(target)
+      }
+      id=target.id
+      target.data={...document(target.data),revision,draft:normalizeDraft(content,revision,now()),updatedAt:now()}
+      return value
+    })
+    return await read(id)
+  }
+  return Object.freeze({ read, manage, stableContext, importBundle,
     saveDraft: input => mutateProfile('saveDraft', input),
     confirm: input => mutateProfile('confirm', input),
     updateConfirmed: input => mutateProfile('updateConfirmed', input),

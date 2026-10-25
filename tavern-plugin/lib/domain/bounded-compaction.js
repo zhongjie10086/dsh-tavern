@@ -16,6 +16,7 @@ export async function* boundedCompaction(ctx, request, stream) {
         input.signal?.throwIfAborted()
         events.push(event)
       }
+      input.signal?.throwIfAborted()
       const finish = events.findLast(event => event.type === 'finish')
       const tool = events.some(event => event.type === 'block-end' && event.block?.type === 'tool-call')
       const text = events.filter(event => event.type === 'block-end' && event.block?.type === 'text').map(event => event.block.text || '').join('').trim()

@@ -221,19 +221,26 @@ export function createDurableFilePromotion(options = {}) {
       const absolute = path.resolve(target)
       return enqueue(absolute, () => withWriteLock(absolute, operation, waitMs))
     },
-    async version(target) {
+    async version(target, { details = false } = {}) {
       const absolute = path.resolve(target)
+      function describe(info, prefix = []) {
+        const parts = [...prefix, info.dev, info.ino, info.size, info.mtimeNs]
+        if (!details) return parts.join(':')
+        const changed = Number(info.ctimeMs), modified = Number(info.mtimeMs)
+        return { stamp: [...parts, info.ctimeNs].join(':'),
+          reusable: Date.now() - Math.max(changed, modified) >= 32 }
+      }
       const snapshots = await pendingSnapshots(absolute)
       if (snapshots.length > 0) {
         const latest = snapshots[snapshots.length - 1]
         try {
           const info = await stat(latest.path, { bigint: true })
-          return ['pending', latest.revision, info.dev, info.ino, info.size, info.mtimeNs].join(':')
+          return describe(info, ['pending', latest.revision])
         } catch (error) { if (error?.code !== 'ENOENT') throw error }
       }
       try {
         const info = await stat(absolute, { bigint: true })
-        return [info.dev, info.ino, info.size, info.mtimeNs].join(':')
+        return describe(info)
       } catch (error) { if (error?.code === 'ENOENT') return ''; throw error }
     },
     async read(target) { return readTarget(path.resolve(target)) },

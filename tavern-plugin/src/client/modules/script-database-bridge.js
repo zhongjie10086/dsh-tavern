@@ -8,6 +8,21 @@ function createTavernDatabaseBridge(options) {
   let scope=currentScope();
   const callbacks = new Set(), fillCallbacks = new Set(), pending = new Set();
   const copy = value => JSON.parse(JSON.stringify(value)), quote = value => '"' + String(value).replaceAll('"', '""') + '"';
+  function templateWithAliases(source){
+    const data=typeof source==='string'?JSON.parse(source):copy(source);
+    for(const [key,sheet]of Object.entries(data||{}))if(key.startsWith('sheet_')&&sheet?.sourceData?.ddl){
+      // This is the authenticated template declaration, not script source or SQL.
+      // Preserve its physical name before the original reconciles/rebinds its DDL.
+      let ddl=String(sheet.sourceData.ddl).trimStart();
+      while(ddl.startsWith('--')||ddl.startsWith('/*')){const end=ddl.startsWith('--')?ddl.indexOf('\n'):ddl.indexOf('*/')+1;if(end<0||end===0)break;ddl=ddl.slice(end+1).trimStart()}
+      const match=/^CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?("(?:[^"]|"")*"|`(?:[^`]|``)*`|\[(?:[^\]]|\]\])*\]|[A-Za-z_\u0080-\uFFFF][\w$\u0080-\uFFFF]*)\s*\(/i.exec(ddl);
+      if(!match)continue;
+      const raw=match[1],name=['"','`','['].includes(raw[0])?raw.slice(1,-1).split(raw[0]==='['?']]':raw[0]+raw[0]).join(raw[0]==='['?']':raw[0]):raw;
+      const aliases=sheet.sourceData.tableAliases;if(aliases!==undefined&&(!Array.isArray(aliases)||aliases.some(value=>typeof value!=='string')))throw Error('模板 tableAliases 无效');
+      sheet.sourceData.tableAliases=[...new Set([...(aliases||[]),name])];
+    }
+    return typeof source==='string'?JSON.stringify(data):data;
+  }
   function sync(next,sourceScope) {
     const nextScope=currentScope();
     if(sourceScope!==undefined&&sourceScope!==nextScope)return false;
@@ -45,6 +60,9 @@ function createTavernDatabaseBridge(options) {
         const statement = database.prepare('INSERT INTO ' + quote(table.name) + ' VALUES (' + table.columns.map(() => '?').join(',') + ')');
         try { for (const row of snapshot.data[table.key].content.slice(1)) statement.run(row.map(cell => typeof cell === 'boolean' ? Number(cell) : cell)); } finally { statement.free(); }
       }
+      const physical=new Set((snapshot.schema||[]).map(table=>table.name.toLowerCase())),aliases=new Map(),ambiguous=new Set();
+      for(const table of snapshot.schema||[])for(const alias of table.aliases||[]){const key=alias.toLowerCase();if(physical.has(key)||ambiguous.has(key))continue;if(aliases.has(key)&&aliases.get(key)!==table.name){aliases.delete(key);ambiguous.add(key)}else aliases.set(key,table.name)}
+      for(const [alias,name]of aliases)database.run('CREATE VIEW '+quote(alias)+' AS SELECT * FROM main.'+quote(name));
       database.run('PRAGMA query_only=ON');
     } catch (e) { database.close(); database = previous; throw e; }
     previous?.close();
@@ -116,7 +134,7 @@ function createTavernDatabaseBridge(options) {
   async function templateCommand(operation){const sourceScope=currentScope(),result=await call('tavernHelperDatabaseTemplates',{operation,expectedRevision:snapshot.revision});if(sourceScope!==currentScope())return result;if(result.names)templateNames=result.names;if(result.database){const changed=sync(result.database,sourceScope);if(changed)notify()}return result}
   const api = {
     getTemplatePresetNames:()=>Array.isArray(context().originalDatabaseTemplates)?context().originalDatabaseTemplates.slice():templateNames.slice(),
-    importTemplateFromData:(data,options={})=>templateCommand({kind:'import',data,scope:options.scope||'global',name:options.presetName,dataMode:options.dataMode,conflictPolicy:options.conflictPolicy}),
+    importTemplateFromData:async(data,options={})=>templateCommand({kind:'import',data:templateWithAliases(data),scope:options.scope||'global',name:options.presetName,dataMode:options.dataMode,conflictPolicy:options.conflictPolicy}),
     switchTemplatePreset:(name,options={})=>templateCommand({kind:'select',scope:options.scope||'global',name}),
     exportFullCheckpointAtMessageIndex: messageIndex => call('tavernHelperChatFiles',{operation:{path:'checkpoint',body:{messageIndex}}}).then(result=>result.value),
     exportTableAsJson: () => copy(snapshot.data), getTableData: () => copy(snapshot.data),
